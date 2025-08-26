@@ -5,26 +5,115 @@ import numpy as np
 import cv2
 
 # ---------- 基础增强 ----------
-def auto_white_balance(img_bgr: np.ndarray, clip_limit: float = 2.0, tile_size: int = 8) -> np.ndarray:
+import cv2
+import numpy as np
+
+import numpy as np
+import cv2
+
+def auto_white_balance(
+    img_bgr: np.ndarray,
+    clip_limit: float = 2.0,     # 为兼容旧签名保留，但在 autoscale 中不使用
+    tile_size: int = 8,          # 为兼容旧签名保留，但在 autoscale 中不使用
+    exposure: float = 1.0,
+    percent_low: float = 0.5,
+    percent_high: float = 99.5,
+    per_channel: bool = False,
+    gamma: float | None = None
+) -> np.ndarray:
     """
-    灰度图：直接 CLAHE 增强后转 BGR
-    彩色图：Gray-world + LAB/CLAHE(L通道)，返回 BGR
+    ImageLab 风格的 Autoscale（自动对比度拉伸）
+
+    灰度图：
+        - 依据 [percent_low, percent_high] 的百分位，线性拉伸至 [0, 255]
+        - 再乘以 exposure（建议 0.5~2.0）
+        - 可选 gamma 校正（对归一化到 [0,1] 的值应用 out = out ** (1/gamma)）
+
+    彩色图：
+        - per_channel = False（默认）：全局统一缩放（对 BGR 全体像素做统一百分位拉伸）
+            * 尽量保持通道比例（不改变色彩倾向）
+        - per_channel = True：逐通道缩放（各通道分别按百分位拉伸）
+            * 对比度最大化，但可能改变色彩
+        - 然后统一乘 exposure；可选 gamma
+
+    说明：
+        - 本实现不再做灰度平场校正、CLAHE 或 Shades-of-Gray，以贴近 ImageLab Autoscale 的线性拉伸本意。
+        - clip_limit/tile_size 参数仅为兼容历史签名保留，函数中不使用。
+
+    参数:
+        exposure: 亮度乘法，建议范围 0.5 ~ 2.0
+        percent_low/percent_high: 百分位阈值（建议 0.1~2 / 98~99.9 之间微调）
+        per_channel: 是否按通道各自 autoscale
+        gamma: 若给定（>0），对归一化后的结果执行 gamma 校正（out = out ** (1/gamma)）
+
+    返回:
+        拉伸后的 BGR uint8 图像
     """
+    # --- 保护性限定 ---
+    exposure = float(np.clip(exposure, 0.5, 2.0))
+    percent_low = float(np.clip(percent_low, 0.0, 50.0))
+    percent_high = float(np.clip(percent_high, 50.0, 100.0))
+    if percent_high <= percent_low:
+        percent_low, percent_high = 0.5, 99.5
+    if gamma is not None:
+        gamma = max(1e-6, float(gamma))
+
+    # 输入转 float32
     if img_bgr.ndim == 2 or (img_bgr.ndim == 3 and img_bgr.shape[2] == 1):
+        # -------- 灰度图分支 --------
         g = img_bgr if img_bgr.ndim == 2 else img_bgr[:, :, 0]
-        clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=(int(tile_size), int(tile_size)))
-        g2 = clahe.apply(g)
-        return cv2.cvtColor(g2, cv2.COLOR_GRAY2BGR)
-    img_f = img_bgr.astype(np.float32)
-    mean_bgr = img_f.mean(axis=(0, 1))
-    gray = float(mean_bgr.mean())
-    scale = gray / (mean_bgr + 1e-6)
-    wb = np.clip(img_f * scale, 0, 255).astype(np.uint8)
-    lab = cv2.cvtColor(wb, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=(int(tile_size), int(tile_size)))
-    l2 = clahe.apply(l)
-    return cv2.cvtColor(cv2.merge([l2, a, b]), cv2.COLOR_LAB2BGR)
+        g = g.astype(np.float32)
+
+        lo = np.percentile(g, percent_low)
+        hi = np.percentile(g, percent_high)
+        if hi <= lo + 1e-6:
+            # 动态范围太小，直接做曝光乘法并裁剪
+            out = np.clip(g / 255.0 * exposure, 0.0, 1.0)
+        else:
+            out = (g - lo) / (hi - lo)
+            out = np.clip(out, 0.0, 1.0)
+            if gamma is not None:
+                out = np.power(out, 1.0 / gamma)
+            out = np.clip(out * exposure, 0.0, 1.0)
+
+        g8 = (out * 255.0 + 0.5).astype(np.uint8)
+        return cv2.cvtColor(g8, cv2.COLOR_GRAY2BGR)
+
+    # -------- 彩色图分支 --------
+    img = img_bgr.astype(np.float32)
+
+    if per_channel:
+        # 每个通道独立 autoscale
+        out = np.empty_like(img, dtype=np.float32)
+        for c in range(3):
+            ch = img[:, :, c]
+            lo = np.percentile(ch, percent_low)
+            hi = np.percentile(ch, percent_high)
+            if hi <= lo + 1e-6:
+                chn = np.clip(ch / 255.0, 0.0, 1.0)
+            else:
+                chn = (ch - lo) / (hi - lo)
+                chn = np.clip(chn, 0.0, 1.0)
+            out[:, :, c] = chn
+    else:
+        # 全局统一 autoscale（对所有通道共同求阈值）
+        lo = np.percentile(img, percent_low)
+        hi = np.percentile(img, percent_high)
+        if hi <= lo + 1e-6:
+            out = np.clip(img / 255.0, 0.0, 1.0)
+        else:
+            out = (img - lo) / (hi - lo)
+            out = np.clip(out, 0.0, 1.0)
+
+    if gamma is not None:
+        out = np.power(out, 1.0 / gamma)
+
+    out = np.clip(out * exposure, 0.0, 1.0)
+    out_u8 = (out * 255.0 + 0.5).astype(np.uint8)
+    return out_u8
+
+
+
 
 # ---------- 胶块检测 ----------
 def detect_gel_regions(img_bgr: np.ndarray, expected: int = 2,
@@ -148,33 +237,59 @@ def y_from_mw(mw: float, a: float, b: float) -> float:
     return a * np.log10(mw) + b
 
 # ---------- 渲染（直立矩形） ----------
-def render_annotation(gel_bgr: np.ndarray, lanes: List[Tuple[int, int]],
-                      ladder_peaks_y: List[int], ladder_labels: List[float],
+def render_annotation(gel_bgr: np.ndarray,
+                      lanes: List[Tuple[int, int]],
+                      ladder_peaks_y: List[int],
+                      ladder_labels: List[float],
                       a: float, b: float,
-                      tick_labels: List[float], yaxis_side: str = 'left') -> np.ndarray:
+                      tick_labels: List[float],
+                      yaxis_side: str = 'left') -> np.ndarray:
     """
-    说明：为了与现有 GUI 兼容，形参 ladder_labels 保留但当前未用于绘制；
-    蓝色横线 = ladder_peaks_y；红色刻度来自 tick_labels（在拟合通过时绘制）。
+    渲染说明（2025-08-25 改）：
+    - 取消蓝色横线（不再在原图上画 ladder_peaks_y）。
+    - 在图像左侧新增白色标签栏（不覆盖原图），把分子量标签画在白色栏上。
+    - 标签位置来自“检测到的峰的真实 y（ladder_peaks_y）”，文本来自“输入 ladder_labels”，
+      两者通过“自顶向下（小 y） ↔ 大→小（kDa）”的一一配对（取二者长度较小的部分）。
+    - 保持泳道（绿色）绘制逻辑不变。
+    - 仍保留 a/b/tick_labels/yaxis_side 形参，以兼容外部接口，但本函数内不再使用它们。
     """
     H, W, _ = gel_bgr.shape
-    canvas = gel_bgr.copy()
-    # 泳道（绿色）
-    for (l, r) in lanes:
-        cv2.rectangle(canvas, (l, 0), (r, H - 1), (0, 255, 0), 1)
-    # 标准带横线（蓝色）
-    for y in ladder_peaks_y:
-        cv2.line(canvas, (0, y), (W - 1, y), (255, 0, 0), 1)
-    # Y 轴刻度（红色）
-    axis_x = 0 if yaxis_side == 'left' else W - 1
-    for mw in tick_labels:
-        y = int(round(y_from_mw(mw, a, b)))
-        if 0 <= y < H:
-            x2 = axis_x + (20 if yaxis_side == 'left' else -20)
-            cv2.line(canvas, (axis_x, y), (x2, y), (0, 0, 255), 2)
-            txt_x = (axis_x + 25) if yaxis_side == 'left' else (axis_x - 120)
-            cv2.putText(canvas, f"{mw} kDa", (txt_x, max(15, y - 2)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+
+    # 1) 左侧白色标签栏（不覆盖原图），默认 130px
+    label_panel_w = 130
+    canvas = np.full((H, W + label_panel_w, 3), 255, dtype=np.uint8)
+    canvas[:, label_panel_w:label_panel_w + W] = gel_bgr
+
+    # 2) 泳道（绿色），注意整体向右平移 label_panel_w
+    if lanes is not None:
+        for (l, r) in lanes:
+            cv2.rectangle(canvas, (label_panel_w + int(l), 0),
+                                   (label_panel_w + int(r), H - 1),
+                                   (0, 255, 0), 1)
+
+    # 3) 分子量标签（红色）画在左侧白色栏，位置=检测到的峰的真实 y
+    #    配对逻辑：y（升序=从上到下） ↔ label（降序=从大到小）
+    if ladder_peaks_y is not None and ladder_labels is not None \
+       and len(ladder_peaks_y) > 0 and len(ladder_labels) > 0:
+        ys = sorted([int(round(float(y))) for y in ladder_peaks_y])
+        lbs = sorted([float(x) for x in ladder_labels], reverse=True)
+        K = min(len(ys), len(lbs))
+
+        # 小红刻度线与文字位置（在白色栏里）
+        tick_x1 = 10               # 刻度左端
+        tick_x2 = label_panel_w - 8  # 刻度右端（靠近原图边缘）
+        txt_x  = 14                # 文本起点（略右于刻度）
+        for y, mw in zip(ys[:K], lbs[:K]):
+            if 0 <= y < H:
+                #cv2.line(canvas, (tick_x1, y), (tick_x2, y), (0, 0, 255), 2)
+                cv2.putText(canvas, f"{mw:g} kDa",
+                            (txt_x, max(15, y)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 0, 255), 1, cv2.LINE_AA)
+
+    # 4) 不再绘制蓝色横线（原先：for y in ladder_peaks_y: cv2.line(..., (255,0,0), 1)）
     return canvas
+
 
 # ---------- 1D 峰检测（prominence） ----------
 def _moving_avg(x: np.ndarray, k: int) -> np.ndarray:
@@ -293,40 +408,58 @@ def match_ladder_best(
     min_pairs: int = 3
 ) -> Tuple[List[int], List[int]]:
     """
-    需求版：从“大分子量”开始自顶向下顺序匹配；若缺少标志物，则舍去末端（小分子量端）的若干个。
-    返回（选中的 peaks 索引列表（相对原 peaks_y）、选中的 ladder 索引列表（相对“按大->小排序后的”标志物））。
+    从峰列表中选取“最有显著性”的数个峰用于拟合：
+    - 用 peak_weights 作为显著性（prominence）评分，选择 Top-K（K = min(len(ladder_labels), len(peaks_y))）。
+    - 选择后再按 y 从小到大排序，使之与“分子量从大->小”的标志物一一对应。
+    - 若可用配对数 < min_pairs，返回空（交由上层放弃拟合）。
 
-    说明：
-    - peaks_y 是图像 y 坐标，越小越靠上（对应分子量越大）。
-    - ladder_labels 会在内部被按 大->小 排序；返回的 ladder 索引基于此排序后的列表。
-    - 不再做“全局最优子序列搜索”，而是简单且稳定的“从上到下”一一配对，保证满足你的业务约束。
+    返回:
+      (选中峰的索引列表[相对原 peaks_y]，选中标志物索引列表[相对“按大->小排序后的 ladder_labels”])
     """
-    # 保护性处理
+    # 基本校验
     if peaks_y is None or ladder_labels is None:
         return [], []
     if len(peaks_y) == 0 or len(ladder_labels) == 0:
         return [], []
 
-    # 1) 标志物按 大->小 排序（记录其在"排序后数组"中的索引 0..M-1）
+    # 标志物按 大->小 排序（仅用于确定K及返回索引域）
     L_sorted = sorted(ladder_labels, reverse=True)
     M = len(L_sorted)
-
-    # 2) 峰按 y 从小到大（自顶向下）排序，保留原 peaks_y 的索引
-    peaks_idx_sorted = sorted(range(len(peaks_y)), key=lambda i: float(peaks_y[i]))
-    N = len(peaks_idx_sorted)
-
-    # 3) 决定可配对数量 K：
-    #    - 若峰更少：舍去末端的小分子量标志物（只取前 N 个标志物）
-    #    - 若标志物更少：只取前 M 个峰
+    N = len(peaks_y)
     K = min(M, N)
 
-    # 若不足最小配对数，直接返回空
     if K < max(1, int(min_pairs)):
         return [], []
 
-    # 4) 一一对应（从上到下 vs 从大到小）：第 j 个峰 ↔ 第 j 个标志物
-    sel_peak_idx = peaks_idx_sorted[:K]          # 这些是相对原 peaks_y 的索引
-    sel_label_idx = list(range(K))               # 这些是相对“已排序 L_sorted”的索引 0..K-1
+    # 显著性权重（prominence）
+    # 若未提供或长度不匹配，则退化为等权
+    import numpy as np
+    if peak_weights is None or len(peak_weights) != N:
+        Wp = np.ones(N, dtype=np.float64)
+    else:
+        Wp = np.array(peak_weights, dtype=np.float64)
+        # 清理 NaN/inf
+        if not np.all(np.isfinite(Wp)):
+            finite = Wp[np.isfinite(Wp)]
+            max_finite = float(finite.max()) if finite.size > 0 else 1.0
+            Wp = np.nan_to_num(Wp, nan=0.0, posinf=max_finite, neginf=0.0)
+
+    # 1) 先按显著性从大到小选 Top-K；若显著性相同则优先取 y 更小（更靠上）的峰
+    #   关键: reverse=True 下，key=(权重, -y) => 权重大者优先；同权时 y 小者(-y 大)优先
+    order_by_prom = sorted(
+        range(N),
+        key=lambda i: (float(Wp[i]), -float(peaks_y[i])),
+        reverse=True
+    )
+    topk_idx = order_by_prom[:K]
+
+    # 2) 为与“分子量 大->小”的标志物顺序对应，将选中的峰按 y 从小到大排序
+    sel_peak_idx = sorted(topk_idx, key=lambda i: float(peaks_y[i]))
+    sel_label_idx = list(range(len(sel_peak_idx)))  # 对应 L_sorted 的 0..K-1
+
+    # 3) 最低配对数检查
+    if len(sel_peak_idx) < max(1, int(min_pairs)):
+        return [], []
 
     return sel_peak_idx, sel_label_idx
 
@@ -363,8 +496,6 @@ def fit_log_mw_irls(y_positions: List[int], ladder_sizes: List[float],
 
 # ---------- 4) 斜线（线性）分道：逐行跟踪 + 线性拟合 ----------
 # --- gel_core 3.py: 替换原 lanes_slanted ---
-import numpy as np
-import cv2
 
 def lanes_slanted(
     gray: np.ndarray, n: int,
@@ -854,27 +985,53 @@ def detect_bands_along_y_slanted(gray: np.ndarray, bounds: np.ndarray, lane_inde
 
 
 # ---------- 6) 斜线渲染（绿：边界折线；蓝：标准带；红：刻度） ----------
-def render_annotation_slanted(gel_bgr: np.ndarray, bounds: np.ndarray,
-                              ladder_peaks_y: List[int], ladder_labels: List[float],
-                              a: float, b: float, tick_labels: List[float],
+def render_annotation_slanted(gel_bgr: np.ndarray,
+                              bounds: np.ndarray,
+                              ladder_peaks_y: List[int],
+                              ladder_labels: List[float],
+                              a: float, b: float,
+                              tick_labels: List[float],
                               yaxis_side: str = 'left') -> np.ndarray:
+    """
+    渲染说明（2025-08-25 改）：
+    - 取消蓝色横线（不再在原图上画 ladder_peaks_y）。
+    - 在图像左侧新增白色标签栏（不覆盖原图），把分子量标签画在白色栏上。
+    - 标签位置来自“检测到的峰的真实 y（ladder_peaks_y）”，文本来自“输入 ladder_labels”，
+      两者通过“自顶向下 ↔ 大→小”的一一配对（取长度较小部分）。
+    - 边界折线（绿色）保持绘制，但整体右移 label_panel_w。
+    - 保留 a/b/tick_labels/yaxis_side 形参以兼容，但本函数内不再使用它们。
+    """
     H, W, _ = gel_bgr.shape
-    canvas = gel_bgr.copy()
-    # 边界折线（直线拟合后逐行绘制，视觉上是折线/近似直线）
-    for i in range(1, bounds.shape[1] - 1):
-        pts = np.stack([bounds[:, i], np.arange(H)], axis=1).astype(np.int32)
-        cv2.polylines(canvas, [pts], isClosed=False, color=(0, 255, 0), thickness=1)
-    # 标准带横线（蓝色）
-    for y in ladder_peaks_y:
-        cv2.line(canvas, (0, y), (W - 1, y), (255, 0, 0), 1)
-    # Y 轴刻度（红色）
-    axis_x = 0 if yaxis_side == 'left' else W - 1
-    for mw in tick_labels:
-        y = int(round(a * np.log10(mw) + b))
-        if 0 <= y < H:
-            x2 = axis_x + (20 if yaxis_side == 'left' else -20)
-            cv2.line(canvas, (axis_x, y), (x2, y), (0, 0, 255), 2)
-            txt_x = (axis_x + 25) if yaxis_side == 'left' else (axis_x - 120)
-            cv2.putText(canvas, f"{mw} kDa", (txt_x, max(15, y - 2)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+
+    # 1) 左侧白色标签栏
+    label_panel_w = 130
+    canvas = np.full((H, W + label_panel_w, 3), 255, dtype=np.uint8)
+    canvas[:, label_panel_w:label_panel_w + W] = gel_bgr
+
+    # 2) 绿色边界折线（整体右移）
+    if bounds is not None and bounds.ndim == 2 and bounds.shape[0] == H:
+        for i in range(1, bounds.shape[1] - 1):
+            pts = np.stack([bounds[:, i] + label_panel_w, np.arange(H)], axis=1).astype(np.int32)
+            cv2.polylines(canvas, [pts], isClosed=False, color=(0, 255, 0), thickness=1)
+
+    # 3) 分子量标签（红色）画在白色栏，位置=检测到的峰的真实 y
+    if ladder_peaks_y is not None and ladder_labels is not None \
+       and len(ladder_peaks_y) > 0 and len(ladder_labels) > 0:
+        ys = sorted([int(round(float(y))) for y in ladder_peaks_y])
+        lbs = sorted([float(x) for x in ladder_labels], reverse=True)
+        K = min(len(ys), len(lbs))
+
+        tick_x1 = 10
+        tick_x2 = label_panel_w - 8
+        txt_x  = 14
+        for y, mw in zip(ys[:K], lbs[:K]):
+            if 0 <= y < H:
+                #cv2.line(canvas, (tick_x1, y), (tick_x2, y), (0, 0, 255), 2)
+                cv2.putText(canvas, f"{mw:g} kDa",
+                            (txt_x, max(15, y)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 0, 255), 1, cv2.LINE_AA)
+
+    # 4) 不再绘制蓝色横线
     return canvas
+
