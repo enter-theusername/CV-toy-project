@@ -245,50 +245,50 @@ def render_annotation(gel_bgr: np.ndarray,
                       tick_labels: List[float],
                       yaxis_side: str = 'left') -> np.ndarray:
     """
-    渲染说明（2025-08-25 改）：
-    - 取消蓝色横线（不再在原图上画 ladder_peaks_y）。
-    - 在图像左侧新增白色标签栏（不覆盖原图），把分子量标签画在白色栏上。
-    - 标签位置来自“检测到的峰的真实 y（ladder_peaks_y）”，文本来自“输入 ladder_labels”，
-      两者通过“自顶向下（小 y） ↔ 大→小（kDa）”的一一配对（取二者长度较小的部分）。
-    - 保持泳道（绿色）绘制逻辑不变。
-    - 仍保留 a/b/tick_labels/yaxis_side 形参，以兼容外部接口，但本函数内不再使用它们。
+    渲染说明：
+    - 左侧白色标签栏（不覆盖原图），把分子量标注画在白色栏上。
+    - 标注位置来自“检测到的峰真实 y (ladder_peaks_y)”，文本来自“输入 ladder_labels”，
+      两者通过“自顶向下 (y 小 -> 大) ↔ 大->小 (kDa)”一一配对（取两者长度较小部分）。
+    - 文字仅显示“数字”（不带单位），并右对齐到一条“短横线”的左边；
+      短横线仅在白色标签栏内，不延伸到原图。
     """
     H, W, _ = gel_bgr.shape
-
-    # 1) 左侧白色标签栏（不覆盖原图），默认 130px
-    label_panel_w = 130
+    label_panel_w = 80
     canvas = np.full((H, W + label_panel_w, 3), 255, dtype=np.uint8)
     canvas[:, label_panel_w:label_panel_w + W] = gel_bgr
 
-    # 2) 泳道（绿色），注意整体向右平移 label_panel_w
+    # 泳道（绿色）
     if lanes is not None:
         for (l, r) in lanes:
             cv2.rectangle(canvas, (label_panel_w + int(l), 0),
-                                   (label_panel_w + int(r), H - 1),
-                                   (0, 255, 0), 1)
+                          (label_panel_w + int(r), H - 1),
+                          (0, 255, 0), 1)
 
-    # 3) 分子量标签（红色）画在左侧白色栏，位置=检测到的峰的真实 y
-    #    配对逻辑：y（升序=从上到下） ↔ label（降序=从大到小）
-    if ladder_peaks_y is not None and ladder_labels is not None \
-       and len(ladder_peaks_y) > 0 and len(ladder_labels) > 0:
+    # 分子量标注（仅数字 + 短横线）
+    if ladder_peaks_y and ladder_labels:
         ys = sorted([int(round(float(y))) for y in ladder_peaks_y])
         lbs = sorted([float(x) for x in ladder_labels], reverse=True)
         K = min(len(ys), len(lbs))
 
-        # 小红刻度线与文字位置（在白色栏里）
-        tick_x1 = 10               # 刻度左端
-        tick_x2 = label_panel_w - 8  # 刻度右端（靠近原图边缘）
-        txt_x  = 14                # 文本起点（略右于刻度）
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale, thickness = 0.5, 1
+        color_text, color_tick = (0, 0, 0), (0, 0, 0)
+        margin_right, tick_len, tick_gap = 2, 12, 3
+        x2 = label_panel_w - 1 - margin_right
+        x1 = max(2, x2 - tick_len + 1)
+
         for y, mw in zip(ys[:K], lbs[:K]):
             if 0 <= y < H:
-                #cv2.line(canvas, (tick_x1, y), (tick_x2, y), (0, 0, 255), 2)
-                cv2.putText(canvas, f"{mw:g} kDa",
-                            (txt_x, max(15, y)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            (0, 0, 255), 1, cv2.LINE_AA)
+                y_draw = int(np.clip(y, 12, H - 5))
+                cv2.line(canvas, (x1, y_draw), (x2, y_draw), color_tick, 1, cv2.LINE_AA)
+                text = f"{mw:g}"
+                (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+                x_text = max(2, x1 - tick_gap - tw)
+                cv2.putText(canvas, text, (x_text, y_draw + th // 2 - 1),
+                            font, font_scale, color_text, thickness, cv2.LINE_AA)
 
-    # 4) 不再绘制蓝色横线（原先：for y in ladder_peaks_y: cv2.line(..., (255,0,0), 1)）
     return canvas
+
 
 
 # ---------- 1D 峰检测（prominence） ----------
@@ -497,30 +497,36 @@ def fit_log_mw_irls(y_positions: List[int], ladder_sizes: List[float],
 # ---------- 4) 斜线（线性）分道：逐行跟踪 + 线性拟合 ----------
 # --- gel_core 3.py: 替换原 lanes_slanted ---
 
+# gel_core 2.py  （只粘贴 lanes_slanted 的完整新版本，其他函数不动）
 def lanes_slanted(
     gray: np.ndarray, n: int,
     smooth_px: int = 31, min_sep_ratio: float = 1.2,
-    search_half: int = 12,  # 兼容保留，不使用
-    max_step_px: int = 3, smooth_y: int = 9,
+    search_half: int = 12, max_step_px: int = 3, smooth_y: int = 9,
     # 代价图权重
-    w_grad: float = 0.7, w_int: float = 0.3,
-    # DP 约束
+    w_grad: float = 0.9, w_int: float = 0.2,
+    # DP / 走廊
     corridor_frac: float = 0.60, lambda_ref: float = 1e-3, gamma_step: float = 0.5,
-    # 顶/底忽略（避开加样孔、眩光）
+    # 顶/底忽略区
     top_ignore_frac: float = 0.07, bot_ignore_frac: float = 0.06,
-    # 多锚点（沿高方向 M 个切片，每片厚 anchor_band_px）
+    # 锚点
     anchor_count: int = 5, anchor_band_px: int = 11,
-    # 抑制“异常宽/深谷”（如中缝）
-    valley_penalty_q: float = 0.15
+    # valley 惩罚
+    valley_penalty_q: float = 0.15,
+    # === 新增：接收白平衡后的 BGR，用于更强调“边缘”的梯度分量；以及是否做等距混合 ===
+    wb_bgr: np.ndarray | None = None,
+    enable_uniform_blend: bool = False,
+    uniform_blend_top_y: int | None = None,
+    uniform_blend_bot_y: int | None = None
 ) -> np.ndarray:
     """
-    斜线分道（DP-Lane+）：
-    新增“按行选种子分隔（基于明暗）→ 整幅 DP”的稳健起始策略，
-    并保留顶/底退火与动态窄走廊，避免分隔线在顶/底端偏向一侧结束。
+    斜线分道（DP-Lane+ 增强版）：
+    - 代价图中的“边缘项”优先使用白平衡后的图像 wb_bgr 计算（Scharr x），让边缘更显著；
+    - 去掉默认“顶/底等距混合”（可通过 enable_uniform_blend 重新开启）；
+    - DP 顶部行对“参考线偏移惩罚”采用渐入（ramp），避免把各分隔线的起始 x 锁死一致。
     """
     H, W = gray.shape
 
-    # ---------- 兜底：极端窄 ROI 直接等宽 ----------
+    # 兜底：极窄 ROI -> 等宽
     if W < max(4, n):
         bounds = np.zeros((H, n + 1), dtype=np.int32)
         bounds[:, 0] = 0
@@ -530,7 +536,7 @@ def lanes_slanted(
         bounds[:, -1] = W
         return bounds
 
-    # ---------- 工具 ----------
+    # ---------------- 工具函数（与原实现相同/略有补充） ----------------
     def _smooth1d(x: np.ndarray, k: int) -> np.ndarray:
         k = int(k)
         if k < 3:
@@ -542,7 +548,6 @@ def lanes_slanted(
         return np.convolve(x, kernel, mode='same')
 
     def _interp_with_extrap(yq: np.ndarray, yk: np.ndarray, vk: np.ndarray) -> np.ndarray:
-        """线性插值 + 两端线性外推"""
         yq = yq.astype(np.float32, copy=False)
         yk = yk.astype(np.float32, copy=False)
         vk = vk.astype(np.float32, copy=False)
@@ -558,55 +563,59 @@ def lanes_slanted(
 
     inv = 255 - gray
 
-    # ---------- 0) 预处理/代价图 ----------
-    inv_blur = cv2.GaussianBlur(inv, (5, 5), 0)
-    gx = np.abs(cv2.Sobel(inv_blur, cv2.CV_32F, 1, 0, ksize=3))
-    gx = gx / (gx.max() + 1e-6)  # 竖向边（越大越像分隔）
+    # ---------------- 0) 预处理/代价图：增强“边缘” ----------------
+    # 基于白平衡后的 BGR（若提供）计算更强的水平梯度；否则沿用原逻辑
+    if wb_bgr is not None and isinstance(wb_bgr, np.ndarray) and wb_bgr.ndim == 3 and wb_bgr.shape[:2] == gray.shape:
+        wb_gray = cv2.cvtColor(wb_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        wb_blur = cv2.GaussianBlur(wb_gray, (3, 3), 0)
+        # 更敏感的 Scharr 水平梯度，强调“竖直边界”
+        gx_wb = np.abs(cv2.Scharr(wb_blur, cv2.CV_32F, 1, 0))
+        gx = gx_wb / (gx_wb.max() + 1e-6)
+        # 强度项仍来源于去趋势后的 inv（避免穿过深色条带）
+        inv_blur = cv2.GaussianBlur(inv, (5, 5), 0)
+    else:
+        inv_blur = cv2.GaussianBlur(inv, (5, 5), 0)
+        sobel_x = cv2.Sobel(inv_blur, cv2.CV_32F, 1, 0, ksize=3)
+        gx = np.abs(sobel_x)
+        gx = gx / (gx.max() + 1e-6)
 
     k = int(smooth_px)
     if k % 2 == 0:
         k += 1
     if k < 3:
         k = 3
-    inv_smooth = cv2.blur(inv_blur, (k, 1)).astype(np.float32)   # 横向平滑
-    row_med = np.median(inv_smooth, axis=1, keepdims=True)       # 行级去趋势
+    inv_smooth = cv2.blur(inv_blur, (k, 1)).astype(np.float32)       # 横向平滑
+    row_med = np.median(inv_smooth, axis=1, keepdims=True)           # 行级去趋势
     inv_smooth = inv_smooth - row_med
     inv_smooth -= inv_smooth.min()
     inv_smooth /= (inv_smooth.max() + 1e-6)
 
-    # 代价：靠近强边（gx 大 → cost 小），避开条带（inv_smooth 大 → cost 大）
+    # 代价：靠近强边界 => 代价小；穿过深色条带 => 代价大
     cost = (w_grad * (1.0 - gx) + w_int * inv_smooth).astype(np.float32)
 
-    # ---------- 1) 顶/底忽略区 ----------
+    # ---------------- 1) 顶/底忽略区 ----------------
     top_ig = int(np.clip(round(H * top_ignore_frac), 0, H // 3))
     bot_ig = int(np.clip(round(H * bot_ignore_frac), 0, H // 3))
     y0_anchors = top_ig
     y1_anchors = H - bot_ig
     if y1_anchors - y0_anchors < 20:
-        y0_anchors, y1_anchors = 0, H  # 极端回退
+        y0_anchors, y1_anchors = 0, H  # 极端退回全高
 
-    # ---------- 2) “按行选种子”：在一条 y 上得到 n-1 个分隔 ----------
-    def _row_seed_separators(y: int,
-                             min_sep_ratio_local: float,
-                             int_mul_k_max: int = 4,
-                             int_mul_tol: float = 0.18,
-                             cv_max: float = 0.25,
-                             drop_outlier_tol: float = 0.45) -> tuple[bool, np.ndarray]:
-        """
-        在第 y 行，按 cost 的“谷”寻找 n-1 个分隔位置（x 索引）。
-        - 若得到的列宽度近似等宽（CV<=cv_max），返回 True + 分隔；
-        - 若某些宽度 ≈ k * 平均宽度（k=2..int_mul_k_max，容差 int_mul_tol），则把该宽均分补点后再验收；
-        - 若宽度中存在明显离群（|w - mu|/mu > drop_outlier_tol），判不合格。
-        """
+    # ---------------- 2) 按行找“种子分隔”并评估（与原逻辑一致，略） ----------------
+    # ...（此处保持你原来的 _row_seed_separators 实现，不变）...
+
+    def _row_seed_separators(
+        y: int, min_sep_ratio_local: float,
+        int_mul_k_max: int = 4, int_mul_tol: float = 0.18,
+        cv_max: float = 0.25, drop_outlier_tol: float = 0.45
+    ) -> tuple[bool, np.ndarray]:
         c = cost[y, :].astype(np.float32)
-        # 寻找局部极小值：在 -c 上找峰
         s = _smooth1d(-c, 7)
         N = len(s)
         mins: list[int] = []
         for i in range(1, N - 1):
             if s[i] >= s[i - 1] and s[i] >= s[i + 1]:
                 mins.append(i)
-        # 贪心挑选 n-1 个代价最小的“谷”，并保持最小间隔
         order = sorted(mins, key=lambda i: c[i])  # cost 越小越好
         picks: list[int] = []
         min_sep = W / (n * max(1e-3, min_sep_ratio_local))
@@ -615,18 +624,14 @@ def lanes_slanted(
                 picks.append(idx)
             if len(picks) >= n - 1:
                 break
-        # 若不足，退化为接近等距的低代价点
         if len(picks) < n - 1:
             step = W / n
             targets = [(j + 1) * step for j in range(n - 1)]
-            # 在每个 target 邻域找局部最小
             for t in targets:
-                r = int(max(2, round(0.08 * step)))  # 8% 宽度的搜寻半径
+                r = int(max(2, round(0.08 * step)))  # 8% 宽度搜索半径
                 l = int(max(0, round(t) - r)); rgt = int(min(W - 1, round(t) + r))
-                if l >= rgt: 
-                    continue
+                if l >= rgt: continue
                 j = l + int(np.argmin(c[l:rgt + 1]))
-                # 保持最小间隔
                 if all(abs(j - p) >= 0.6 * min_sep for p in picks):
                     picks.append(j)
             picks = sorted(picks)[:(n - 1)]
@@ -634,31 +639,22 @@ def lanes_slanted(
             return False, np.array([], dtype=np.int32)
 
         picks = sorted(picks)
-        # 列宽
         seps = np.array([0] + picks + [W], dtype=np.int32)
         widths = np.diff(seps).astype(np.float32)
         mu = float(widths.mean()); sd = float(widths.std(ddof=1)) if len(widths) > 1 else 0.0
-        if mu <= 1e-6:
-            return False, np.array([], dtype=np.int32)
+        if mu <= 1e-6: return False, np.array([], dtype=np.int32)
         cv = sd / mu if mu > 0 else 1.0
-
-        # 若存在明显离群宽度，判不合格（整行丢弃）
         bad = np.abs(widths - mu) / mu > drop_outlier_tol
-        if np.any(bad):
-            return False, np.array([], dtype=np.int32)
+        if np.any(bad): return False, np.array([], dtype=np.int32)
 
-        # 整数倍均分补点（把过宽区间拆分）
-        # 只在 pick 数不足或 CV 超阈值时尝试
         if len(picks) != n - 1 or cv > cv_max:
             new_edges = [0]
             for w, a, b in zip(widths, seps[:-1], seps[1:]):
                 ratio = w / mu
                 k_best = 1
-                # 找是否接近 2..K 的整数倍
-                for k in range(2, int_mul_k_max + 1):
-                    if abs(ratio - k) <= int_mul_tol:
-                        k_best = k
-                        break
+                for k2 in range(2, int_mul_k_max + 1):
+                    if abs(ratio - k2) <= int_mul_tol:
+                        k_best = k2; break
                 if k_best == 1:
                     new_edges.append(b)
                 else:
@@ -667,9 +663,7 @@ def lanes_slanted(
                         new_edges.append(int(round(a + kk * stepw)))
                     new_edges.append(b)
             new_edges = np.array(sorted(set(new_edges)), dtype=np.int32)
-            # 避免重复/越界
             new_edges[0] = 0; new_edges[-1] = W
-            # 若分隔数仍不对，按最近等距微调
             if len(new_edges) - 1 != n:
                 step = W / n
                 uniform = np.array([int(round((j + 1) * step)) for j in range(n - 1)], dtype=np.int32)
@@ -678,45 +672,40 @@ def lanes_slanted(
                 seps2 = new_edges
             widths2 = np.diff(seps2).astype(np.float32)
             mu2 = float(widths2.mean()); sd2 = float(widths2.std(ddof=1)) if len(widths2) > 1 else 0.0
-            cv2 = sd2 / mu2 if mu2 > 0 else 1.0
-            if len(seps2) == n + 1 and cv2 <= max(cv_max, 0.28):  # 放宽一点以通过筛选
+            cv2v = sd2 / mu2 if mu2 > 0 else 1.0
+            if len(seps2) == n + 1 and cv2v <= max(cv_max, 0.28):
                 return True, seps2[1:-1].astype(np.int32)
-            # 否则回退原 picks，继续交由外层挑其他 y
             return False, np.array([], dtype=np.int32)
 
-        # 直接合格
         return True, np.array(picks, dtype=np.int32)
 
-    # 在可用高度内抽样若干行，寻找“近似等分”的种子分隔
+    # 候选行
     rng_top = max(0, y0_anchors)
     rng_bot = min(H - 1, y1_anchors - 1)
     candidate_rows = np.linspace(rng_top + 2, rng_bot - 2, num=max(9, int(0.15 * H)), dtype=np.int32)
+
     seed_ok = False; y_seed = int((rng_top + rng_bot) // 2); seps_seed = None
     best_cv = 1e9; best_picks = None; best_y = y_seed
-
     for yy in candidate_rows:
         ok, picks = _row_seed_separators(int(yy), min_sep_ratio_local=min_sep_ratio,
                                          int_mul_k_max=4, int_mul_tol=0.18,
                                          cv_max=0.25, drop_outlier_tol=0.45)
         if ok and (len(picks) == n - 1):
-            # 记录最佳（以列宽 CV 为准）
             widths = np.diff(np.array([0] + list(picks) + [W], dtype=np.int32)).astype(np.float32)
             mu = float(widths.mean()); sd = float(widths.std(ddof=1)) if len(widths) > 1 else 0.0
             cv = sd / mu if mu > 0 else 1.0
             if cv < best_cv:
                 best_cv, best_picks, best_y = cv, picks, int(yy)
-                if cv <= 0.15:  # 已足够均匀，提前接受
-                    break
-
+            if cv <= 0.15:
+                break
     if best_picks is not None:
         seed_ok, y_seed, seps_seed = True, best_y, best_picks
     else:
-        # 兜底：用几何等距作为种子
         step = W / n
         seps_seed = np.array([int(round((i + 1) * step)) for i in range(n - 1)], dtype=np.int32)
         seed_ok, y_seed = True, int((rng_top + rng_bot) // 2)
 
-    # ---------- 3) 构建锚点 ----------
+    # ---------------- 3) 锚点（与原逻辑一致） ----------------
     M = max(3, int(anchor_count))
     ys_anchor = np.linspace(y0_anchors, y1_anchors - 1, M).astype(np.int32)
     band = max(5, int(anchor_band_px)); band += (band % 2 == 0)
@@ -744,25 +733,21 @@ def lanes_slanted(
         thr = z.mean() - 0.15 * z.std()
         for i in idx:
             i = int(i)
-            if score[i] < thr:
-                break
+            if score[i] < thr: break
             if all(abs(i - c) >= min_sep for c in centers):
                 centers.append(i)
-            if len(centers) >= n:
-                break
+            if len(centers) >= n: break
         if len(centers) < n or z.size < max(2, n):
-            step = max(1.0, W / max(1, n))
-            centers = [int((j + 0.5) * step) for j in range(n)]
+            step2 = max(1.0, W / max(1, n))
+            centers = [int((j + 0.5) * step2) for j in range(n)]
         centers.sort()
         return centers
 
     centers_list = [_pick_centers_band(int(yy)) for yy in ys_anchor]
 
-    # —— 将“种子分隔”转换为“种子中心”，并插入为额外锚点 —— #
     if seed_ok and seps_seed is not None and len(seps_seed) == n - 1:
         seps_full = np.array([0] + list(seps_seed) + [W], dtype=np.int32)
         centers_seed = [int(round(0.5 * (seps_full[i] + seps_full[i + 1]))) for i in range(n)]
-        # 将 y_seed 插入 ys_anchor 的有序位置
         ys_aug = np.append(ys_anchor, y_seed).astype(np.int32)
         centers_aug = centers_list + [centers_seed]
         order = np.argsort(ys_aug)
@@ -770,7 +755,6 @@ def lanes_slanted(
         centers_list = [centers_aug[i] for i in order]
         M = len(ys_anchor)
 
-    # 由相邻中心中点得到锚点分隔（seps_anchor: M×(n-1)）
     seps_anchor = np.zeros((M, n - 1), dtype=np.float32)
     gaps_anchor = np.zeros((M, n - 1), dtype=np.float32)
     for m in range(M):
@@ -779,7 +763,7 @@ def lanes_slanted(
             seps_anchor[m, i] = 0.5 * (c[i] + c[i + 1])
             gaps_anchor[m, i] = c[i + 1] - c[i]
 
-    # ---------- 4) 参考分隔曲线 & 走廊（插值 + 外推） ----------
+    # ---------------- 4) 参考分隔曲线 & 走廊 ----------------
     ys_all = np.arange(H, dtype=np.float32)
     yk = ys_anchor.astype(np.float32)
     xref_all: list[np.ndarray] = []
@@ -791,63 +775,63 @@ def lanes_slanted(
         xref_all.append(x_ref.astype(np.float32))
         halfw_all.append(half_w.astype(np.float32))
 
-    # ---------- 4.5) 顶/底：等距种子 → 数据驱动（退火混合） ----------
-    # 顶端
-    y_start_for_blend = max(1, int(top_ig))
-    y_blend_top = int(max(1, max(y_start_for_blend, round(0.08 * H))))
-    # 底端
-    y_end_for_blend = H - max(1, int(bot_ig))
-    y_blend_bot = int(min(H - 1, min(y_end_for_blend, round(0.92 * H))))
-
-    if y_blend_top > 1 or y_blend_bot < H - 1:
+    # ---------------- 4.5) 顶/底“等距混合” -> 默认关闭 ----------------
+    if enable_uniform_blend:
+        y_blend_top = uniform_blend_top_y
+        y_blend_bot = uniform_blend_bot_y
+        if y_blend_top is None:
+            y_start_for_blend = max(1, int(top_ig))
+            y_blend_top = int(max(1, max(y_start_for_blend, round(0.08 * H))))
+        if y_blend_bot is None:
+            y_end_for_blend = H - max(1, int(bot_ig))
+            y_blend_bot = int(min(H - 1, min(y_end_for_blend, round(0.92 * H))))
         step_uni = W / float(max(1, n))
-    if y_blend_top > 1:
-        alpha_top = np.linspace(1.0, 0.0, y_blend_top, dtype=np.float32)
-        for i in range(n - 1):
-            x_uni = (i + 1) * step_uni
-            xref_all[i][:y_blend_top] = alpha_top * x_uni + (1.0 - alpha_top) * xref_all[i][:y_blend_top]
-    if y_blend_bot < H - 1:
-        L = H - y_blend_bot
-        alpha_bot = np.linspace(1.0, 0.0, L, dtype=np.float32)
-        y_slice = np.arange(y_blend_bot, H, dtype=np.int32)
-        for i in range(n - 1):
-            x_uni = (i + 1) * step_uni
-            seg = xref_all[i][y_slice]
-            xref_all[i][y_slice] = alpha_bot * x_uni + (1.0 - alpha_bot) * seg
+        if y_blend_top > 1:
+            alpha_top = np.linspace(1.0, 0.0, y_blend_top, dtype=np.float32)
+            for i in range(n - 1):
+                x_uni = (i + 1) * step_uni
+                xref_all[i][:y_blend_top] = alpha_top * x_uni + (1.0 - alpha_top) * xref_all[i][:y_blend_top]
+        if y_blend_bot < H - 1:
+            L = H - y_blend_bot
+            alpha_bot = np.linspace(1.0, 0.0, L, dtype=np.float32)
+            y_slice = np.arange(y_blend_bot, H, dtype=np.int32)
+            for i in range(n - 1):
+                x_uni = (i + 1) * step_uni
+                seg = xref_all[i][y_slice]
+                xref_all[i][y_slice] = alpha_bot * x_uni + (1.0 - alpha_bot) * seg
 
-    # ---------- 5) DP：逐条分隔线（左→右），不交叉 ----------
+    # ---------------- 5) DP：逐条分隔线（左->右），不交叉 ----------------
     bounds = np.zeros((H, n + 1), dtype=np.int32)
     bounds[:, 0] = 0; bounds[:, -1] = W
 
-    y_start = max(1, int(top_ig))           # 顶端忽略带上界
-    y_end   = H - max(1, int(bot_ig))       # 底端忽略带下界
+    y_start = max(1, int(top_ig))
+    y_end = H - max(1, int(bot_ig))
 
     def _dp_one_separator(i_sep: int, left_guard: np.ndarray | None) -> np.ndarray:
         x_ref = xref_all[i_sep]
         half_w = halfw_all[i_sep]
 
-        # 初始走廊：参考线 ± half_w
         xL = np.maximum(0, np.floor(x_ref - half_w)).astype(np.int32)
         xR = np.minimum(W - 1, np.ceil(x_ref + half_w)).astype(np.int32)
 
-        # 左护栏（不交叉）
+        # 左护栏：避免与左侧分隔交叉
         if left_guard is not None:
             xL = np.maximum(xL, left_guard + 1)
-        # 右侧上界：不超过下一条参考线 - 1
+
+        # 右上界：不超过下一条参考线 - 1
         if i_sep < n - 2:
             xR = np.minimum(xR, np.floor(xref_all[i_sep + 1] - 1).astype(np.int32))
 
-        # 顶/底忽略带内：动态窄走廊（±d，d 随 half_w）
+        # 顶/底忽略段：动态收窄走廊
         if y_start > 1:
             d_top = np.maximum(1, np.minimum(4, np.rint(0.3 * half_w[:y_start]).astype(np.int32)))
             xL[:y_start] = np.maximum(0, np.floor(x_ref[:y_start] - d_top)).astype(np.int32)
-            xR[:y_start] = np.minimum(W - 1, np.ceil (x_ref[:y_start] + d_top)).astype(np.int32)
+            xR[:y_start] = np.minimum(W - 1, np.ceil(x_ref[:y_start] + d_top)).astype(np.int32)
         if y_end < H - 1:
             d_bot = np.maximum(1, np.minimum(4, np.rint(0.3 * half_w[y_end:]).astype(np.int32)))
             xL[y_end:] = np.maximum(0, np.floor(x_ref[y_end:] - d_bot)).astype(np.int32)
-            xR[y_end:] = np.minimum(W - 1, np.ceil (x_ref[y_end:] + d_bot)).astype(np.int32)
+            xR[y_end:] = np.minimum(W - 1, np.ceil(x_ref[y_end:] + d_bot)).astype(np.int32)
 
-        # 每行至少 3px 宽
         bad = (xR - xL < 2)
         if np.any(bad):
             fix = np.where(bad)[0]
@@ -857,39 +841,41 @@ def lanes_slanted(
                 xL[y], xR[y] = xl, xl + 2
 
         widths = (xR - xL + 1).astype(np.int32)
-        maxw = int(widths.max())
-        INF = 1e9
+        maxw = int(widths.max()); INF = 1e9
 
-        # 局部 cost
         C = np.full((H, maxw), INF, dtype=np.float32)
         for y in range(H):
             w = widths[y]
             C[y, :w] = cost[y, xL[y]:xR[y] + 1]
 
-        # 动规表
         E = np.full_like(C, INF)
         P = np.zeros(C.shape, dtype=np.int16)
 
-        # 初始化（含顶端忽略段）
+        # 顶部初始化 —— 关键改动：参考线惩罚“渐入”，避免把起始 x 锁死一致
         y0_dp = max(1, y_start)
+        ramp_len = max(1, min(y0_dp, int(0.03 * H)))  # ~3% 高度的线性渐入
         for y in range(0, y0_dp):
             w = widths[y]
             xs = xL[y] + np.arange(w, dtype=np.int32)
-            E[y, :w] = C[y, :w] + lambda_ref * (xs.astype(np.float32) - x_ref[y])**2
+            # 线性从 0 -> lambda_ref 的权重
+            w_ref = (0.0 if ramp_len <= 1 else (float(y) / float(ramp_len - 1))) * float(lambda_ref)
+            ref_pen = w_ref * (xs.astype(np.float32) - x_ref[y]) ** 2
+            E[y, :w] = C[y, :w] + ref_pen
 
         s = int(max(1, max_step_px))
         for y in range(1, H):
             w = widths[y]
             w_prev = widths[y - 1]
             xs_now = (xL[y] + np.arange(w)).astype(np.int32)
-            ref_pen = lambda_ref * (xs_now.astype(np.float32) - x_ref[y])**2
+            # 常规行开始应用完整 lambda_ref
+            ref_pen = float(lambda_ref) * (xs_now.astype(np.float32) - x_ref[y]) ** 2
             for j in range(w):
                 xj = xs_now[j]
                 k0 = max(0, (xj - s) - xL[y - 1])
                 k1 = min(w_prev - 1, (xj + s) - xL[y - 1])
                 if k0 <= k1:
                     xs_prev = (xL[y - 1] + np.arange(k0, k1 + 1)).astype(np.int32)
-                    step_pen = gamma_step * np.abs(xs_prev - xj).astype(np.float32)
+                    step_pen = float(gamma_step) * np.abs(xs_prev - xj).astype(np.float32)
                     cand = E[y - 1, k0:k1 + 1] + step_pen
                     kk = int(np.argmin(cand))
                     E[y, j] = C[y, j] + ref_pen[j] + cand[kk]
@@ -897,7 +883,6 @@ def lanes_slanted(
                 else:
                     E[y, j] = C[y, j] + ref_pen[j] + INF / 4
 
-        # 回溯
         seam = np.zeros(H, dtype=np.int32)
         j = int(np.argmin(E[H - 1, :widths[H - 1]]))
         seam[H - 1] = xL[H - 1] + j
@@ -905,7 +890,6 @@ def lanes_slanted(
             j = int(P[y, j])
             seam[y - 1] = xL[y - 1] + j
 
-        # 纵向轻度平滑
         if smooth_y is not None and smooth_y >= 3:
             sy = int(smooth_y)
             if sy % 2 == 0:
@@ -922,11 +906,10 @@ def lanes_slanted(
         seam = _dp_one_separator(i, left_guard)
         seps.append(seam)
         left_guard = seam
-
     for i in range(1, n):
         bounds[:, i] = seps[i - 1]
 
-    # ---------- 6) 健壮性收尾 ----------
+    # ---------------- 6) 健壮性收尾 & 行内约束 ----------------
     if n >= 2:
         mid_x = np.median(bounds[:, 1:n], axis=0)
         if float(np.max(mid_x) - np.min(mid_x)) <= 1.0:
@@ -935,19 +918,16 @@ def lanes_slanted(
                 x_line = int(round(i * step))
                 bounds[:, i] = np.clip(x_line, 0, W - 1)
 
-    # 行内严格不交叉 + 最小间距
     margin = 2
     for y in range(H):
         row = bounds[y, :].astype(np.int32, copy=True)
-        for i in range(1, n):          # 左→右
+        for i in range(1, n):             # 左->右，至少 margin
             row[i] = max(row[i], row[i - 1] + margin)
         row[-1] = W
-        for i in range(n - 1, 0, -1):  # 右→左
+        for i in range(n - 1, 0, -1):     # 右->左，至少 margin
             row[i] = min(row[i], row[i + 1] - margin)
         bounds[y, :] = np.clip(row, 0, W)
-
     return bounds
-
 
 
 
@@ -993,45 +973,44 @@ def render_annotation_slanted(gel_bgr: np.ndarray,
                               tick_labels: List[float],
                               yaxis_side: str = 'left') -> np.ndarray:
     """
-    渲染说明（2025-08-25 改）：
-    - 取消蓝色横线（不再在原图上画 ladder_peaks_y）。
-    - 在图像左侧新增白色标签栏（不覆盖原图），把分子量标签画在白色栏上。
-    - 标签位置来自“检测到的峰的真实 y（ladder_peaks_y）”，文本来自“输入 ladder_labels”，
-      两者通过“自顶向下 ↔ 大→小”的一一配对（取长度较小部分）。
-    - 边界折线（绿色）保持绘制，但整体右移 label_panel_w。
-    - 保留 a/b/tick_labels/yaxis_side 形参以兼容，但本函数内不再使用它们。
+    渲染说明：
+    - 左侧白色标签栏（不覆盖原图），把分子量标注画在白色栏上。
+    - 标注位置来自“检测到的峰真实 y (ladder_peaks_y)”，文本来自“输入 ladder_labels”，
+      两者通过“自顶向下 ↔ 大->小”的顺序一一配对（取两者长度较小部分）。
+    - 文字仅显示“数字”，并右对齐到一条“短横线”的左边；短横线仅在白色标签栏内。
     """
     H, W, _ = gel_bgr.shape
-
-    # 1) 左侧白色标签栏
-    label_panel_w = 130
+    label_panel_w = 80
     canvas = np.full((H, W + label_panel_w, 3), 255, dtype=np.uint8)
     canvas[:, label_panel_w:label_panel_w + W] = gel_bgr
 
-    # 2) 绿色边界折线（整体右移）
+    # 绿色边界折线
     if bounds is not None and bounds.ndim == 2 and bounds.shape[0] == H:
         for i in range(1, bounds.shape[1] - 1):
             pts = np.stack([bounds[:, i] + label_panel_w, np.arange(H)], axis=1).astype(np.int32)
             cv2.polylines(canvas, [pts], isClosed=False, color=(0, 255, 0), thickness=1)
 
-    # 3) 分子量标签（红色）画在白色栏，位置=检测到的峰的真实 y
-    if ladder_peaks_y is not None and ladder_labels is not None \
-       and len(ladder_peaks_y) > 0 and len(ladder_labels) > 0:
+    # 分子量标注（仅数字 + 短横线）
+    if ladder_peaks_y and ladder_labels:
         ys = sorted([int(round(float(y))) for y in ladder_peaks_y])
         lbs = sorted([float(x) for x in ladder_labels], reverse=True)
         K = min(len(ys), len(lbs))
 
-        tick_x1 = 10
-        tick_x2 = label_panel_w - 8
-        txt_x  = 14
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale, thickness = 0.5, 1
+        color_text, color_tick = (0, 0, 0), (0, 0, 0)
+        margin_right, tick_len, tick_gap = 2, 12, 3
+        x2 = label_panel_w - 1 - margin_right
+        x1 = max(2, x2 - tick_len + 1)
+
         for y, mw in zip(ys[:K], lbs[:K]):
             if 0 <= y < H:
-                #cv2.line(canvas, (tick_x1, y), (tick_x2, y), (0, 0, 255), 2)
-                cv2.putText(canvas, f"{mw:g} kDa",
-                            (txt_x, max(15, y)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            (0, 0, 255), 1, cv2.LINE_AA)
+                y_draw = int(np.clip(y, 12, H - 5))
+                cv2.line(canvas, (x1, y_draw), (x2, y_draw), color_tick, 1, cv2.LINE_AA)
+                text = f"{mw:g}"
+                (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+                x_text = max(2, x1 - tick_gap - tw)
+                cv2.putText(canvas, text, (x_text, y_draw + th // 2 - 1),
+                            font, font_scale, color_text, thickness, cv2.LINE_AA)
 
-    # 4) 不再绘制蓝色横线
     return canvas
-

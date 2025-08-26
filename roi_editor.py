@@ -4,7 +4,7 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 import numpy as np
 from PIL import Image, ImageTk
 import cv2
@@ -12,40 +12,61 @@ import math
 
 
 @dataclass
-class Box:
-    x: int
-    y: int
-    w: int
-    h: int
+class RBox:
+    """旋转矩形：中心坐标 + 宽高（像素，图像坐标系），角度由外部基准线提供。"""
+    cx: float
+    cy: float
+    w: float
+    h: float
 
-    def as_tuple(self) -> Tuple[int, int, int, int]:
-        return (int(self.x), int(self.y), int(self.w), int(self.h))
+    def as_center_size(self) -> Tuple[float, float, float, float]:
+        return float(self.cx), float(self.cy), float(self.w), float(self.h)
 
-    def clamp(self, W: int, H: int):
-        self.x = max(0, min(self.x, W - 1))
-        self.y = max(0, min(self.y, H - 1))
-        self.w = max(1, min(self.w, W - self.x))
-        self.h = max(1, min(self.h, H - self.y))
+    def to_aabb(self, angle_deg: float) -> Tuple[int, int, int, int]:
+        """把旋转矩形在给定角度下的外接轴对齐框（AABB）返回为 x,y,w,h（int）。"""
+        corners = RBox._corners(self.cx, self.cy, self.w, self.h, angle_deg)
+        xs = [p[0] for p in corners]
+        ys = [p[1] for p in corners]
+        x0 = int(math.floor(min(xs)))
+        y0 = int(math.floor(min(ys)))
+        x1 = int(math.ceil(max(xs)))
+        y1 = int(math.ceil(max(ys)))
+        return x0, y0, max(1, x1 - x0), max(1, y1 - y0)
+
+    @staticmethod
+    def _corners(cx: float, cy: float, w: float, h: float, angle_deg: float) -> List[Tuple[float, float]]:
+        """返回按顺时针顺序的四个角点（图像坐标）。"""
+        hw, hh = w / 2.0, h / 2.0
+        # 局部坐标（u-v）
+        pts = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+        rad = math.radians(angle_deg)
+        cosA, sinA = math.cos(rad), math.sin(rad)
+        out = []
+        for u, v in pts:
+            x = cx + (u * cosA - v * sinA)
+            y = cy + (u * sinA + v * cosA)
+            out.append((x, y))
+        return out
 
 
 class ROIEditorCanvas(ttk.Frame):
     """
-    一个可缩放/平移的图像画布，支持交互式拖拽编辑矩形 ROI：
-    - 左键拖动角/边修改 ROI，左键拖动内部移动 ROI
-    - 左键空白处拖拽新建 ROI
-    - 右键拖动画布平移
-    - 滚轮缩放（以光标为中心）
-    - 方向键/Shift+方向键 像素级微调
-
+    可缩放/平移的图像画布，支持交互式拖拽编辑“随基准线旋转”的矩形 ROI：
+    - 左键拖动角/边修改 ROI（在 ROI 局部坐标系内缩放），左键拖动内部移动 ROI
+    - 左键空白处拖拽新建 ROI（创建的是与基准线同角度的旋转矩形）
+    - 右键/中键平移画布；滚轮缩放（以光标为中心）
+    - 方向键/Shift+方向键：以像素级微调 ROI 中心
     扩展：新增“校准横线”以手动校准倾斜（±15°）
     - 永久显示；支持拖动（平移）与端点旋转（保持长度不变）
     - 旋转角度限制在 [-15°, +15°]
-    - 通过 get_angle_deg() 提供当前角度（用于下游裁剪后“摆正”）
+    - 通过 get_angle_deg() 提供当前角度（用于下游裁剪后的“摆正”）
     """
-    HANDLE_SIZE = 5        # ROI 角点可见更清晰
-    CORNER_LEN = 18        # ROI L 形角标长度
-    LINE_HANDLE_SZ = 6     # 校准线端点/中心手柄可见尺寸
+    HANDLE_SIZE = 5            # ROI 角点可见更清晰
+    EDGE_HANDLE_SIZE = 5       # 边中点句柄
+    CORNER_LEN = 18            # ROI L 形角标长度（保留视觉风格）
+    LINE_HANDLE_SZ = 6         # 校准线端点/中心手柄可见尺寸
     LINE_COLOR = "#00d1ff"
+    ROI_COLOR = "#20f28b"
 
     def __init__(self, master, **kwargs):
         super().__init__(master, **kwargs)
@@ -62,8 +83,8 @@ class ROIEditorCanvas(ttk.Frame):
         self.offset_x = 0.0  # 画布坐标系中图像左上角位置
         self.offset_y = 0.0
 
-        # ROI
-        self.box: Optional[Box] = None
+        # ROI：旋转矩形（角度使用 cal_angle_deg）
+        self.rbox: Optional[RBox] = None
 
         # 校准线（以图像坐标存储：中心+长度+角度）
         self.cal_cx: float = 0.0
@@ -75,38 +96,39 @@ class ROIEditorCanvas(ttk.Frame):
         self.dragging = False
         self.drag_mode = None  # "move" | "new" | "resize-<tag>" | "pan" | "line-move" | "line-rot-p1" | "line-rot-p2"
         self.drag_start = (0, 0)  # canvas coords
-        self.orig_box: Optional[Box] = None
-        self.orig_line = None     # (cx,cy,len,angle) 在旋转/拖动校准线时保存初始值
+        self.orig_rbox: Optional[RBox] = None
+        self.orig_line = None  # (cx,cy,len,angle) 在旋转/拖动校准线时保存初始值
 
         # 事件绑定
         self.canvas.bind("<Configure>", self._on_resize)
         self.canvas.bind("<Button-1>", self._on_left_down)
         self.canvas.bind("<B1-Motion>", self._on_left_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_left_up)
-        self.canvas.bind("<Button-2>", self._on_mid_down)      # 有些平台中键平移
+        self.canvas.bind("<Button-2>", self._on_mid_down)   # 有些平台中键平移
         self.canvas.bind("<B2-Motion>", self._on_mid_drag)
         self.canvas.bind("<ButtonRelease-2>", self._on_mid_up)
-        self.canvas.bind("<Button-3>", self._on_right_down)    # 右键平移
+        self.canvas.bind("<Button-3>", self._on_right_down) # 右键平移
         self.canvas.bind("<B3-Motion>", self._on_right_drag)
         self.canvas.bind("<ButtonRelease-3>", self._on_right_up)
+
         # 滚轮（Win/Mac/Linux 兼容）
-        self.canvas.bind("<MouseWheel>", self._on_mousewheel)      # Windows/Mac
-        self.canvas.bind("<Button-4>", self._on_mousewheel_linux)  # Linux up
-        self.canvas.bind("<Button-5>", self._on_mousewheel_linux)  # Linux down
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)     # Windows/Mac
+        self.canvas.bind("<Button-4>", self._on_mousewheel_linux) # Linux up
+        self.canvas.bind("<Button-5>", self._on_mousewheel_linux) # Linux down
 
         # 键盘微调
         self.canvas.focus_set()
         self.canvas.bind("<Up>",    lambda e: self._nudge(0, -1, e))
         self.canvas.bind("<Down>",  lambda e: self._nudge(0,  1, e))
         self.canvas.bind("<Left>",  lambda e: self._nudge(-1, 0, e))
-        self.canvas.bind("<Right>", lambda e: self._nudge(1,  0, e))
+        self.canvas.bind("<Right>", lambda e: self._nudge( 1, 0, e))
 
         # 信息栏
         self.info_var = tk.StringVar(value="")
         self.lbl_info = ttk.Label(self, textvariable=self.info_var, foreground="#ddd")
         self.lbl_info.pack(anchor="w", padx=6, pady=4)
 
-    # --------------- 公有 API ---------------
+    # ---------- 公有 API ----------
     def set_image(self, img_bgr: np.ndarray):
         self.img_bgr = img_bgr
         rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -115,7 +137,7 @@ class ROIEditorCanvas(ttk.Frame):
         self.scale = 1.0
         self.offset_x = self.offset_y = 0.0
         self._fit_to_window()
-        # 初始化校准线（位于图上方 20% 处，长度为宽度的 60%，角度 0）
+        # 初始化校准线（位于图上方 18% 处，长度为宽度的 60%，角度 0）
         H, W = img_bgr.shape[0], img_bgr.shape[1]
         self.cal_cx = W / 2.0
         self.cal_cy = max(10.0, H * 0.18)
@@ -124,28 +146,51 @@ class ROIEditorCanvas(ttk.Frame):
         self.redraw()
 
     def set_roi(self, box: Tuple[int, int, int, int] | None):
+        """
+        兼容旧接口：输入轴对齐框 (x,y,w,h) 或 None。
+        内部转换为旋转矩形的“中心+宽高”，角度由 cal_angle_deg 决定。
+        """
         if box is None:
-            self.box = None
+            self.rbox = None
         else:
-            self.box = Box(*map(int, box))
-        self._clamp_box()
+            x, y, w, h = map(int, box)
+            cx = x + w / 2.0
+            cy = y + h / 2.0
+            self.rbox = RBox(cx, cy, max(1.0, float(w)), max(1.0, float(h)))
+            self._clamp_rbox_basic()
         self.redraw()
 
     def get_roi(self) -> Optional[Tuple[int, int, int, int]]:
-        return self.box.as_tuple() if self.box else None
+        """保持兼容：返回当前“旋转 ROI”的外接轴对齐框 (x,y,w,h)。"""
+        if self.rbox is None:
+            return None
+        return self.rbox.to_aabb(self.cal_angle_deg)
+
+    def get_rotated_roi(self):
+        """
+        返回 (cx, cy, w, h, angle_deg_ccw)
+        - cx,cy,w,h：图像坐标/像素，w、h 为 ROI 局部宽高
+        - angle_deg_ccw：对外统一为 OpenCV 语义（逆时针 CCW 为正）
+        """
+        if self.rbox is None:
+            return None
+        cx, cy, w, h = self.rbox.as_center_size()
+        # 画布内部若使用 CW 为正，这里导出成 CCW 为正：取反
+        angle_deg_ccw = float(-self.cal_angle_deg)
+        return float(cx), float(cy), float(w), float(h), angle_deg_ccw
 
     def get_angle_deg(self) -> float:
         """返回当前校准线角度（度），范围 [-15, +15]。正值=顺时针（向右上倾斜）。"""
         return float(self.cal_angle_deg)
 
-    # --------------- 坐标转换 ---------------
+    # ---------- 坐标转换 ----------
     def img_to_canvas(self, x: float, y: float) -> Tuple[float, float]:
         return (x * self.scale + self.offset_x, y * self.scale + self.offset_y)
 
     def canvas_to_img(self, cx: float, cy: float) -> Tuple[float, float]:
         return ((cx - self.offset_x) / self.scale, (cy - self.offset_y) / self.scale)
 
-    # --------------- 事件处理 ---------------
+    # ---------- 事件处理 ----------
     def _on_resize(self, _):
         self.redraw()
 
@@ -161,7 +206,7 @@ class ROIEditorCanvas(ttk.Frame):
             self.dragging = True
             self.drag_start = (cx, cy)
             self.orig_line = (self.cal_cx, self.cal_cy, self.cal_len, self.cal_angle_deg)
-            if tag_line == "line_c" or tag_line == "line_seg":
+            if tag_line in ("line_c", "line_seg"):
                 self.drag_mode = "line-move"
             elif tag_line == "line_p1":
                 self.drag_mode = "line-rot-p1"
@@ -170,30 +215,38 @@ class ROIEditorCanvas(ttk.Frame):
             return
 
         # ② ROI 操作
-        if self.box:
-            tag = self._hit_test_handles(cx, cy)
+        if self.rbox:
+            tag = self._hit_test_rbox_handles(cx, cy)
             if tag:
-                # 拖拽边/角
+                # 拖拽边/角（在 ROI 局部坐标系下）
                 self.drag_mode = f"resize-{tag}"
                 self.dragging = True
                 self.drag_start = (cx, cy)
-                self.orig_box = Box(self.box.x, self.box.y, self.box.w, self.box.h)
+                self.orig_rbox = RBox(self.rbox.cx, self.rbox.cy, self.rbox.w, self.rbox.h)
                 return
 
-            # 点在 ROI 内 → 移动
-            if self._point_in_box_canvas(cx, cy, self.box):
+            # 点在旋转 ROI 内 → 移动
+            if self._point_in_rbox_canvas(cx, cy, self.rbox, self.cal_angle_deg):
                 self.drag_mode = "move"
                 self.dragging = True
                 self.drag_start = (cx, cy)
-                self.orig_box = Box(self.box.x, self.box.y, self.box.w, self.box.h)
+                self.orig_rbox = RBox(self.rbox.cx, self.rbox.cy, self.rbox.w, self.rbox.h)
                 return
 
-        # ③ 空白处 → 新建 ROI
+        # ③ 空白处 → 新建 ROI（初始创建为与基准线同角度的矩形）
         self.drag_mode = "new"
         self.dragging = True
         self.drag_start = (cx, cy)
         ix, iy = self.canvas_to_img(cx, cy)
-        self.box = Box(int(ix), int(iy), 1, 1)
+        # 初始给 1x1，后续拖动时计算外接框 → 转为旋转矩形
+        self.rbox = RBox(float(ix), float(iy), 1.0, 1.0)
+        self.redraw()
+    def reset_angle(self):
+        """
+        将校准线旋转角设为 0°（水平），并重绘。
+        仅修改角度，不改变校准线的中心位置与长度。
+        """
+        self.cal_angle_deg = 0.0
         self.redraw()
 
     def _on_left_drag(self, e):
@@ -209,7 +262,6 @@ class ROIEditorCanvas(ttk.Frame):
             if self.orig_line is None:
                 return
             ocx, ocy, olen, oang = self.orig_line
-
             if self.drag_mode == "line-move":
                 # 画布位移 → 图像位移
                 mx = dx / self.scale
@@ -219,73 +271,81 @@ class ROIEditorCanvas(ttk.Frame):
             else:
                 # 旋转：保持长度，改变角度（以中心为轴）
                 ix, iy = self.canvas_to_img(cx, cy)
-                # 被拖动端点的向量（相对中心）
                 vx = ix - ocx
                 vy = iy - ocy
-                if self.drag_mode == "line-rot-p2":
-                    # 端点 p2：直接用当前向量
-                    pass
-                else:
-                    # 端点 p1：与 p2 相反方向
+                if self.drag_mode == "line-rot-p1":
+                    # 把 p1 的拖动同样映射到“中心→p2”方向，消除端点差异
                     vx, vy = -vx, -vy
-                ang = math.degrees(math.atan2(vy, vx))  # [-180,180]
-                # 限制到 [-15, +15]
-                ang = max(-30.0, min(30.0, ang))
-                self.cal_angle_deg = float(ang)
-                # 中心不变，长度固定
+
+                # 屏幕坐标（y 向下）：atan2(vy, vx) 的正角是【顺时针】
+                # 统一到 (-90°, +90°]，再限幅到 ±15°
+                if abs(vx) + abs(vy) < 1e-9:
+                    theta = 0.0
+                else:
+                    theta = math.degrees(math.atan2(vy, vx))      # [-180, 180)
+                    theta = ((theta + 180.0) % 360.0) - 180.0     # [-180, 180)
+                    if theta > 90.0:
+                        theta -= 180.0
+                    elif theta <= -90.0:
+                        theta += 180.0
+                    theta = max(-45.0, min(45.0, theta))          # 限幅
+                # 不再取反：保持“顺时针为正”
+                self.cal_angle_deg = float(theta)
                 self.cal_cx, self.cal_cy = ocx, ocy
                 self.cal_len = olen
-
             self.redraw()
             return
 
         # —— ROI 操作 —— #
-        if self.box is None:
+        if self.rbox is None and self.drag_mode != "new":
             return
+
         if self.drag_mode == "move":
-            mx = int(round(dx / self.scale))
-            my = int(round(dy / self.scale))
-            self.box.x = self.orig_box.x + mx
-            self.box.y = self.orig_box.y + my
-            self.box.clamp(W, H)
+            mx = dx / self.scale
+            my = dy / self.scale
+            self.rbox.cx = self.orig_rbox.cx + mx
+            self.rbox.cy = self.orig_rbox.cy + my
+            self._clamp_rbox_basic()
 
         elif self.drag_mode and self.drag_mode.startswith("resize-"):
             tag = self.drag_mode.split("-", 1)[1]
             ix, iy = self.canvas_to_img(cx, cy)
-            ix = int(round(ix))
-            iy = int(round(iy))
-            b = Box(self.orig_box.x, self.orig_box.y, self.orig_box.w, self.orig_box.h)
-            if "l" in tag:
-                new_x = min(max(0, ix), b.x + b.w - 1)
-                new_w = b.x + b.w - new_x
-                b.x, b.w = new_x, max(1, new_w)
-            if "r" in tag:
-                new_w = max(1, ix - b.x)
-                b.w = new_w
-            if "t" in tag:
-                new_y = min(max(0, iy), b.y + b.h - 1)
-                new_h = b.y + b.h - new_y
-                b.y, b.h = new_y, max(1, new_h)
-            if "b" in tag:
-                new_h = max(1, iy - b.y)
-                b.h = new_h
-            b.clamp(W, H)
-            self.box = b
+            self._resize_rbox_to_pointer(tag, ix, iy)
 
         elif self.drag_mode == "new":
-            ix0, iy0 = self.canvas_to_img(*self.drag_start)
-            ix1, iy1 = self.canvas_to_img(cx, cy)
-            x0, y0 = int(round(min(ix0, ix1))), int(round(min(iy0, iy1)))
-            x1, y1 = int(round(max(ix0, ix1))), int(round(max(iy0, iy1)))
-            self.box = Box(x0, y0, max(1, x1 - x0), max(1, y1 - y0))
-            self._clamp_box()
+            # 新建：按下起点为锚定角；另一角随鼠标沿“旋转坐标系”变化
+            ax, ay = self.canvas_to_img(*self.drag_start)  # 锚点（固定角）
+            bx, by = self.canvas_to_img(cx, cy)            # 当前鼠标
+
+            rad = math.radians(self.cal_angle_deg)
+            cosA, sinA = math.cos(rad), math.sin(rad)
+            du = (bx - ax) * cosA + (by - ay) * sinA   # 局部 u（宽）方向
+            dv = -(bx - ax) * sinA + (by - ay) * cosA  # 局部 v（高）方向
+
+            ul, ur = (min(0.0, du), max(0.0, du))
+            vt, vb = (min(0.0, dv), max(0.0, dv))
+
+            u_c = (ul + ur) / 2.0
+            v_c = (vt + vb) / 2.0
+            w = max(1.0, ur - ul)
+            h = max(1.0, vb - vt)
+
+            dcx = u_c * cosA - v_c * sinA
+            dcy = u_c * sinA + v_c * cosA
+            cx_new = ax + dcx
+            cy_new = ay + dcy
+
+            self.rbox = RBox(cx_new, cy_new, w, h)
+            self._clamp_rbox_basic()
 
         self.redraw()
+
+
 
     def _on_left_up(self, _):
         self.dragging = False
         self.drag_mode = None
-        self.orig_box = None
+        self.orig_rbox = None
         self.orig_line = None
 
     def _on_right_down(self, e):
@@ -327,15 +387,15 @@ class ROIEditorCanvas(ttk.Frame):
         self._zoom_at(step, e.x, e.y)
 
     def _nudge(self, dx, dy, e):
-        if self.box is None:
+        if self.rbox is None:
             return
         k = 10 if (e.state & 0x0001 or e.state & 0x0004) else 1  # Shift/Ctrl 都加速
-        self.box.x += dx * k
-        self.box.y += dy * k
-        self._clamp_box()
+        self.rbox.cx += dx * k
+        self.rbox.cy += dy * k
+        self._clamp_rbox_basic()
         self.redraw()
 
-    # --------------- 内部工具 ---------------
+    # ---------- 内部工具 ----------
     def _fit_to_window(self):
         if self.img_pil is None:
             return
@@ -351,52 +411,94 @@ class ROIEditorCanvas(ttk.Frame):
         self.offset_y = (ch - H * self.scale) / 2
 
     def _zoom_at(self, factor: float, cx: float, cy: float):
+        """
+        以鼠标位置为锚点缩放；若正在拖拽（move/resize/new/line-*），
+        同步更新 drag_start，使拖拽连续不跳变。
+        """
         old_scale = self.scale
         new_scale = max(self.min_scale, min(self.max_scale, self.scale * factor))
         if abs(new_scale - old_scale) < 1e-6:
             return
-        ix, iy = self.canvas_to_img(cx, cy)
+
+        # 1) 记录缩放锚点（鼠标）对应的图像坐标
+        ix_anchor, iy_anchor = self.canvas_to_img(cx, cy)
+
+        # 2) 若正在拖拽，记录 drag_start 对应的图像坐标（作为“拖拽锚点”）
+        dragging = bool(self.dragging and self.drag_mode)
+        if dragging:
+            ds_cx, ds_cy = self.drag_start  # 旧的 canvas 坐标
+            ds_ix, ds_iy = self.canvas_to_img(ds_cx, ds_cy)
+        else:
+            ds_ix = ds_iy = None
+
+        # 3) 应用缩放，并调整 offset 以保证“鼠标下的图像点”不动
         self.scale = new_scale
-        nx, ny = self.img_to_canvas(ix, iy)
+        nx, ny = self.img_to_canvas(ix_anchor, iy_anchor)  # 新缩放下，该点的 canvas 坐标
         self.offset_x += (cx - nx)
         self.offset_y += (cy - ny)
+
+        # 4) 若正在拖拽，把原 drag_start 对应的“同一图像点”映射回新的 canvas 坐标，保持拖拽连续性
+        if dragging and ds_ix is not None:
+            nds_cx, nds_cy = self.img_to_canvas(ds_ix, ds_iy)
+            self.drag_start = (nds_cx, nds_cy)
+
+        # 5) 重绘
         self.redraw()
 
-    def _clamp_box(self):
-        if self.img_pil is None or self.box is None:
+
+    def _clamp_rbox_basic(self):
+        """基础约束：中心留在图内；宽高范围做保守限制。"""
+        if self.img_pil is None or self.rbox is None:
             return
         W, H = self.img_pil.size
-        self.box.clamp(W, H)
+        self.rbox.cx = float(np.clip(self.rbox.cx, 0, W - 1))
+        self.rbox.cy = float(np.clip(self.rbox.cy, 0, H - 1))
+        self.rbox.w = float(np.clip(self.rbox.w, 1.0, W))
+        self.rbox.h = float(np.clip(self.rbox.h, 1.0, H))
 
-    # ROI 句柄命中测试
-    def _hit_test_handles(self, cx: float, cy: float) -> Optional[str]:
-        if self.box is None:
+    # ---------- ROI 命中/判定 ----------
+    def _hit_test_rbox_handles(self, cx: float, cy: float) -> Optional[str]:
+        """命中旋转矩形的 8 个句柄：lt/rt/rb/lb/l/t/r/b"""
+        if self.rbox is None:
             return None
-        x, y, w, h = self.box.as_tuple()
-        pts = {
-            "lt": (x, y), "rt": (x + w, y),
-            "rb": (x + w, y + h), "lb": (x, y + h),
-            "l": (x, y + h // 2), "t": (x + w // 2, y),
-            "r": (x + w, y + h // 2), "b": (x + w // 2, y + h),
-        }
-        for tag, (ix, iy) in pts.items():
+        # 角点与边中点（图像坐标）
+        corners = RBox._corners(self.rbox.cx, self.rbox.cy, self.rbox.w, self.rbox.h, self.cal_angle_deg)
+        (lt, rt, rb, lb) = corners
+        mids = [
+            ((lt[0] + rt[0]) / 2.0, (lt[1] + rt[1]) / 2.0),  # t
+            ((rt[0] + rb[0]) / 2.0, (rt[1] + rb[1]) / 2.0),  # r
+            ((rb[0] + lb[0]) / 2.0, (rb[1] + lb[1]) / 2.0),  # b
+            ((lb[0] + lt[0]) / 2.0, (lb[1] + lt[1]) / 2.0),  # l
+        ]
+        tags_pts = [
+            ("lt", lt), ("rt", rt), ("rb", rb), ("lb", lb),
+            ("t", mids[0]), ("r", mids[1]), ("b", mids[2]), ("l", mids[3]),
+        ]
+        hs = self.HANDLE_SIZE
+        for tag, (ix, iy) in tags_pts:
             hx, hy = self.img_to_canvas(ix, iy)
-            if abs(cx - hx) <= self.HANDLE_SIZE and abs(cy - hy) <= self.HANDLE_SIZE:
+            if abs(cx - hx) <= hs and abs(cy - hy) <= hs:
                 return tag
         return None
 
-    def _point_in_box_canvas(self, cx: float, cy: float, box: Box) -> bool:
-        x0, y0 = self.img_to_canvas(box.x, box.y)
-        x1, y1 = self.img_to_canvas(box.x + box.w, box.y + box.h)
-        return (x0 <= cx <= x1) and (y0 <= cy <= y1)
+    def _point_in_rbox_canvas(self, cx: float, cy: float, rbox: RBox, angle_deg: float) -> bool:
+        ix, iy = self.canvas_to_img(cx, cy)
+        # 转到 ROI 局部坐标
+        rad = math.radians(angle_deg)
+        cosA, sinA = math.cos(rad), math.sin(rad)
+        dx = ix - rbox.cx
+        dy = iy - rbox.cy
+        # 逆旋转（-angle）
+        u = dx * cosA + dy * sinA
+        v = -dx * sinA + dy * cosA
+        return (abs(u) <= rbox.w / 2.0) and (abs(v) <= rbox.h / 2.0)
 
-    # 校准线命中测试（端点/中心/近线）
+    # ---------- 校准线命中测试 ----------
     def _hit_test_line_handles(self, cx: float, cy: float) -> Optional[str]:
         if self.img_pil is None:
             return None
         (p1x, p1y), (p2x, p2y) = self._line_endpoints_img()
         cix, ciy = self.cal_cx, self.cal_cy
-
         items = [
             ("line_p1", p1x, p1y),
             ("line_p2", p2x, p2y),
@@ -406,13 +508,10 @@ class ROIEditorCanvas(ttk.Frame):
             hx, hy = self.img_to_canvas(ix, iy)
             if abs(cx - hx) <= self.LINE_HANDLE_SZ and abs(cy - hy) <= self.LINE_HANDLE_SZ:
                 return tag
-
         # 近线（拖到线身上 → 平移）
-        # 使用点到线段距离（以“画布像素”为单位）
         dist = self._dist_point_to_segment_canvas(cx, cy, (p1x, p1y), (p2x, p2y))
         if dist <= self.LINE_HANDLE_SZ + 2:
             return "line_seg"
-
         return None
 
     def _line_endpoints_img(self) -> Tuple[Tuple[float, float], Tuple[float, float]]:
@@ -427,7 +526,6 @@ class ROIEditorCanvas(ttk.Frame):
                                       p1_img: Tuple[float, float], p2_img: Tuple[float, float]) -> float:
         x1, y1 = self.img_to_canvas(*p1_img)
         x2, y2 = self.img_to_canvas(*p2_img)
-        # 点到线段距离
         vx, vy = x2 - x1, y2 - y1
         wx, wy = cx - x1, cy - y1
         seg_len2 = vx * vx + vy * vy
@@ -438,7 +536,106 @@ class ROIEditorCanvas(ttk.Frame):
         projy = y1 + t * vy
         return math.hypot(cx - projx, cy - projy)
 
-    # --------------- 绘制 ---------------
+    # ---------- 旋转 ROI 缩放逻辑（在局部坐标系内） ----------
+    def _resize_rbox_to_pointer(self, tag: str, ix: float, iy: float):
+        """
+        在 ROI 局部坐标系内进行缩放：
+        - 角点句柄（lt/rt/rb/lb）：锚点为“对角点”；
+        - 边句柄（l/r/t/b）：锚点为“对侧边整条线”，即该边的位置保持不动（宽/高单向改变）。
+        鼠标点与锚点共同决定新的中心与尺寸。
+        """
+        if self.orig_rbox is None:
+            return
+
+        # 1) 世界坐标 -> ROI 局部坐标（u,v），局部坐标系定义：
+        #    u 轴沿矩形宽方向（向右为 +），v 轴沿高方向（向下为 +）
+        rad = math.radians(self.cal_angle_deg)
+        cosA, sinA = math.cos(rad), math.sin(rad)
+
+        def to_local(x, y, cx0, cy0):
+            dx = x - cx0
+            dy = y - cy0
+            u = dx * cosA + dy * sinA
+            v = -dx * sinA + dy * cosA
+            return u, v
+
+        # 当前鼠标在“原始矩形中心”为基准的局部坐标
+        u_mouse, v_mouse = to_local(ix, iy, self.orig_rbox.cx, self.orig_rbox.cy)
+
+        # 原始半宽/半高
+        w2_0 = self.orig_rbox.w / 2.0
+        h2_0 = self.orig_rbox.h / 2.0
+
+        # 2) 计算“锚点/锚边”的局部坐标边界（ul/ur/vt/vb 分别为左/右/上/下边在线的 u 或 v 值）
+        # 对于角点：锚点是对角点 → 固定一个点 (u_anchor, v_anchor)；
+        # 对于边：锚边是一条线 → 对侧边的位置固定（例如左边拖动时，锚右边 u = +w2_0 不动）。
+        # 然后用  “锚点/锚边 + 鼠标点” 共同决定新的边界，再求新中心与尺寸。
+        # 初始边界取自原始矩形
+        ul, ur = -w2_0, +w2_0   # 左/右边的 u
+        vt, vb = -h2_0, +h2_0   # 上/下边的 v
+
+        # 防止出现 0 或负的尺寸
+        MIN_HALF = 0.5
+
+        if tag in ("lt", "rt", "rb", "lb"):
+            # 角点拖拽：锚点为对角点
+            if tag == "lt":
+                # 锚：rb → ( +w2_0, +h2_0 )；鼠标定义新 (ul, vt)
+                ul = min(u_mouse, ur - 2*MIN_HALF)
+                vt = min(v_mouse, vb - 2*MIN_HALF)
+            elif tag == "rt":
+                # 锚：lb → ( -w2_0, +h2_0 )；鼠标定义新 (ur, vt)
+                ur = max(u_mouse, ul + 2*MIN_HALF)
+                vt = min(v_mouse, vb - 2*MIN_HALF)
+            elif tag == "rb":
+                # 锚：lt → ( -w2_0, -h2_0 )；鼠标定义新 (ur, vb)
+                ur = max(u_mouse, ul + 2*MIN_HALF)
+                vb = max(v_mouse, vt + 2*MIN_HALF)
+            elif tag == "lb":
+                # 锚：rt → ( +w2_0, -h2_0 )；鼠标定义新 (ul, vb)
+                ul = min(u_mouse, ur - 2*MIN_HALF)
+                vb = max(v_mouse, vt + 2*MIN_HALF)
+
+        elif tag in ("l", "r", "t", "b"):
+            # 边拖拽：对侧边整条线位置固定；另一维度尺寸不变
+            if tag == "l":
+                # 固定右边：ur = +w2_0；改变 ul
+                ul = min(u_mouse, ur - 2*MIN_HALF)
+                # 高度不变
+                vt, vb = -h2_0, +h2_0
+            elif tag == "r":
+                # 固定左边：ul = -w2_0；改变 ur
+                ur = max(u_mouse, ul + 2*MIN_HALF)
+                vt, vb = -h2_0, +h2_0
+            elif tag == "t":
+                # 固定下边：vb = +h2_0；改变 vt
+                vt = min(v_mouse, vb - 2*MIN_HALF)
+                ul, ur = -w2_0, +w2_0
+            elif tag == "b":
+                # 固定上边：vt = -h2_0；改变 vb
+                vb = max(v_mouse, vt + 2*MIN_HALF)
+                ul, ur = -w2_0, +w2_0
+        else:
+            return
+
+        # 3) 由新边界求新的中心（局部）与半宽/半高
+        u_c = (ul + ur) / 2.0
+        v_c = (vt + vb) / 2.0
+        w2_new = max(MIN_HALF, (ur - ul) / 2.0)
+        h2_new = max(MIN_HALF, (vb - vt) / 2.0)
+
+        # 4) 局部中心 -> 世界坐标中心
+        dcx = u_c * cosA - v_c * sinA
+        dcy = u_c * sinA + v_c * cosA
+        cx_new = self.orig_rbox.cx + dcx
+        cy_new = self.orig_rbox.cy + dcy
+
+        # 5) 写回并约束
+        self.rbox = RBox(cx_new, cy_new, 2.0 * w2_new, 2.0 * h2_new)
+        self._clamp_rbox_basic()
+
+
+    # ---------- 绘制 ----------
     def redraw(self):
         self.canvas.delete("all")
         if self.img_pil is None:
@@ -452,46 +649,49 @@ class ROIEditorCanvas(ttk.Frame):
         self.tk_img = ImageTk.PhotoImage(img)
         self.canvas.create_image(self.offset_x, self.offset_y, anchor="nw", image=self.tk_img)
 
-        # ROI 基础
-        if self.box:
-            x, y, w, h = self.box.as_tuple()
-            x0, y0 = self.img_to_canvas(x, y)
-            x1, y1 = self.img_to_canvas(x + w, y + h)
-
-            # ROI 框与角标
-            self.canvas.create_rectangle(x0, y0, x1, y1, outline="#20f28b", width=2)
-
+        # ROI 绘制（旋转）
+        if self.rbox:
+            corners = RBox._corners(self.rbox.cx, self.rbox.cy, self.rbox.w, self.rbox.h, self.cal_angle_deg)
+            pts_canvas = [self.img_to_canvas(x, y) for (x, y) in corners]
+            # 外框
+            self.canvas.create_polygon(
+                *sum(([x, y] for (x, y) in pts_canvas), []),
+                outline=self.ROI_COLOR, width=2, fill=""
+            )
+            # 角 L 形标（沿边方向）
             L = self.CORNER_LEN
-            # 左上
-            self.canvas.create_line(x0, y0, x0 + L, y0, fill="#20f28b", width=1)
-            self.canvas.create_line(x0, y0, x0, y0 + L, fill="#20f28b", width=1)
-            # 右上
-            self.canvas.create_line(x1, y0, x1 - L, y0, fill="#20f28b", width=1)
-            self.canvas.create_line(x1, y0, x1, y0 + L, fill="#20f28b", width=1)
-            # 右下
-            self.canvas.create_line(x1, y1, x1 - L, y1, fill="#20f28b", width=1)
-            self.canvas.create_line(x1, y1, x1, y1 - L, fill="#20f28b", width=1)
-            # 左下
-            self.canvas.create_line(x0, y1, x0 + L, y1, fill="#20f28b", width=1)
-            self.canvas.create_line(x0, y1, x0, y1 - L, fill="#20f28b", width=1)
+            def draw_L(p0, p1, p3):  # 以 p0 为角点，p1/p3 为相邻边方向
+                # 取单位方向向量
+                vx = p1[0] - p0[0]; vy = p1[1] - p0[1]
+                ux = p3[0] - p0[0]; uy = p3[1] - p0[1]
+                vlen = max(1e-6, math.hypot(vx, vy))
+                ulen = max(1e-6, math.hypot(ux, uy))
+                vx, vy = vx / vlen, vy / vlen
+                ux, uy = ux / ulen, uy / ulen
+                self.canvas.create_line(p0[0], p0[1], p0[0] + vx * L, p0[1] + vy * L, fill=self.ROI_COLOR, width=1)
+                self.canvas.create_line(p0[0], p0[1], p0[0] + ux * L, p0[1] + uy * L, fill=self.ROI_COLOR, width=1)
+            draw_L(pts_canvas[0], pts_canvas[1], pts_canvas[3])  # lt
+            draw_L(pts_canvas[1], pts_canvas[2], pts_canvas[0])  # rt
+            draw_L(pts_canvas[2], pts_canvas[3], pts_canvas[1])  # rb
+            draw_L(pts_canvas[3], pts_canvas[0], pts_canvas[2])  # lb
 
-            # 句柄（四角+四边中点）
+            # 句柄（角点+边中点）
             hs = self.HANDLE_SIZE
-            handles = [
-                ("lt", x0, y0), ("rt", x1, y0), ("rb", x1, y1), ("lb", x0, y1),
-                ("l", x0, (y0 + y1) / 2), ("t", (x0 + x1) / 2, y0),
-                ("r", x1, (y0 + y1) / 2), ("b", (x0 + x1) / 2, y1),
+            lt, rt, rb, lb = pts_canvas
+            mids = [
+                ((lt[0] + rt[0]) / 2.0, (lt[1] + rt[1]) / 2.0),  # t
+                ((rt[0] + rb[0]) / 2.0, (rt[1] + rb[1]) / 2.0),  # r
+                ((rb[0] + lb[0]) / 2.0, (rb[1] + lb[1]) / 2.0),  # b
+                ((lb[0] + lt[0]) / 2.0, (lb[1] + lt[1]) / 2.0),  # l
             ]
-            for tag, hx, hy in handles:
-                self.canvas.create_oval(hx - hs, hy - hs, hx + hs, hy + hs,
-                                        outline="#111", fill="#fcf802")
+            for hx, hy in [lt, rt, rb, lb] + mids:
+                self.canvas.create_oval(hx - hs, hy - hs, hx + hs, hy + hs, outline="#111", fill="#fcf802")
 
         # 校准线（最后绘制，始终可见）
         (p1x, p1y), (p2x, p2y) = self._line_endpoints_img()
         lp1 = self.img_to_canvas(p1x, p1y)
         lp2 = self.img_to_canvas(p2x, p2y)
-        lc  = self.img_to_canvas(self.cal_cx, self.cal_cy)
-
+        lc = self.img_to_canvas(self.cal_cx, self.cal_cy)
         self.canvas.create_line(lp1[0], lp1[1], lp2[0], lp2[1], fill=self.LINE_COLOR, width=2)
         # 端点圆 & 中心方块
         s = self.LINE_HANDLE_SZ
@@ -500,8 +700,15 @@ class ROIEditorCanvas(ttk.Frame):
         self.canvas.create_rectangle(lc[0] - s, lc[1] - s, lc[0] + s, lc[1] + s, outline="#111", fill=self.LINE_COLOR)
 
         # 信息
-        if self.box:
-            bx, by, bw, bh = self.box.as_tuple()
-            self.info_var.set(f"ROI: x={bx}, y={by}, w={bw}, h={bh} | 校准角度: {self.cal_angle_deg:+.1f}°（±15°）")
+        if self.rbox:
+            bx, by, bw, bh = self.rbox.to_aabb(self.cal_angle_deg)
+            cx, cy, w, h = self.rbox.as_center_size()
+            self.info_var.set(
+                f"ROI: cx={cx:.1f}, cy={cy:.1f}, w={w:.1f}, h={h:.1f}  "
+                f"AABB(x,y,w,h)={bx},{by},{bw},{bh}   "
+                f"校准角度: {self.cal_angle_deg:+.1f}°（±45°）"
+            )
         else:
-            self.info_var.set(f"无 ROI：左键拖动可新建。 | 校准角度: {self.cal_angle_deg:+.1f}°（±15°）")
+            self.info_var.set(
+                f"无 ROI：左键拖动可新建。  校准角度: {self.cal_angle_deg:+.1f}°（±45°）"
+            )

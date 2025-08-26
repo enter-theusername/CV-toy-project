@@ -17,9 +17,10 @@ from gel_core import (
     render_annotation_slanted,
     match_ladder_best,
     fit_log_mw_irls,
-    eval_fit_quality  # <-- 仍沿用
+    eval_fit_quality
 )
 from roi_editor import ROIEditorCanvas
+
 
 def bgr_to_rgb(bgr):
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -38,19 +39,19 @@ class App(tk.Tk):
         self.render_cache = {}
         self.LEFT_WIDTH = 300
 
-        self.var_label_rows = tk.IntVar(value=1)            # 标签行数
-        self.var_labels_on = tk.BooleanVar(value=True)      # 是否附加标签面板
-        self.custom_labels: list[list[str]] = []            # 标签二维表
+        self.var_label_rows = tk.IntVar(value=1)     # 标签行数
+        self.var_labels_on = tk.BooleanVar(value=True)  # 是否附加标签面板
+        self.custom_labels: list[list[str]] = []  # 标签二维表
 
         # —— 自适应图片展示注册表（右侧两个预览） ——
-        #   widget -> {"img": np.ndarray, "last": (w,h)}
+        # widget -> {"img": np.ndarray, "last": (w,h)}
         self._autofit_store: dict[tk.Label, dict] = {}
 
         # 左右UI
         self._build_left()
         self._build_right()
 
-    # --------------------------- UI ---------------------------
+    # ---------------- UI ----------------
     def _build_left(self):
         # 外层容器：固定宽度，防止被内容撑大
         left_container = ttk.Frame(self)
@@ -70,7 +71,7 @@ class App(tk.Tk):
 
         # 内部 Frame：真正放控件的地方
         left = ttk.Frame(self.left_canvas)
-        # 把内部 Frame 嵌进 Canvas
+        # 把内部 Frame 嵌入 Canvas
         self._left_window_item = self.left_canvas.create_window((0, 0), window=left, anchor="nw")
 
         # 内部 Frame 大小变化时，更新 scrollregion，并让内部 Frame 宽度等于 Canvas 宽度
@@ -102,6 +103,7 @@ class App(tk.Tk):
         self.left_canvas.bind("<Leave>", _unbind_wheel)
 
         # ---- 以下把你现有的左栏控件都放到 left 这个 Frame 里 ----
+
         # 文件打开
         f_file = ttk.LabelFrame(left, text="步骤1：打开图片")
         f_file.pack(fill=tk.X, pady=6)
@@ -127,9 +129,13 @@ class App(tk.Tk):
         ttk.Button(nav, text="⬅ 上一块", command=lambda: self.switch_gel(-1)).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,3))
         ttk.Button(nav, text="下一块 ➡", command=lambda: self.switch_gel(1)).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(3,0))
         ttk.Button(f_roi, text="用自动检测结果重置当前 ROI", command=self.reset_roi_from_detect).pack(fill=tk.X, padx=6, pady=4)
+
+        # ⭐ 新增：重置旋转角度按钮（让基准线回到水平）
+        ttk.Button(f_roi, text="重置旋转角度（水平）", command=self.reset_angle).pack(fill=tk.X, padx=6, pady=4)
+
         ttk.Label(
             f_roi,
-            text="提示：在右侧画布中左键拖动角点/边界即可精细裁剪；滚轮缩放，右键平移，方向键微调。",
+            text="提示：在右侧画布中左键拖动角点/边界即可精细裁剪；滚轮缩放，右键平移，方向键微调。\n现在 ROI 会随基准线角度旋转，便于在倾斜时准确圈选。",
             wraplength=self.LEFT_WIDTH-24,
             justify="left"
         ).pack(anchor="w", padx=6, pady=(0,6))
@@ -149,13 +155,17 @@ class App(tk.Tk):
         self._spin(f_wb, "曝光 exposure (0.5–2.0)", self.var_wb_exposure, 0.5, 2.0, step=0.05)
         self._spin(f_wb, "低百分位 percent_low (0–50)", self.var_wb_p_low, 0.0, 50.0, step=0.1)
         self._spin(f_wb, "高百分位 percent_high (50–100)", self.var_wb_p_high, 50.0, 100.0, step=0.1)
-        ttk.Checkbutton(f_wb, text="逐通道 per_channel（最大对比度，可能改变色彩）",
-                        variable=self.var_wb_per_channel).pack(anchor="w", padx=6, pady=(2,4))
-        # Gamma：复选框（启用/禁用） + 旋钮（>0）
+        ttk.Checkbutton(
+            f_wb, text="逐通道 per_channel（最大对比度，可能改变色彩）",
+            variable=self.var_wb_per_channel
+        ).pack(anchor="w", padx=6, pady=(2,4))
+
         def _toggle_gamma_state():
             self.sp_gamma.configure(state=("normal" if self.var_gamma_on.get() else "disabled"))
-        ttk.Checkbutton(f_wb, text="启用 gamma 校正（out = out ** (1/gamma)）",
-                        variable=self.var_gamma_on, command=_toggle_gamma_state).pack(anchor="w", padx=6)
+        ttk.Checkbutton(
+            f_wb, text="启用 gamma 校正（out = out ** (1/gamma)）",
+            variable=self.var_gamma_on, command=_toggle_gamma_state
+        ).pack(anchor="w", padx=6)
         frm_g = ttk.Frame(f_wb); frm_g.pack(fill=tk.X, padx=6, pady=2)
         ttk.Label(frm_g, text="gamma (>0)", wraplength=self.LEFT_WIDTH-40, justify="left").pack(side=tk.LEFT)
         self.sp_gamma = ttk.Spinbox(frm_g, textvariable=self.var_gamma_val,
@@ -209,26 +219,25 @@ class App(tk.Tk):
         f_lab = ttk.LabelFrame(left, text="自定义标签")
         f_lab.pack(fill=tk.X, pady=6)
         ttk.Button(f_lab, text="编辑标签...", command=self.open_labels_editor).pack(fill=tk.X, padx=6, pady=(6, 6))
+    def reset_angle(self):
+        """
+        将右侧 ROI 编辑器中的“校准线”角度重置为 0°（水平），并立即重绘。
+        """
+        if getattr(self, "roi_editor", None) is None:
+            return
+        # 优先调用 ROIEditorCanvas 提供的公有方法（若无则直接设置属性）
+        if hasattr(self.roi_editor, "reset_angle") and callable(self.roi_editor.reset_angle):
+            self.roi_editor.reset_angle()
+        else:
+            try:
+                self.roi_editor.cal_angle_deg = 0.0
+                self.roi_editor.redraw()
+            except Exception:
+                pass
 
-    def _normalize_labels(self, labels: list[list[str]], nlanes: int) -> list[list[str]]:
-        """将 labels 规整为 rows x nlanes 的二维表，缺省补空，超出裁剪。"""
-        if not labels:
-            return []
-        out = []
-        for row in labels:
-            row = list(row) if row else []
-            if len(row) < nlanes:
-                row = row + [""] * (nlanes - len(row))
-            else:
-                row = row[:nlanes]
-            out.append(row)
-        return out
 
     def open_labels_editor(self):
-        """
-        简化标签编辑：支持从 Excel 中复制的纵向内容（多行），
-        自动将换行、Tab、中文逗号统一处理为英文逗号。
-        """
+        """简化标签编辑：支持从 Excel 中复制的纵向内容（多行），自动将换行、Tab、中文逗号统一处理为英文逗号。"""
         cols = max(1, int(self.var_nlanes.get()))
         win = tk.Toplevel(self)
         win.title("编辑标签（支持从 Excel 粘贴）")
@@ -258,119 +267,7 @@ class App(tk.Tk):
         ttk.Button(btns, text="确定", command=do_ok).pack(side=tk.RIGHT)
         ttk.Button(btns, text="取消", command=win.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
-    def _attach_labels_panel(
-        self,
-        img_bgr: np.ndarray,
-        lanes: list[tuple[int, int]] | None,
-        bounds: np.ndarray | None,
-        labels_table: list[list[str]]
-    ) -> np.ndarray:
-        """
-        在 img_bgr 上方追加一条“白底黑字”的标签面板。
-        - 文本竖排（逐字符竖向绘制）
-        - 每列（泳道）x 位置：相邻两条分隔线在图像高度中线处的中点
-          * 斜线分道：x = (bounds[H//2, i] + bounds[H//2, i+1]) / 2
-          * 等宽/手动：x = (l + r) / 2
-        - 面板在图像“上方”（返回 np.vstack([panel, img_bgr])）
-        """
-        import numpy as np, cv2
-        if img_bgr is None or img_bgr.size == 0:
-            return img_bgr
-        H, W = img_bgr.shape[:2]
-        rows = len(labels_table)
-        if rows == 0:
-            return img_bgr
-        cols = len(labels_table[0]) if rows else 0
-        if cols == 0:
-            return img_bgr
-
-        # 1) 泳道中心与宽度
-        centers: list[int] = []
-        widths: list[int] = []
-        if bounds is not None and isinstance(bounds, np.ndarray) and bounds.ndim == 2 and bounds.shape[1] >= cols + 1:
-            yc = int(min(bounds.shape[0] - 1, max(0, H // 2)))
-            for i in range(cols):
-                L = int(bounds[yc, i])
-                R = int(bounds[yc, i + 1])
-                centers.append(int(round((L + R) / 2)))
-                widths.append(max(1, R - L))
-        elif lanes is not None:
-            for (l, r) in lanes[:cols]:
-                centers.append(int(round((l + r) / 2)))
-                widths.append(max(1, r - l))
-        else:
-            step = W / max(1, cols)
-            for i in range(cols):
-                centers.append(int(round((i + 0.5) * step)))
-                widths.append(int(step))
-
-        # 2) 列宽→字号
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        base_scale = 0.7
-        thick = 1
-        v_char_gap = 2
-        h_margin = 3
-        per_col_scale: list[float] = []
-        per_col_char_w: list[int] = []
-        per_col_char_h: list[int] = []
-        for c in range(cols):
-            max_w = max(10, widths[c] - 2 * h_margin)
-            scale = base_scale
-            (tw_char, th_char), _ = cv2.getTextSize("W", font, scale, thick)
-            if tw_char > max_w:
-                scale = max(0.4, scale * (max_w / (tw_char + 1e-6)))
-                (tw_char, th_char), _ = cv2.getTextSize("W", font, scale, thick)
-            per_col_scale.append(scale)
-            per_col_char_w.append(max(1, int(tw_char)))
-            per_col_char_h.append(max(1, int(th_char)))
-
-        # 3) 面板高度
-        top_pad, bot_pad, row_gap = 8, 10, 6
-        row_heights: list[int] = []
-        rows_used_idx: list[int] = []
-        for r in range(rows):
-            has_text = any((t or "").strip() for t in labels_table[r])
-            if not has_text:
-                row_heights.append(0)
-                continue
-            max_h = 0
-            for c in range(cols):
-                text = str(labels_table[r][c] or "").strip()
-                if not text:
-                    continue
-                ch_h = per_col_char_h[c]
-                h_need = len(text) * (ch_h + v_char_gap) - v_char_gap
-                max_h = max(max_h, h_need)
-            max_h = max(max_h, int(0.8 * max(per_col_char_h)))
-            row_heights.append(max_h)
-            rows_used_idx.append(r)
-        if not rows_used_idx:
-            return img_bgr
-        panel_h = top_pad + sum(row_heights[r] for r in rows_used_idx) + (len(rows_used_idx) - 1) * row_gap + bot_pad
-        panel = np.full((panel_h, W, 3), 255, dtype=np.uint8)
-
-        # 4) 绘制
-        y_cursor = top_pad
-        for r in range(rows):
-            if r not in rows_used_idx:
-                continue
-            rh = row_heights[r]
-            for c in range(cols):
-                text = str(labels_table[r][c] or "").strip()
-                if not text:
-                    continue
-                scale = per_col_scale[c]
-                ch_w = per_col_char_w[c]
-                ch_h = per_col_char_h[c]
-                x = int(np.clip(centers[c] - ch_w // 2, 2, W - ch_w - 2))
-                y = y_cursor + ch_h
-                for ch in text:
-                    cv2.putText(panel, ch, (x, y), font, scale, (0, 0, 0), thick, cv2.LINE_AA)
-                    y += ch_h + v_char_gap
-            y_cursor += rh + row_gap
-        cv2.rectangle(panel, (0, 0), (W - 1, panel_h - 1), (0, 0, 0), 1)
-        return np.vstack([panel, img_bgr])
-
+    # ---------------- 右侧（显示） ----------------
     def _build_right(self):
         # 整体右侧容器
         right = ttk.Frame(self)
@@ -402,26 +299,24 @@ class App(tk.Tk):
 
         # 把左右预览加入下层分隔
         self.pw_bottom.add(self.lbl_roi_wb, minsize=120)
-        self.pw_bottom.add(self.lbl_anno,  minsize=120)
+        self.pw_bottom.add(self.lbl_anno, minsize=120)
 
         # 把顶部/底部加入主分隔
         self.pw_main.add(top_grp, minsize=180)
         self.pw_main.add(bottom_container, minsize=160)
 
-        # 设置初始分隔位置（基于当前窗口尺寸的比例）
+        # 设置初始分隔位置
         self.after(150, self._init_paned_positions)
 
-        # 绑定两个 Label 的自适应刷新（仅需绑定一次）
+        # 两个 Label 的自适应刷新
         self._bind_autofit(self.canvas_roi_wb)
         self._bind_autofit(self.canvas_anno)
 
-    # ----------- 自适应展示：注册 / 刷新 -----------
+    # ---------- 自适应显示：注册 / 刷新 ----------
     def _bind_autofit(self, widget: tk.Label):
         if widget not in self._autofit_store:
             self._autofit_store[widget] = {"img": None, "last": (0, 0)}
-        # 在尺寸变化时刷新
         widget.bind("<Configure>", lambda e, w=widget: self._render_autofit(w), add="+")
-        # 父容器变化时也刷新（例如拖动 PanedWindow）
         parent = widget.nametowidget(widget.winfo_parent())
         parent.bind("<Configure>", lambda e, w=widget: self._render_autofit(w), add="+")
 
@@ -432,31 +327,26 @@ class App(tk.Tk):
         self._render_autofit(widget)
 
     def _render_autofit(self, widget: tk.Label):
-        """把 registry 中的原图按 widget 当前大小进行等比适配，并显示。"""
         store = self._autofit_store.get(widget)
         if not store:
             return
         img_bgr = store.get("img")
         if img_bgr is None or not isinstance(img_bgr, np.ndarray) or img_bgr.size == 0:
-            # 清空显示
             widget.configure(image="")
             widget.image = None
             return
-
         tw = max(1, widget.winfo_width())
         th = max(1, widget.winfo_height())
         H, W = img_bgr.shape[:2]
         if W < 1 or H < 1:
             return
         scale = min(tw / W, th / H)
-        # 允许放大与缩小；挑选合适插值
         if abs(scale - 1.0) < 1e-3:
             rgb_disp = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         else:
             new_w, new_h = max(1, int(round(W * scale))), max(1, int(round(H * scale)))
             interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
             rgb_disp = cv2.cvtColor(cv2.resize(img_bgr, (new_w, new_h), interpolation=interp), cv2.COLOR_BGR2RGB)
-
         from PIL import Image, ImageTk
         pil = Image.fromarray(rgb_disp)
         tkimg = ImageTk.PhotoImage(pil)
@@ -464,19 +354,16 @@ class App(tk.Tk):
         widget.image = tkimg
 
     def _init_paned_positions(self):
-        """根据当前窗口大小设置分隔条初始位置（一次性）。"""
         try:
             self.update_idletasks()
-            # 上下分隔：上 58% / 下 42%
             total_h = max(1, self.pw_main.winfo_height())
             self.pw_main.sash_place(0, 0, int(total_h * 0.58))
-            # 左右分隔：各占一半
             total_w = max(1, self.pw_bottom.winfo_width())
             self.pw_bottom.sash_place(0, int(total_w * 0.5), 0)
         except Exception:
             pass
 
-    # --------------------------- 逻辑 ---------------------------
+    # ---------------- 逻辑 ----------------
     def _spin(self, parent, text, var, from_, to, step=1):
         f = ttk.Frame(parent)
         f.pack(fill=tk.X, padx=6, pady=2)
@@ -485,6 +372,24 @@ class App(tk.Tk):
         ).pack(side=tk.LEFT)
         sp = ttk.Spinbox(f, textvariable=var, from_=from_, to=to, increment=step, width=8)
         sp.pack(side=tk.RIGHT)
+    def _normalize_labels(self, labels: list[list[str]], nlanes: int) -> list[list[str]]:
+        """
+        将 labels 规整为 rows × nlanes 的二维表：
+        - 每行不足 nlanes 用空串补齐；
+        - 超出则裁剪到 nlanes；
+        - labels 为空时返回 []。
+        """
+        if not labels:
+            return []
+        out: list[list[str]] = []
+        for row in labels:
+            row = list(row) if row else []
+            if len(row) < nlanes:
+                row = row + [""] * (nlanes - len(row))
+            else:
+                row = row[:nlanes]
+            out.append(row)
+        return out
 
     def open_image(self):
         path = filedialog.askopenfilename(
@@ -540,45 +445,69 @@ class App(tk.Tk):
         idx = max(1, min(self.gi, len(self.boxes))) - 1
         self.roi_editor.set_roi(self.boxes[idx])
 
-    # 兼容旧调用名：统一走自适应注册器
     def _show_np_on_label(self, widget: tk.Label, img_bgr: np.ndarray):
         self._set_autofit_image(widget, img_bgr)
+
+    # --------- 旋转对齐裁剪（按旋转 ROI） ---------
+    @staticmethod
+    def _rotate_bound_with_M(image_bgr: np.ndarray, angle_deg: float):
+        """旋转保持完整：扩张画布，返回 (rot_img, M)；M 为 2x3 仿射矩阵（已含平移）"""
+        (h0, w0) = image_bgr.shape[:2]
+        c = (w0 / 2.0, h0 / 2.0)
+        M = cv2.getRotationMatrix2D(c, angle_deg, 1.0)
+        cos = abs(M[0, 0]); sin = abs(M[0, 1])
+        nW = int(round((h0 * sin) + (w0 * cos)))
+        nH = int(round((h0 * cos) + (w0 * sin)))
+        # 平移修正：把图像中心移到新画布中心
+        M[0, 2] += (nW / 2.0) - c[0]
+        M[1, 2] += (nH / 2.0) - c[1]
+        rot = cv2.warpAffine(image_bgr, M, (nW, nH), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        return rot, M
+
+    @staticmethod
+    def _affine_point(M: np.ndarray, x: float, y: float) -> tuple[float, float]:
+        """把点 (x,y) 应用 2x3 仿射矩阵 M。"""
+        nx = M[0,0]*x + M[0,1]*y + M[0,2]
+        ny = M[1,0]*x + M[1,1]*y + M[1,2]
+        return nx, ny
 
     def render_current(self):
         if self.orig_bgr is None:
             return
-        roi = self.roi_editor.get_roi()
-        if roi is None:
+
+        # 1) 只从 ROI 编辑器拿“旋转矩形 + OpenCV 角度”（CCW为正）
+        rroi = self.roi_editor.get_rotated_roi()
+        if rroi is None:
+            from tkinter import messagebox
             messagebox.showwarning("提示", "请先在画布中框选或调整 ROI。")
             return
+        cx, cy, w, h, angle_ccw = rroi  # angle_ccw：逆时针为正
 
-        x, y, w, h = roi
-        gel = self.orig_bgr[y:y + h, x:x + w]
-        # —— 读取校准角度并“摆正”（旋转 -angle） —— #
-        angle = 0.0
-        try:
-            angle = float(self.roi_editor.get_angle_deg())
-        except Exception:
-            angle = 0.0
-        def _rotate_bound(image_bgr, angle_deg):
-            # 旋转保持完整：扩大画布，避免裁切
-            (h0, w0) = image_bgr.shape[:2]
-            c = (w0 / 2.0, h0 / 2.0)
-            M = cv2.getRotationMatrix2D(c, angle_deg, 1.0)
-            cos = abs(M[0, 0]); sin = abs(M[0, 1])
-            nW = int(round((h0 * sin) + (w0 * cos)))
-            nH = int(round((h0 * cos) + (w0 * sin)))
-            M[0, 2] += (nW / 2.0) - c[0]
-            M[1, 2] += (nH / 2.0) - c[1]
-            return cv2.warpAffine(image_bgr, M, (nW, nH),
-                                  flags=cv2.INTER_LINEAR,
-                                  borderMode=cv2.BORDER_REPLICATE)
-        if abs(angle) > 1e-3:
-            # 线是“图像相对于水平的倾斜角”；裁剪后旋转“-angle”即可摆正
-            gel = _rotate_bound(gel, -angle)
-      
-        # WB（使用新 Autoscale 参数）
-        # WB（使用新 Autoscale 参数）—— 放在摆正后执行，便于按最终方向观察
+        # 2) 先对整幅原图按 -angle 摆正（使 ROI 局部坐标与最终图像轴对齐）
+        rot_img, M = self._rotate_bound_with_M(self.orig_bgr, -angle_ccw)
+
+        # 3) 用同一仿射 M 把 ROI 中心映射到旋转后的图
+        def _affine_point(M_, x, y):
+            return (M_[0,0]*x + M_[0,1]*y + M_[0,2],
+                    M_[1,0]*x + M_[1,1]*y + M_[1,2])
+
+        cx2, cy2 = _affine_point(M, cx, cy)
+
+        # 4) 在摆正后的图上按 (w,h) 做轴对齐裁剪（以中心为准）
+        x0 = int(round(cx2 - w / 2.0))
+        y0 = int(round(cy2 - h / 2.0))
+        x1 = x0 + int(round(w))
+        y1 = y0 + int(round(h))
+
+        H2, W2 = rot_img.shape[:2]
+        x0 = max(0, min(x0, W2 - 1))
+        y0 = max(0, min(y0, H2 - 1))
+        x1 = max(x0 + 1, min(x1, W2))
+        y1 = max(y0 + 1, min(y1, H2))
+
+        gel = rot_img[y0:y1, x0:x1].copy()
+
+        # 5) WB（放在摆正/裁剪之后）
         gamma_val = float(self.var_gamma_val.get())
         gamma = float(gamma_val) if self.var_gamma_on.get() else None
         gel_bgr = auto_white_balance(
@@ -589,11 +518,10 @@ class App(tk.Tk):
             per_channel=bool(self.var_wb_per_channel.get()),
             gamma=gamma
         ) if self.var_wb_on.get() else gel
-        gel_gray = cv2.cvtColor(gel_bgr, cv2.COLOR_BGR2GRAY)
+
         gel_gray = cv2.cvtColor(gel_bgr, cv2.COLOR_BGR2GRAY)
 
-
-        # 解析标签
+        # 6) 解析标签
         def parse_list(s: str):
             s = (s or "").replace("，", ",")
             out = []
@@ -610,44 +538,47 @@ class App(tk.Tk):
         ladder_labels_all = parse_list(self.ent_marker.get()) or [180, 130, 100, 70, 55, 40, 35, 25, 15, 10]
         tick_labels = parse_list(self.ent_ticks.get()) or ladder_labels_all
 
-        # 分道
+        # 7) 分道
         nlanes = int(self.var_nlanes.get())
         mode = self.var_mode.get()
         if mode == "uniform":
             lanes = lanes_uniform(gel_gray, nlanes, int(self.var_lpad.get()), int(self.var_rpad.get()))
             bounds = None
-        else:  # auto（含斜率）
+        else:
             bounds = lanes_slanted(
                 gel_gray, nlanes,
                 smooth_px=int(self.var_smooth.get()),
                 min_sep_ratio=float(self.var_sep.get()),
-                search_half=12, max_step_px=5, smooth_y=9
+                search_half=12, max_step_px=5, smooth_y=9,
+                wb_bgr=gel_bgr,
+                # 新增：默认不做顶/底“等距混合”，避免把起始 x 锁死一致
+                enable_uniform_blend=False
             )
             lanes = None
 
-        # 标准道
+        # 8) 标准道/找峰
         ladder_lane = max(1, min(int(self.var_ladder_lane.get()), nlanes))
         top = int(self.var_top.get())
         bot = int(self.var_bot.get())
-        y0 = top
-        y1 = (gel_gray.shape[0] - bot) if bot > 0 else None
+        y0_roi = top
+        y1_roi = (gel_gray.shape[0] - bot) if bot > 0 else None
 
-        # 1) 先“标记所有可见标记物（峰）”
         if bounds is not None:
             peaks, prom = detect_bands_along_y_slanted(
                 gel_gray, bounds, lane_index=ladder_lane - 1,
-                y0=y0, y1=y1, min_distance=10, min_prominence=50.0
+                y0=y0_roi, y1=y1_roi, min_distance=10, min_prominence=50.0
             )
         else:
             lx, rx = lanes[ladder_lane - 1]
             sub = gel_gray[:, lx:rx]
             peaks, prom = detect_bands_along_y_prominence(
-                sub, y0=y0, y1=y1, min_distance=10, min_prominence=50.0
+                sub, y0=y0_roi, y1=y1_roi, min_distance=10, min_prominence=50.0
             )
+
         ladder_peaks_for_draw = [int(round(p)) for p in peaks]
         ladder_labels_for_draw = sorted(ladder_labels_all, reverse=True)[:len(ladder_peaks_for_draw)]
 
-        # 2) 匹配与拟合
+        # 9) 拟合
         sel_p_idx, sel_l_idx = match_ladder_best(peaks, ladder_labels_all, prom, min_pairs=3)
         fit_ok = False
         a, b = 1.0, 0.0
@@ -669,14 +600,14 @@ class App(tk.Tk):
                 from tkinter import messagebox
                 messagebox.showwarning(
                     "提示",
-                    f"标准道分子量拟合偏差较大（R²={r2:.3f}, RMSE={rmse:.1f}px），已放弃拟合。\n"
-                    "请检查：标准道序号、分子量列表、泳道数/边界与 ROI。"
+                    f"标准道拟合偏差较大（R²={r2:.3f}, RMSE={rmse:.1f}px），已放弃拟合。\n"
+                    "请检查标准道序号、分子量表、泳道与 ROI。"
                 )
         else:
             from tkinter import messagebox
-            messagebox.showinfo("提示", "可用于稳健拟合的标准带不足：已输出图像，但 Y 轴刻度仅在拟合成功时显示。")
+            messagebox.showinfo("提示", "用于稳健拟合的标准带不足：已输出图像，但 Y 轴刻度仅在拟合成功时显示。")
 
-        # 3) 渲染
+        # 10) 标注渲染
         if bounds is not None:
             annotated = render_annotation_slanted(
                 gel_bgr, bounds, ladder_peaks_for_draw, ladder_labels_for_draw,
@@ -690,40 +621,143 @@ class App(tk.Tk):
                 yaxis_side=self.var_axis.get()
             )
 
-        # —— 在标注图下方追加“白底黑字”标签面板（可选） ——
+        # 11) 附加标签面板（可选）
         annotated_final = annotated
         if self.var_labels_on.get():
             table = self._normalize_labels(self.custom_labels, nlanes)
             if table and any(any((t or "").strip() for t in row) for row in table):
                 annotated_final = self._attach_labels_panel(annotated, lanes, bounds, table)
 
-        # ★ 使用新的自适应展示：设置原图并让它随尺寸变化自动刷新
+        # 12) 显示（自适应）
         self._set_autofit_image(self.canvas_roi_wb, gel_bgr)
-        self._set_autofit_image(self.canvas_anno,   annotated_final)
+        self._set_autofit_image(self.canvas_anno, annotated_final)
 
-        # 缓存（仅用于导出图片）
+        # 13) 缓存导出
         self.render_cache = {
             "gi": int(self.gi),
             "gel_bgr": gel_bgr,
             "annotated": annotated,
             "annotated_final": annotated_final
         }
-        self.image_path: str | None = getattr(self, "image_path", None)
 
         if not fit_ok:
+            from tkinter import messagebox
             messagebox.showinfo("提示", "本次未绘制 Y 轴分子量刻度（拟合未通过质控）。")
+
+
+
+    def _attach_labels_panel(
+        self,
+        img_bgr: np.ndarray,
+        lanes: list[tuple[int, int]] | None,
+        bounds: np.ndarray | None,
+        labels_table: list[list[str]]
+    ) -> np.ndarray:
+        """
+        在 img_bgr 上方追加“白底黑字”的标签面板（与原实现相同，略）。
+        """
+        import numpy as np, cv2
+        if img_bgr is None or img_bgr.size == 0:
+            return img_bgr
+        H, W = img_bgr.shape[:2]
+        rows = len(labels_table)
+        if rows == 0:
+            return img_bgr
+        cols = len(labels_table[0]) if rows else 0
+        if cols == 0:
+            return img_bgr
+        # 1) 泳道中心与宽度
+        centers: list[int] = []
+        widths: list[int] = []
+        if bounds is not None and isinstance(bounds, np.ndarray) and bounds.ndim == 2 and bounds.shape[1] >= cols + 1:
+            yc = int(min(bounds.shape[0] - 1, max(0, H // 2)))
+            for i in range(cols):
+                L = int(bounds[yc, i]); R = int(bounds[yc, i + 1])
+                centers.append(int(round((L + R) / 2)))
+                widths.append(max(1, R - L))
+        elif lanes is not None:
+            for (l, r) in lanes[:cols]:
+                centers.append(int(round((l + r) / 2)))
+                widths.append(max(1, r - l))
+        else:
+            step = W / max(1, cols)
+            for i in range(cols):
+                centers.append(int(round((i + 0.5) * step)))
+                widths.append(int(step))
+        # 2) 列宽→字号
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        base_scale = 0.7
+        thick = 1
+        v_char_gap = 2
+        h_margin = 3
+        per_col_scale: list[float] = []
+        per_col_char_w: list[int] = []
+        per_col_char_h: list[int] = []
+        for c in range(cols):
+            max_w = max(10, widths[c] - 2 * h_margin)
+            scale = base_scale
+            (tw_char, th_char), _ = cv2.getTextSize("W", font, scale, thick)
+            if tw_char > max_w:
+                scale = max(0.4, scale * (max_w / (tw_char + 1e-6)))
+                (tw_char, th_char), _ = cv2.getTextSize("W", font, scale, thick)
+            per_col_scale.append(scale)
+            per_col_char_w.append(max(1, int(tw_char)))
+            per_col_char_h.append(max(1, int(th_char)))
+        # 3) 面板高度
+        top_pad, bot_pad, row_gap = 8, 10, 6
+        row_heights: list[int] = []
+        rows_used_idx: list[int] = []
+        for r in range(rows):
+            has_text = any((t or "").strip() for t in labels_table[r])
+            if not has_text:
+                row_heights.append(0)
+                continue
+            max_h = 0
+            for c in range(cols):
+                text = str(labels_table[r][c] or "").strip()
+                if not text:
+                    continue
+                ch_h = per_col_char_h[c]
+                h_need = len(text) * (ch_h + v_char_gap) - v_char_gap
+                max_h = max(max_h, h_need)
+            max_h = max(max_h, int(0.8 * max(per_col_char_h)))
+            row_heights.append(max_h)
+            rows_used_idx.append(r)
+        if not rows_used_idx:
+            return img_bgr
+        panel_h = top_pad + sum(row_heights[r] for r in rows_used_idx) + (len(rows_used_idx) - 1) * row_gap + bot_pad
+        panel = np.full((panel_h, W, 3), 255, dtype=np.uint8)
+        # 4) 绘制
+        y_cursor = top_pad
+        for r in range(rows):
+            if r not in rows_used_idx:
+                continue
+            rh = row_heights[r]
+            for c in range(cols):
+                text = str(labels_table[r][c] or "").strip()
+                if not text:
+                    continue
+                scale = per_col_scale[c]
+                ch_w = per_col_char_w[c]
+                ch_h = per_col_char_h[c]
+                x = int(np.clip(centers[c] - ch_w // 2, 2, W - ch_w - 2))
+                y = y_cursor + ch_h
+                for ch in text:
+                    cv2.putText(panel, ch, (x, y), font, scale, (0, 0, 0), thick, cv2.LINE_AA)
+                    y += ch_h + v_char_gap
+            y_cursor += rh + row_gap
+        cv2.rectangle(panel, (0, 0), (W - 1, panel_h - 1), (0, 0, 0), 1)
+        return np.vstack([panel, img_bgr])
 
     def export_current(self):
         if not self.render_cache:
             messagebox.showwarning("提示", "请先渲染当前胶块。")
             return
-        # 仅导出带标注的图像（优先含标签面板）
         img_to_save = self.render_cache.get("annotated_final", self.render_cache.get("annotated"))
         if img_to_save is None:
             messagebox.showwarning("提示", "未找到可导出的标注图像。")
             return
         gi = self.render_cache.get("gi", 1)
-        # 仅取默认文件名：原图文件名 + "_annotated".png；不设定 initialdir（交由系统/上次目录）
         default_name = f"gel{gi}_annotated.png"
         try:
             if getattr(self, "image_path", None):
@@ -731,13 +765,11 @@ class App(tk.Tk):
                 default_name = f"{p.stem}_annotated.png"
         except Exception:
             pass
-        # 另存为对话框：用户可自由修改目录与文件名
         fpath = filedialog.asksaveasfilename(
-            title="保存带标注的图像",
+            title="保存带标注的图片",
             defaultextension=".png",
             initialfile=default_name,
             filetypes=[("PNG Image", "*.png")]
-            # 不传 initialdir —— 使用系统默认/上次目录，用户可更改
         )
         if not fpath:
             return
