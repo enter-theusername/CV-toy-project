@@ -250,11 +250,11 @@ def render_annotation(gel_bgr: np.ndarray,
     canvas[:, label_panel_w:label_panel_w + W] = gel_bgr
 
     # 泳道（绿色）
-    if lanes is not None:
-        for (l, r) in lanes:
-            cv2.rectangle(canvas, (label_panel_w + int(l), 0),
-                          (label_panel_w + int(r), H - 1),
-                          (0, 255, 0), 1)
+    #if lanes is not None:
+    #    for (l, r) in lanes:
+    #        cv2.rectangle(canvas, (label_panel_w + int(l), 0),
+    #                      (label_panel_w + int(r), H - 1),
+    #                      (0, 255, 0), 1)
 
     # 分子量标注（仅数字 + 短横线）
     if ladder_peaks_y and ladder_labels:
@@ -584,7 +584,7 @@ def match_ladder_best(
 
     # RANSAC参数
     trials = min(400, max(60, 20 * min(N, M)))
-    tol_px = max(6.0, 0.012 * (y.max() - y.min() + 1e-6))  # 高度相关容差
+    tol_px = max(8.0, 0.08 * (y.max() - y.min() + 1e-6))  # 高度相关容差
     rng = np.random.default_rng(20250827)
 
     best_pairs: list[tuple[int, int]] = []
@@ -652,30 +652,67 @@ def match_ladder_best(
     sel_peak_idx = [int(order_y[int(i)]) for i in sel_peak_idx]
     return sel_peak_idx, sel_label_idx
 
-def fit_log_mw_irls(y_positions: List[int], ladder_sizes: List[float],
-                    weights: List[float] | None = None, iters: int = 5) -> Tuple[float, float]:
+def fit_log_mw_irls(
+    y_positions: List[int],
+    ladder_sizes: List[float],
+    weights: List[float] | None = None,
+    iters: int = 6,
+    huber_k: float = 1.345,
+    eps: float = 1e-8,
+) -> Tuple[float, float]:
     """
-    y = a*log10(MW) + b 的 IRLS (Huber) 加权鲁棒拟合。
+    鲁棒线性回归（Huber IRLS）：拟合 y = a*log10(MW) + b
+    修复点：
+    1) 加权最小二乘按“√w”行缩放；
+    2) Huber 权重更新为 w_eff = w0 * huber，其中 huber = min(1, k*s/|r|)；
+    3) 数值健壮性：x-范围过小/样本过少时做保底处理。
     """
     x = np.log10(np.array(ladder_sizes, dtype=np.float64))
     y = np.array(y_positions, dtype=np.float64)
-    if weights is None:
-        w = np.ones_like(y)
-    else:
-        w = np.array(weights, dtype=np.float64)
-    w = w / (w.max() + 1e-6)
 
-    a, b = 0.0, y.mean()
-    for _ in range(iters):
-        A = np.vstack([x, np.ones_like(x)]).T
-        Aw = A * w[:, None]
-        yw = y * w
-        a, b = np.linalg.lstsq(Aw, yw, rcond=None)[0]
+    if x.size < 2 or y.size < 2 or x.size != y.size:
+        # 保底：返回“温和负斜率”与均值截距
+        a0 = -0.5
+        b0 = float(y.mean()) - a0 * float(x.mean() if x.size else 0.0)
+        return float(a0), float(b0)
+
+    # 初始权重
+    if weights is None:
+        w0 = np.ones_like(y, dtype=np.float64)
+    else:
+        w0 = np.array(weights, dtype=np.float64)
+        # 非法值 → 0
+        w0 = np.nan_to_num(w0, nan=0.0, posinf=np.max(w0[np.isfinite(w0)]) if np.any(np.isfinite(w0)) else 1.0, neginf=0.0)
+    # 归一化到 [eps, 1]
+    w0 = w0 / (np.max(w0) + eps)
+    w0 = np.clip(w0, eps, 1.0)
+
+    # 初值：普通最小二乘
+    A = np.vstack([x, np.ones_like(x)]).T
+    try:
+        a, b = np.linalg.lstsq(A, y, rcond=None)[0]
+    except Exception:
+        a, b = 0.0, float(y.mean())
+
+    # IRLS 主循环
+    w_eff = w0.copy()
+    for _ in range(max(1, int(iters))):
+        ws = np.sqrt(np.clip(w_eff, eps, 1.0))  # √w
+        Aw = A * ws[:, None]
+        yw = y * ws
+        try:
+            a, b = np.linalg.lstsq(Aw, yw, rcond=None)[0]
+        except Exception:
+            break
+
         r = y - (a * x + b)
-        mad = np.median(np.abs(r)) + 1e-6
-        huber = 1.0 / np.maximum(1.0, np.abs(r) / (1.345 * mad))
-        w = w * huber
-        w = w / (w.max() + 1e-6)
+        # 鲁棒尺度（MAD）
+        mad = np.median(np.abs(r - np.median(r))) + eps
+        # Huber 权重：min(1, k*s/|r|)
+        hub = np.minimum(1.0, (huber_k * mad) / (np.abs(r) + eps))
+        # 更新有效权重（保持到 [eps,1]）
+        w_eff = np.clip(w0 * hub, eps, 1.0)
+
     return float(a), float(b)
 
 # ---------- 4) 斜线（线性）分道：逐行跟踪 + 线性拟合 ----------
@@ -1160,36 +1197,6 @@ def lanes_slanted(
 
     return bounds
 
-# === [新增] 6.5) 边缘“垂直方向”锁定 ===
-    # 顶部锁定：y ∈ [0, top_lock) 使每条分隔线在该区间内 x 不随 y 改变
-    top_lock = int(max(0, min(10, H - 1)))
-    if top_lock > 0:
-        y_src0 = top_lock
-        y_src1 = min(H - 1, top_lock + 4)  # 取 5 行的中位数更稳健
-        for i in range(1, n):
-            x_fix = int(round(np.median(bounds[y_src0:y_src1 + 1, i])))
-            bounds[:top_lock, i] = x_fix
-
-    # 底部锁定（可选）：y ∈ [H-bot_lock, H)
-    bot_lock = int(max(0, min(10, H - 1)))
-    if bot_lock > 0:
-        y_src1 = max(0, H - bot_lock - 1)
-        y_src0 = max(0, y_src1 - 4)        # 取上方 5 行的中位数
-        for i in range(1, n):
-            x_fix = int(round(np.median(bounds[y_src0:y_src1 + 1, i])))
-            bounds[H - bot_lock:, i] = x_fix
-
-    # === [新增] 6.6) 再次行内约束，防止交叉 ===
-    for y in range(H):
-        row = bounds[y, :].astype(np.int32, copy=True)
-        for i in range(1, n):
-            row[i] = max(row[i], row[i - 1] + margin)
-        row[-1] = W
-        for i in range(n - 1, 0, -1):
-            row[i] = min(row[i], row[i + 1] - margin)
-        bounds[y, :] = np.clip(row, 0, W)
-
-    return bounds
 
 
 
@@ -1217,10 +1224,10 @@ def render_annotation_slanted(gel_bgr: np.ndarray,
     canvas[:, label_panel_w:label_panel_w + W] = gel_bgr
 
     # 绿色边界折线
-    if bounds is not None and bounds.ndim == 2 and bounds.shape[0] == H:
-        for i in range(1, bounds.shape[1] - 1):
-            pts = np.stack([bounds[:, i] + label_panel_w, np.arange(H)], axis=1).astype(np.int32)
-            cv2.polylines(canvas, [pts], isClosed=False, color=(0, 255, 0), thickness=1)
+    #if bounds is not None and bounds.ndim == 2 and bounds.shape[0] == H:
+    #    for i in range(1, bounds.shape[1] - 1):
+    #        pts = np.stack([bounds[:, i] + label_panel_w, np.arange(H)], axis=1).astype(np.int32)
+    #        cv2.polylines(canvas, [pts], isClosed=False, color=(0, 255, 0), thickness=1)
 
     # 分子量标注（仅数字 + 短横线）
     if ladder_peaks_y and ladder_labels:

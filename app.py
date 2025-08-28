@@ -26,6 +26,293 @@ from roi_editor import ROIEditorCanvas
 def bgr_to_rgb(bgr):
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
+# ===== 新增：右侧交互编辑画布（用于显示标注结果并可拖动红色箭头） =====
+class RightAnnoCanvas(tk.Canvas):
+    """
+    在 Canvas 上显示最终标注底图（不含红箭头），并把红箭头作为可拖动的矢量元素叠加。
+    - 自动等比缩放以适应画布，内部维护「图像坐标 <-> 画布坐标」的映射。
+    - 仅允许垂直拖动；X 在拖动过程中会根据 lanes/bounds 在该 Y 的几何中心自动更新。
+    - 可导出：把当前箭头叠加回像素图用于保存。
+    """
+    def __init__(self, parent):
+        super().__init__(parent, bg="#222", highlightthickness=0)
+        self.bind("<Configure>", self._on_resize)
+
+        # 基础图
+        self.base_img_bgr: np.ndarray | None = None   # 最终底图（已含Y轴/白面板等，但不含红箭头）
+        self.base_img_tk = None                       # 缩放后的Tk图
+        self.img_item = None                          # Canvas image item id
+
+        # 缩放与偏移（将图像等比放入画布）
+        self.s = 1.0
+        self.ox = 0
+        self.oy = 0
+
+        # 与几何/映射相关的数据（生成/拖动箭头需要）
+        self.gel_size = (0, 0)  # (Hg, Wg) 仅凝胶区域尺寸
+        self.bounds: np.ndarray | None = None
+        self.lanes: list[tuple[int, int]] | None = None
+        self.a = 1.0
+        self.b = 0.0
+        self.fit_ok = False
+        self.nlanes = 0
+        self.ladder_lane = 1
+        self.yaxis_side = "left"
+        self.panel_top_h = 0
+        self.panel_w = 0
+        self.x_offset = 0
+
+        # 箭头集合
+        self.arrows: list[dict] = []  # dict: {id, lane_idx, y_img, mw, color}
+
+        # 拖动状态
+        self._drag = {"id": None, "y0_canvas": 0, "dy_img": 0}
+
+    # ---------- 公有API ----------
+    # === 在 RightAnnoCanvas 类中（app 24.py）新增 ===
+    def update_base_image(self, base_img_bgr: np.ndarray):
+        """
+        仅更新底图，不改动箭头集合；用于“显示绿线”瞬时切换。
+        """
+        if base_img_bgr is None or not isinstance(base_img_bgr, np.ndarray) or base_img_bgr.size == 0:
+            return
+        self.base_img_bgr = base_img_bgr
+        # 重新缩放/绘制底图，并按当前 scale/offset 复位箭头
+        self._render_base_image()
+        self._redraw_arrows()
+
+    def set_scene(
+        self,
+        base_img_bgr: np.ndarray,
+        gel_bgr: np.ndarray,
+        bounds: np.ndarray | None,
+        lanes: list[tuple[int, int]] | None,
+        a: float, b: float, fit_ok: bool,
+        nlanes: int, ladder_lane: int,
+        yaxis_side: str,
+        lane_marks: list[list[float]] | None,
+        panel_top_h: int = 0
+    ):
+        """设置底图与几何信息，并按 lane_marks 生成可拖动红箭头。"""
+        # 清空画布元素，并重置图像 item 与缓存，防止使用已删除的 item id
+        self.delete("all")
+        self.img_item = None           # ★★ 关键修复：防止后续用已删除的 item id
+        self.base_img_tk = None        # 推荐一并重置，避免旧引用
+        self.arrows.clear()
+
+        # 基础数据
+        self.base_img_bgr = base_img_bgr
+        self.gel_size = gel_bgr.shape[:2]  # (Hg, Wg)
+        self.bounds = bounds
+        self.lanes = lanes
+        self.a, self.b = float(a), float(b)
+        self.fit_ok = bool(fit_ok)
+        self.nlanes = int(nlanes)
+        self.ladder_lane = int(ladder_lane)
+        self.yaxis_side = str(yaxis_side or "left").lower()
+        self.panel_top_h = int(panel_top_h)
+
+        Ht, Wt = self.base_img_bgr.shape[:2]
+        Hg, Wg = self.gel_size
+        self.panel_w = max(0, Wt - Wg)
+        self.x_offset = self.panel_w if self.yaxis_side == "left" else 0
+
+        # 渲染底图
+        self._render_base_image()
+
+        # 生成箭头（拟合失败则不生成）
+        if self.fit_ok and lane_marks:
+            self._create_arrows_from_marks(lane_marks)
+
+    def render_to_image(self) -> np.ndarray | None:
+        """把当前箭头叠加到底图像素，返回BGR图（用于导出）。"""
+        if self.base_img_bgr is None:
+            return None
+        img = self.base_img_bgr.copy()
+        H, W = img.shape[:2]
+
+        # 三角箭头（像素坐标系，未缩放的固定尺寸）
+        w, h = 20, 5
+        for a in self.arrows:
+            y = int(np.clip(a["y_img"], 0, H - 1))
+            if "x_img" in a:
+                x = int(np.clip(a["x_img"], 0, W - 1))
+            else:
+                lane_idx = a["lane_idx"]
+                xc_gel = self._lane_center_x_at_y_gel(y - self.panel_top_h, lane_idx)
+                x = int(np.clip(self.x_offset + xc_gel, 0, W - 1))
+            tip = (x , y)
+            p1 = (tip[0] - w // 2, int(np.clip(tip[1] + h, 0, H - 1)))
+            p2 = (tip[0] - w // 2, int(np.clip(tip[1] - h, 0, H - 1)))
+            pts = np.array([p1, p2, tip], dtype=np.int32)
+            cv2.fillPoly(img, [pts], (0, 0, 255))
+            cv2.polylines(img, [pts], isClosed=True, color=(255, 255, 255),
+                          thickness=1, lineType=cv2.LINE_AA)
+        return img
+
+    # ---------- 内部：几何/绘制 ----------
+    def _on_resize(self, _evt=None):
+        # 画布变化时重绘底图与箭头
+        if self.base_img_bgr is None:
+            return
+        self._render_base_image()
+        self._redraw_arrows()
+
+    def _render_base_image(self):
+        """按画布尺寸等比缩放底图，并绘制到Canvas。"""
+        H, W = self.base_img_bgr.shape[:2]
+        cw = max(1, self.winfo_width())
+        ch = max(1, self.winfo_height())
+        self.s = min(cw / W, ch / H)
+        new_w = max(1, int(round(W * self.s)))
+        new_h = max(1, int(round(H * self.s)))
+        self.ox = (cw - new_w) // 2
+        self.oy = (ch - new_h) // 2
+
+        rgb = cv2.cvtColor(
+            cv2.resize(self.base_img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA),
+            cv2.COLOR_BGR2RGB
+        )
+        from PIL import Image, ImageTk
+        pil = Image.fromarray(rgb)
+        self.base_img_tk = ImageTk.PhotoImage(pil)  # 保持强引用，防止GC
+
+        # 尝试复用旧的 image item，如已失效则创建新的
+        try:
+            if self.img_item is None:
+                self.img_item = self.create_image(self.ox, self.oy, image=self.base_img_tk, anchor="nw")
+            else:
+                self.coords(self.img_item, self.ox, self.oy)
+                self.itemconfig(self.img_item, image=self.base_img_tk)
+        except tk.TclError:
+            # 旧 id 已无效，重建
+            self.img_item = self.create_image(self.ox, self.oy, image=self.base_img_tk, anchor="nw")
+
+    def _to_canvas(self, x_img: float, y_img: float) -> tuple[float, float]:
+        return self.ox + x_img * self.s, self.oy + y_img * self.s
+
+    def _to_img(self, x_canvas: float, y_canvas: float) -> tuple[float, float]:
+        return (x_canvas - self.ox) / self.s, (y_canvas - self.oy) / self.s
+
+    def _lane_center_x_at_y_gel(self, y_gel: int, lane_idx: int) -> int:
+        """返回在凝胶坐标系(y_gel)下，lane_idx 的中心X（单位：像素，相对凝胶左边界）。"""
+        Hg, Wg = self.gel_size
+        y = int(np.clip(y_gel, 0, max(0, Hg - 1)))
+        if self.bounds is not None and isinstance(self.bounds, np.ndarray) and self.bounds.ndim == 2 and self.bounds.shape[0] >= Hg:
+            L = int(self.bounds[y, lane_idx])
+            R = int(self.bounds[y, lane_idx + 1])
+            xc = int(round((L + R) / 2.0))
+        elif self.lanes is not None and 0 <= lane_idx < len(self.lanes):
+            l, r = self.lanes[lane_idx]
+            xc = int(round((l + r) / 2.0))
+        else:
+            step = Wg / max(1, self.nlanes)
+            xc = int(round((lane_idx + 0.5) * step))
+        return int(np.clip(xc, 0, max(0, Wg - 1)))
+
+    def _create_arrows_from_marks(self, lane_marks: list[list[float]]):
+        """依据 lane_marks 在非标准道生成箭头。"""
+        # 真实泳道数
+        if self.bounds is not None and isinstance(self.bounds, np.ndarray):
+            real_nlanes = max(0, self.bounds.shape[1] - 1)
+        elif self.lanes is not None:
+            real_nlanes = len(self.lanes)
+        else:
+            real_nlanes = self.nlanes
+
+        skip_idx = max(0, self.ladder_lane - 1)
+        target_lane_idx = [i for i in range(real_nlanes) if i != skip_idx]
+
+        use_k = min(len(target_lane_idx), len(lane_marks))
+        for k in range(use_k):
+            arr = lane_marks[k] or []
+            lane_idx = target_lane_idx[k]
+            for mw in arr:
+                try:
+                    v = float(mw)
+                except Exception:
+                    continue
+                if not (np.isfinite(v) and v > 0):
+                    continue
+                y_gel = int(round(self.a * np.log10(v) + self.b))
+                y_img = self.panel_top_h + y_gel
+                xc_gel = self._lane_center_x_at_y_gel(y_gel, lane_idx)
+                x_img = self.x_offset + xc_gel
+                self._add_arrow(x_img, y_img, lane_idx, v)
+
+    def _arrow_canvas_points(self, x_img: float, y_img: float) -> list[float]:
+        """返回画布坐标下的三角形顶点序列（flat list）。"""
+        # 以像素坐标为准的箭头尺寸（未缩放）
+        w_px, h_px = 20, 5
+        tip_img = (x_img - 20, y_img)
+        p1_img = (tip_img[0] - w_px // 2, y_img + h_px)
+        p2_img = (tip_img[0] - w_px // 2, y_img - h_px)
+        pts_img = [p1_img, p2_img, tip_img]
+        pts_canvas = []
+        for (x, y) in pts_img:
+            cx, cy = self._to_canvas(x, y)
+            pts_canvas.extend([cx, cy])
+        return pts_canvas
+
+    def _add_arrow(self, x_img: float, y_img: float, lane_idx: int, mw: float, color: tuple[int, int, int] = (255, 64, 64)):
+        """在Canvas上新增一个箭头并绑定拖动事件。"""
+        # Tk 颜色（BGR -> #RRGGBB）
+        r, g, b = (255, 64, 64)
+        pts = self._arrow_canvas_points(x_img, y_img)
+        aid = self.create_polygon(pts, fill=f"#{r:02x}{g:02x}{b:02x}", outline="#ffffff", width=1, smooth=False)
+        meta = {"id": aid, "lane_idx": lane_idx, "x_img": float(x_img),"y_img": float(y_img), "mw": float(mw)}
+        self.arrows.append(meta)
+
+        # 绑定仅用于该箭头的拖动事件
+        self.tag_bind(aid, "<ButtonPress-1>", lambda e, a=meta: self._on_drag_start(e, a))
+        self.tag_bind(aid, "<B1-Motion>",     lambda e, a=meta: self._on_drag_move(e, a))
+        self.tag_bind(aid, "<ButtonRelease-1>", lambda e, a=meta: self._on_drag_end(e, a))
+
+    def _redraw_arrows(self):
+        """画布变化时，按照最新缩放/偏移重画箭头形状。"""
+        for a in self.arrows:
+            lane_idx = a["lane_idx"]
+            y_img = a["y_img"]
+            if "x_img" in a:
+                x_img = float(a["x_img"])
+            else:
+                xc_gel = self._lane_center_x_at_y_gel(int(round(y_img - self.panel_top_h)), lane_idx)
+                x_img = float(self.x_offset + xc_gel)
+            # 限制在整张图可见区域（你也可改成仅限 gel 区域）
+            H, W = self.base_img_bgr.shape[:2]
+            x_img = float(np.clip(x_img, 0, W - 1))
+            pts = self._arrow_canvas_points(x_img, y_img)
+            self.coords(a["id"], *pts)
+
+
+    # ---------- 交互：仅允许垂直拖动 ----------
+    def _on_drag_start(self, evt, arrow_meta: dict):
+        self._drag["id"] = arrow_meta["id"]
+        self._drag["y0_canvas"] = evt.y
+
+
+    def _on_drag_move(self, evt, arrow_meta: dict):
+        if self._drag["id"] != arrow_meta["id"]:
+            return
+        # 画布坐标 → 图像坐标
+        x_img, y_img = self._to_img(evt.x, evt.y)
+
+        # 边界：Y 仍限制在 gel 有效高度（不进入上方白板），X 限制在整图宽
+        H, W = self.base_img_bgr.shape[:2]
+        Hg, Wg = self.gel_size
+        ymin = self.panel_top_h
+        ymax = self.panel_top_h + Hg - 1
+        x_img = float(np.clip(x_img, 0, W - 1))
+        y_img = float(np.clip(y_img, ymin, ymax))
+
+        # 保存坐标并重绘箭头
+        arrow_meta["x_img"] = x_img
+        arrow_meta["y_img"] = y_img
+        pts = self._arrow_canvas_points(x_img, y_img)
+        self.coords(arrow_meta["id"], *pts)
+
+
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -155,6 +442,7 @@ class App(tk.Tk):
         # 新增参数：exposure / percent_low / percent_high / per_channel / gamma
         self.var_wb_exposure = tk.DoubleVar(value=1.0)
         self.var_wb_p_low = tk.DoubleVar(value=0.5)
+        self.var_show_green = tk.BooleanVar(value=True)
         self.var_wb_p_high = tk.DoubleVar(value=99.5)
         self.var_wb_per_channel = tk.BooleanVar(value=False)
         self.var_gamma_on = tk.BooleanVar(value=False)
@@ -202,9 +490,11 @@ class App(tk.Tk):
         self.var_ladder_lane = tk.IntVar(value=1)
         self._spin(f_marker, "标准道序号", self.var_ladder_lane, 1, 40)
         ttk.Label(f_marker, text="标准分子量(kDa，大→小)：", wraplength=self.LEFT_WIDTH-24, justify="left").pack(anchor="w", padx=6)
-        self.ent_marker = ttk.Entry(f_marker); self.ent_marker.insert(0, "180,130,100,70,55,40,35,25,15,10")
+        self.ent_marker = ttk.Entry(f_marker); self.ent_marker.insert(0, "180,130,95,65,52,41,31,25,17,10")
         self.ent_marker.pack(fill=tk.X, padx=6, pady=2)
         self.var_axis = tk.StringVar(value="left")
+        ttk.Checkbutton(f_marker,text="显示绿线（分隔线）",variable=self.var_show_green,command=self.on_toggle_show_green ).pack(anchor="w", padx=6, pady=2) # <--- 轻量切换
+
 
         # 操作按钮
         f_action = ttk.Frame(left)
@@ -218,6 +508,7 @@ class App(tk.Tk):
         ttk.Button(f_lab, text="编辑列名与分子量...", command=self.open_labels_editor).pack(fill=tk.X, padx=6, pady=(6, 6))
 
     # -------------------- UI：右侧（显示） -------------------- #
+
     def _build_right(self):
         # 整体右侧容器
         right = ttk.Frame(self)
@@ -243,9 +534,10 @@ class App(tk.Tk):
         self.canvas_roi_wb.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
         # 右预览
-        self.lbl_anno = ttk.LabelFrame(self.pw_bottom, text="标注结果")
-        self.canvas_anno = tk.Label(self.lbl_anno, bg="#222")
+        self.lbl_anno = ttk.LabelFrame(self.pw_bottom, text="标注结果")       
+        self.canvas_anno = RightAnnoCanvas(self.lbl_anno)
         self.canvas_anno.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
 
         # 把左右预览加入下层分隔
         self.pw_bottom.add(self.lbl_roi_wb, minsize=120)
@@ -275,6 +567,88 @@ class App(tk.Tk):
             self._bind_autofit(widget)
         self._autofit_store[widget]["img"] = img_bgr
         self._render_autofit(widget)
+
+        # app 23.py —— 在 App 类中新增一个辅助方法：根据 overlay/bounds/lanes 绘制绿线与刻度
+    def _draw_overlays_on_core(
+        self,
+        img_core: np.ndarray,
+        gel_bgr: np.ndarray,
+        overlay: dict | None,
+        bounds: np.ndarray | None,
+        lanes: list[tuple[int, int]] | None,
+        a: float, b: float, fit_ok: bool,
+        tick_labels: list[float],
+        yaxis_side: str,
+        show_green: bool | None = None
+    ) -> np.ndarray:
+        if img_core is None or img_core.size == 0:
+            return img_core
+        img = img_core.copy()
+        H, W_total = img.shape[:2]
+        Hg, Wg = gel_bgr.shape[:2]
+        panel_w = (overlay.get("panel_w") if overlay else max(0, W_total - Wg))
+        side = (overlay.get("yaxis_side") if overlay else str(yaxis_side or "left").lower())
+        x_offset = 0 if side == "right" else panel_w
+
+        # === 1) 绿线：分隔线折线 ===
+        boundaries = (overlay.get("boundaries") if overlay else None) if overlay else None
+        if not boundaries:
+            # 回退：根据 bounds 或 lanes 重新构造
+            boundaries = []
+            if isinstance(bounds, np.ndarray) and bounds.ndim == 2 and bounds.shape[0] == Hg:
+                for i in range(1, bounds.shape[1]-1):
+                    xcol = (bounds[:, i].astype(np.int32) + int(x_offset))
+                    xcol = np.clip(xcol, 0, W_total-1)
+                    pts = np.stack([xcol, np.arange(Hg, dtype=np.int32)], axis=1)
+                    boundaries.append(pts)
+            elif lanes:
+                xs = [lanes[i][0] for i in range(1, len(lanes))]
+                for x in xs:
+                    xg = int(np.clip(x_offset + int(x), 0, W_total-1))
+                    pts = np.stack([np.full((Hg,), xg, dtype=np.int32),
+                                    np.arange(Hg, dtype=np.int32)], axis=1)
+                    boundaries.append(pts)
+        # 绘制
+        do_green = bool(self.var_show_green.get()) if show_green is None else bool(show_green)
+        if do_green:
+            for pts in boundaries or []:
+                cv2.polylines(
+                    img, [pts.astype(np.int32)],
+                    isClosed=False, color=(0, 255, 0), thickness=1, lineType=cv2.LINE_AA
+                )
+
+
+        # === 2) 刻度短横线/文字：App 层重绘，支持左右轴 ===
+        #if fit_ok and tick_labels:
+        #    lbs = sorted([float(x) for x in tick_labels if np.isfinite(x) and x > 0], reverse=True)
+        #    font = cv2.FONT_HERSHEY_SIMPLEX
+        #    fscale, thick = 0.5, 1
+        #    tick_len, gap = 12, 3
+        #    margin = 2
+        #    for mw in lbs:
+        #        y = int(round(a * np.log10(float(mw)) + b))
+        #        y_draw = int(np.clip(y, 12, H-5))
+        #        if side == "right":
+        #            # 右轴：短横线靠右白板左缘；文字在其右侧
+        #            x1 = int(Wg + margin)
+        #            x2 = int(min(W_total-1, x1 + tick_len - 1))
+        #            cv2.line(img, (x1, y_draw), (x2, y_draw), (0, 0, 0), 1, cv2.LINE_AA)
+        #            text = f"{mw:g}"
+        #            (tw, th), _ = cv2.getTextSize(text, font, fscale, thick)
+        #            x_text = int(min(W_total - 2 - tw, x2 + gap))
+        #            cv2.putText(img, text, (x_text, y_draw + th//2 - 1), font, fscale, (0,0,0), thick, cv2.LINE_AA)
+        #        else:
+        #            # 左轴：短横线靠白板右缘；文字在其左侧
+        #            x2 = int(panel_w - 1 - margin)
+        #            x1 = int(max(2, x2 - tick_len + 1))
+        #            cv2.line(img, (x1, y_draw), (x2, y_draw), (0, 0, 0), 1, cv2.LINE_AA)
+        #            text = f"{mw:g}"
+        #            (tw, th), _ = cv2.getTextSize(text, font, fscale, thick)
+        #            x_text = int(max(2, x1 - gap - tw))
+        #            cv2.putText(img, text, (x_text, y_draw + th//2 - 1), font, fscale, (0,0,0), thick, cv2.LINE_AA)
+
+        return img
+
 
     def _render_autofit(self, widget: tk.Label):
         store = self._autofit_store.get(widget)
@@ -385,6 +759,30 @@ class App(tk.Tk):
         self.gi = 1
         self.roi_editor.set_roi(self.boxes[0])
 
+    def on_toggle_show_green(self):
+        """
+        仅切换绿线显示，不做任何重算。
+        若缓存不存在（例如首次，还未 render_current），则回退到 render_current。
+        """
+        cache = getattr(self, "render_cache", None) or {}
+        img_no = cache.get("annotated_base_no_green")
+        img_yes = cache.get("annotated_base_with_green")
+        if img_no is None or img_yes is None:
+            # 首次或缓存失效时，执行一次完整渲染构建缓存
+            try:
+                self.render_current()
+            except Exception:
+                pass
+            return
+    
+        target = img_yes if bool(self.var_show_green.get()) else img_no
+        # 快速替换右侧交互画布底图（箭头保持）
+        if hasattr(self, "canvas_anno") and hasattr(self.canvas_anno, "update_base_image"):
+            try:
+                self.canvas_anno.update_base_image(target)
+            except Exception:
+                pass
+
     def switch_gel(self, delta):
         if not self.boxes:
             return
@@ -431,36 +829,25 @@ class App(tk.Tk):
         if self.orig_bgr is None:
             return
 
-        # 1) 只从 ROI 编辑器拿“旋转矩形 + OpenCV 角度”（CCW为正）
+        # 1) 读取旋转ROI并校正、裁切（保持原逻辑）
         rroi = self.roi_editor.get_rotated_roi()
         if rroi is None:
             from tkinter import messagebox
             messagebox.showwarning("提示", "请先在画布中框选或调整 ROI。")
             return
-        cx, cy, w, h, angle_ccw = rroi  # angle_ccw：逆时针为正
-
-        # 2) 先对整幅原图按 -angle 摆正（使 ROI 局部坐标与最终图像轴对齐）
+        cx, cy, w, h, angle_ccw = rroi
         rot_img, M = self._rotate_bound_with_M(self.orig_bgr, -angle_ccw)
-
-        # 3) 用同一仿射 M 把 ROI 中心映射到旋转后的图
         def _affine_point(M_, x, y):
-            return (M_[0,0]*x + M_[0,1]*y + M_[0,2],
-                    M_[1,0]*x + M_[1,1]*y + M_[1,2])
+            return (M_[0,0]*x + M_[0,1]*y + M_[0,2], M_[1,0]*x + M_[1,1]*y + M_[1,2])
         cx2, cy2 = _affine_point(M, cx, cy)
-
-        # 4) 在摆正后的图上按 (w,h) 做轴对齐裁剪（以中心为准）
-        x0 = int(round(cx2 - w / 2.0))
-        y0 = int(round(cy2 - h / 2.0))
-        x1 = x0 + int(round(w))
-        y1 = y0 + int(round(h))
+        x0 = int(round(cx2 - w/2.0)); y0 = int(round(cy2 - h/2.0))
+        x1 = x0 + int(round(w));      y1 = y0 + int(round(h))
         H2, W2 = rot_img.shape[:2]
-        x0 = max(0, min(x0, W2 - 1))
-        y0 = max(0, min(y0, H2 - 1))
-        x1 = max(x0 + 1, min(x1, W2))
-        y1 = max(y0 + 1, min(y1, H2))
+        x0 = max(0, min(x0, W2 - 1)); y0 = max(0, min(y0, H2 - 1))
+        x1 = max(x0 + 1, min(x1, W2)); y1 = max(y0 + 1, min(y1, H2))
         gel = rot_img[y0:y1, x0:x1].copy()
 
-        # 5) WB（放在摆正/裁剪之后）
+        # 2) WB（保持原逻辑）
         gamma_val = float(self.var_gamma_val.get())
         gamma = float(gamma_val) if self.var_gamma_on.get() else None
         gel_bgr = auto_white_balance(
@@ -473,23 +860,20 @@ class App(tk.Tk):
         ) if self.var_wb_on.get() else gel
         gel_gray = cv2.cvtColor(gel_bgr, cv2.COLOR_BGR2GRAY)
 
-        # 6) 解析标签（标准分子量 & 刻度）
+        # 3) 解析标记（保持原逻辑）
         def parse_list(s: str):
             s = (s or "").replace("，", ",")
             out = []
             for t in s.split(","):
                 t = t.strip()
-                if not t:
-                    continue
-                try:
-                    out.append(float(t))
-                except:
-                    pass
+                if not t: continue
+                try: out.append(float(t))
+                except: pass
             return out
-        ladder_labels_all = parse_list(self.ent_marker.get()) or [180, 130, 100, 70, 55, 40, 35, 25, 15, 10]
-        tick_labels =  ladder_labels_all
+        ladder_labels_all = parse_list(self.ent_marker.get()) or [180,130,100,70,55,40,35,25,15,10]
+        tick_labels = ladder_labels_all
 
-        # 7) 分道
+        # 4) 分道（保持原逻辑）
         nlanes = int(self.var_nlanes.get())
         mode = self.var_mode.get()
         if mode == "uniform":
@@ -502,24 +886,20 @@ class App(tk.Tk):
                 min_sep_ratio=float(self.var_sep.get()),
                 search_half=12, max_step_px=5, smooth_y=9,
                 wb_bgr=gel_bgr,
-                # 默认不做顶/底“等距混合”，避免把起始 x 锁死一致
                 enable_uniform_blend=False
             )
             lanes = None
 
-        # 8) 标准道/找峰
+        # 5) 标准带检测与拟合（保持原逻辑）
         ladder_lane = max(1, min(int(self.var_ladder_lane.get()), nlanes))
-        top = 0
-        bot = 0
-        y0_roi = top
-        y1_roi = (gel_gray.shape[0] - bot) if bot > 0 else None
+        y0_roi, y1_roi = 0, None
         if bounds is not None:
             peaks, prom = detect_bands_along_y_slanted(
-                gel_gray, bounds, lane_index=ladder_lane - 1,
+                gel_gray, bounds, lane_index=ladder_lane-1,
                 y0=y0_roi, y1=y1_roi, min_distance=20, min_prominence=10.0
             )
         else:
-            lx, rx = lanes[ladder_lane - 1]
+            lx, rx = lanes[ladder_lane-1]
             sub = gel_gray[:, lx:rx]
             peaks, prom = detect_bands_along_y_prominence(
                 sub, y0=y0_roi, y1=y1_roi, min_distance=20, min_prominence=10.0
@@ -527,21 +907,16 @@ class App(tk.Tk):
         ladder_peaks_for_draw = [int(round(p)) for p in peaks]
         ladder_labels_for_draw = sorted(ladder_labels_all, reverse=True)[:len(ladder_peaks_for_draw)]
 
-        # 9) 拟合
         sel_p_idx, sel_l_idx = match_ladder_best(peaks, ladder_labels_all, prom, min_pairs=3)
-        fit_ok = False
-        a, b = 1.0, 0.0
-        r2, rmse = None, None
+        fit_ok = False; a, b = 1.0, 0.0; r2 = rmse = None
         if len(sel_p_idx) >= 2:
             y_used = [float(peaks[i]) for i in sel_p_idx]
             lbl_used = [sorted(ladder_labels_all, reverse=True)[j] for j in sel_l_idx]
             w_used = [float(prom[i]) for i in sel_p_idx]
             a_fit, b_fit = fit_log_mw_irls(y_used, lbl_used, w_used, iters=6)
             H_roi = gel_gray.shape[0]
-            ok, r2, rmse = eval_fit_quality(
-                y_used, lbl_used, a_fit, b_fit, H=H_roi,
-                r2_min=0.97, rmse_frac_max=0.02, rmse_abs_min_px=20.0
-            )
+            ok, r2, rmse = eval_fit_quality(y_used, lbl_used, a_fit, b_fit, H=H_roi,
+                                            r2_min=0.97, rmse_frac_max=0.02, rmse_abs_min_px=20.0)
             if ok:
                 a, b = a_fit, b_fit
                 fit_ok = True
@@ -549,77 +924,103 @@ class App(tk.Tk):
                 from tkinter import messagebox
                 messagebox.showwarning(
                     "提示",
-                    f"标准道拟合偏差较大（R²={r2:.3f}, RMSE={rmse:.1f}px），已放弃拟合。\n"
-                    "请检查标准道序号、分子量表、泳道与 ROI。"
+                    f"标准道拟合偏差较大（R²={r2:.3f}, RMSE={rmse:.1f}px），已放弃拟合。\n请检查标准道序号、分子量表、泳道与 ROI。"
                 )
         else:
             from tkinter import messagebox
             messagebox.showinfo("提示", "用于稳健拟合的标准带不足：已输出图像，但 Y 轴分子量刻度仅在拟合成功时显示。")
 
-        # 10) 标注渲染
-        # —— 10) 标注渲染（原样） ——
+        # 6) 核心标注底图（不包含绿线）
         if bounds is not None:
-            annotated = render_annotation_slanted(
+            res = render_annotation_slanted(
                 gel_bgr, bounds, ladder_peaks_for_draw, ladder_labels_for_draw,
                 a, b, tick_labels if fit_ok else [],
                 yaxis_side=self.var_axis.get()
             )
         else:
-            annotated = render_annotation(
+            res = render_annotation(
                 gel_bgr, lanes, ladder_peaks_for_draw, ladder_labels_for_draw,
                 a, b, tick_labels if fit_ok else [],
                 yaxis_side=self.var_axis.get()
             )
+        annotated_core = res if not (isinstance(res, tuple) and len(res) == 2) else res[0]
+        overlay = None
 
-        # 10.5) 逐列分子量箭头叠加 —— 新增参数 yaxis_side 与 ladder_lane
-        annotated = self._overlay_lane_marks(
-            annotated_img=annotated,
-            gel_bgr=gel_bgr,
-            bounds=bounds, lanes=lanes,
+        # 7) “不带绿线”的核心图
+        annotated_core_no_green = self._draw_overlays_on_core(
+            img_core=annotated_core, gel_bgr=gel_bgr,
+            overlay=overlay, bounds=bounds, lanes=lanes,
             a=a, b=b, fit_ok=fit_ok,
-            nlanes=nlanes,
-            ladder_lane=ladder_lane,                      # ★ 新增
-            yaxis_side=self.var_axis.get()                # ★ 新增
+            tick_labels=tick_labels if fit_ok else [],
+            yaxis_side=self.var_axis.get(),
+            show_green=False
         )
 
-       # --- render_current 内，第 11) 附加标签面板处：改为仅映射到非标准道 ---
-# 11) 附加标签面板（白底列名）—— 仅映射到非标准道，顺延；缺则空，多则省
-        annotated_final = annotated
+        # 8) 上方“列名”白板（如开启），得到最终“无绿线”底图
+        annotated_final_base = annotated_core_no_green
+        panel_top_h = 0
         if self.var_labels_on.get():
             nlanes = int(self.var_nlanes.get())
             ladder_lane = max(1, min(int(self.var_ladder_lane.get()), nlanes))
             n_nonladder = max(0, nlanes - 1)
-
             names_seq = (self.lane_names or [])
-            # 顺延映射：仅取前 n_nonladder 个名字，不足补空，超出截断
             names_use = (names_seq + [""] * n_nonladder)[:n_nonladder]
-            labels_table = [names_use]  # 单行表
-
-            # 若至少有一个非空文本，才附加白底面板
+            labels_table = [names_use]  # 仅一行：列名
             if labels_table and any((t or "").strip() for t in labels_table[0]):
-                annotated_final = self._attach_labels_panel(
-                    img_bgr=annotated,
+                H0 = annotated_core_no_green.shape[0]
+                annotated_final_base = self._attach_labels_panel(
+                    img_bgr=annotated_core_no_green,
                     lanes=lanes, bounds=bounds,
                     labels_table=labels_table,
                     gel_bgr=gel_bgr,
                     ladder_lane=ladder_lane,
                     yaxis_side=self.var_axis.get()
                 )
+                panel_top_h = annotated_final_base.shape[0] - H0
 
-        # 12) 显示（自适应）
+        # 9) 在“无绿线最终底图”基础上，再生成一份“带绿线”的版本
+        annotated_final_with_green = self._draw_overlays_on_core(
+            img_core=annotated_final_base, gel_bgr=gel_bgr,
+            overlay=overlay, bounds=bounds, lanes=lanes,
+            a=a, b=b, fit_ok=fit_ok,
+            tick_labels=tick_labels if fit_ok else [],
+            yaxis_side=self.var_axis.get(),
+            show_green=True
+        )
+
+        # 10) 左侧预览（WB 后 ROI 裁剪图）
         self._set_autofit_image(self.canvas_roi_wb, gel_bgr)
-        self._set_autofit_image(self.canvas_anno, annotated_final)
 
-        # 13) 缓存导出
+        # 11) 右侧交互画布初始化：用“无绿线”底图；若勾选，则再瞬时切到“有绿线”
+        lane_marks_input = self.lane_marks or []
+        ladder_lane = max(1, min(int(self.var_ladder_lane.get()), int(self.var_nlanes.get())))
+        self.canvas_anno.set_scene(
+            base_img_bgr=annotated_final_base,  # 先用无绿线
+            gel_bgr=gel_bgr,
+            bounds=bounds, lanes=lanes,
+            a=a, b=b, fit_ok=fit_ok,
+            nlanes=int(self.var_nlanes.get()),
+            ladder_lane=ladder_lane,
+            yaxis_side=self.var_axis.get(),
+            lane_marks=lane_marks_input,
+            panel_top_h=panel_top_h
+        )
+        if bool(self.var_show_green.get()):
+            # 切换为“带绿线”
+            self.canvas_anno.update_base_image(annotated_final_with_green)
+
+        # 12) 缓存：两版底图 + 其他信息
         self.render_cache = {
             "gi": int(self.gi),
             "gel_bgr": gel_bgr,
-            "annotated": annotated,
-            "annotated_final": annotated_final
+            "annotated_base": annotated_final_base,            # 兼容旧键：无绿线
+            "annotated_base_no_green": annotated_final_base,   # 新：无绿线
+            "annotated_base_with_green": annotated_final_with_green,  # 新：有绿线
+            "fit_ok": fit_ok
         }
         if not fit_ok:
             from tkinter import messagebox
-            messagebox.showinfo("提示", "本次未绘制 Y 轴分子量刻度（拟合未通过质控）。")
+            messagebox.showinfo("提示", "本次未绘制 Y 轴分子量刻度（拟合未通过质控），右侧不生成可拖动箭头。")
 
     # -------- 新增：按“每列分子量列表”绘制红色箭头 -------- #
     def _overlay_lane_marks(
@@ -677,10 +1078,10 @@ class App(tk.Tk):
 
         # 小实心红箭头
         def draw_arrow(xc: int, y: int, color=(0, 0, 255)):
-            tip = (int(xc), int(np.clip(y, 0, H - 1)))
-            w, h = 10, 12
-            p1 = (tip[0] - w // 2, int(np.clip(tip[1] - h, 0, H - 1)))
-            p2 = (tip[0] + w // 2, int(np.clip(tip[1] - h, 0, H - 1)))
+            tip = (int(xc)-20, int(np.clip(y, 0, H - 1)))
+            w, h = 20, 5
+            p1 = (tip[0] - w // 2, int(np.clip(tip[1] + h, 0, H - 1)))
+            p2 = (tip[0] - w // 2, int(np.clip(tip[1] - h, 0, H - 1)))
             pts = np.array([p1, p2, tip], dtype=np.int32)
             cv2.fillPoly(img, [pts], color)
             cv2.polylines(img, [pts], isClosed=True, color=(255, 255, 255), thickness=1, lineType=cv2.LINE_AA)
@@ -832,29 +1233,63 @@ class App(tk.Tk):
                     y += ch_h + v_char_gap
             y_cursor += rh + row_gap
 
-        cv2.rectangle(panel, (0, 0), (W_total - 1, panel_h - 1), (0, 0, 0), 1)
+        #cv2.rectangle(panel, (0, 0), (W_total - 1, panel_h - 1), (0, 0, 0), 1)
         return np.vstack([panel, img_bgr])
 
 
 
     # -------------------- 其他 -------------------- #
     def export_current(self):
-        if not self.render_cache:
-            messagebox.showwarning("提示", "请先渲染当前胶块。")
-            return
-        img_to_save = self.render_cache.get("annotated_final", self.render_cache.get("annotated"))
+        """
+        导出当前右侧“标注结果”：
+        - 优先从右侧交互式 Canvas（self.canvas_anno）合成：包含用户拖动后的位置（若有箭头）。
+        - 若交互式 Canvas 不可用或未渲染，则回退导出不含红箭头的底图（render_cache["annotated_base"]）。
+        - 继续兼容旧键：若没有 annotated_base，会尝试 annotated_final / annotated。
+        """
+        # 1) 优先从交互画布取“所见即所得”的合成结果
+        img_to_save = None
+        if hasattr(self, "canvas_anno") and hasattr(self.canvas_anno, "render_to_image"):
+            try:
+                img_to_save = self.canvas_anno.render_to_image()
+            except Exception:
+                img_to_save = None
+
+        # 2) 回退：导出底图（不含红箭头）
         if img_to_save is None:
-            messagebox.showwarning("提示", "未找到可导出的标注图像。")
+            if not getattr(self, "render_cache", None):
+                messagebox.showwarning("提示", "请先渲染当前胶块。")
+                return
+            # 新版键：仅底图（不含红箭头）
+            img_to_save = self.render_cache.get("annotated_base")
+            # 兼容旧版键：annotated_final（含叠加内容）、annotated（不一定含白板）
+            if img_to_save is None:
+                img_to_save = self.render_cache.get("annotated_final") or self.render_cache.get("annotated")
+
+            if img_to_save is None:
+                messagebox.showwarning("提示", "未找到可导出的图像。")
+                return
+
+        # 3) 基本健壮性检查
+        if not isinstance(img_to_save, np.ndarray) or img_to_save.size == 0:
+            messagebox.showerror("错误", "导出图像无效。")
             return
-        gi = self.render_cache.get("gi", 1)
+
+        # 4) 生成默认文件名
+        try:
+            gi = int(self.render_cache.get("gi", getattr(self, "gi", 1)))
+        except Exception:
+            gi = getattr(self, "gi", 1) or 1
+
         default_name = f"gel{gi}_annotated.png"
         try:
             if getattr(self, "image_path", None):
                 p = Path(self.image_path)
+                # 使用源文件名作为前缀
                 default_name = f"{p.stem}_annotated.png"
         except Exception:
             pass
 
+        # 5) 保存对话框
         fpath = filedialog.asksaveasfilename(
             title="保存带标注的图片",
             defaultextension=".png",
@@ -863,11 +1298,23 @@ class App(tk.Tk):
         )
         if not fpath:
             return
+
+        # 6) PNG 编码并写入（tofile 适配 Windows 中文路径）
         ok, buf = cv2.imencode(".png", img_to_save)
         if not ok:
             messagebox.showerror("错误", "PNG 编码失败，未能导出。")
             return
-        buf.tofile(fpath)
+
+        try:
+            buf.tofile(fpath)   # Windows 下避免编码问题
+        except Exception:
+            try:
+                with open(fpath, "wb") as f:
+                    f.write(buf.tobytes())
+            except Exception as e:
+                messagebox.showerror("错误", f"写入文件失败：{e}")
+                return
+
         messagebox.showinfo("完成", f"已导出：{fpath}")
 
     # ----- 新增/改造：角度重置 & 列名+分子量编辑器 ----- #
