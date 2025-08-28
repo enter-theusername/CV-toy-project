@@ -5,7 +5,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import numpy as np
 import cv2
-
+import json
 from gel_core import (
     auto_white_balance, detect_gel_regions,
     lanes_by_projection, lanes_uniform,
@@ -343,6 +343,223 @@ class App(tk.Tk):
         # 左右UI
         self._build_left()
         self._build_right()
+        self._init_ladder_presets()
+
+    # ===== 标准分子量集合：持久化与初始化 =====
+    def _preset_store_path(self) -> Path:
+        # ~/.gel_annotator/ladder_presets.json
+        base = Path.home() / ".gel_annotator"
+        base.mkdir(parents=True, exist_ok=True)
+        return base / "ladder_presets.json"
+
+    def _load_ladder_presets(self) -> list[dict]:
+        """返回 [{'name': str, 'values': [float], 'note': str}, ...] """
+        p = self._preset_store_path()
+        if p.exists():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                items = data.get("items", []) if isinstance(data, dict) else data
+                # 基本清洗
+                out = []
+                for it in items:
+                    name = str(it.get("name", "")).strip()
+                    vals = [float(v) for v in it.get("values", []) if isinstance(v, (int,float))]
+                    note = str(it.get("note", "")).strip()
+                    if name and vals:
+                        out.append({"name": name, "values": vals, "note": note})
+                # 去重（以名称为准，后者覆盖前者）
+                seen = {}
+                for it in out:
+                    seen[it["name"]] = it
+                return list(seen.values())
+            except Exception:
+                pass
+        # 不存在或损坏：写入一个默认集合
+        default_items = [{
+            "name": "常用10条(10–180 kDa)",
+            "values": [180,130,95,65,52,41,31,25,17,10],
+            "note": "与应用内默认相同，顺序大→小"
+        }]
+        self._save_ladder_presets(default_items)
+        return default_items
+
+    def _save_ladder_presets(self, items: list[dict]):
+        p = self._preset_store_path()
+        data = {"version": 1, "items": items}
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _init_ladder_presets(self):
+        """一次性初始化变量、加载并刷新 UI"""
+        self._ladder_items: list[dict] = self._load_ladder_presets()   # 内存集合
+        self.var_preset = getattr(self, "var_preset", tk.StringVar(value=""))
+        self._refresh_preset_ui()
+
+    def _refresh_preset_ui(self):
+        """刷新下拉框与信息标签"""
+        names = [it["name"] for it in getattr(self, "_ladder_items", [])]
+        if hasattr(self, "cb_preset"):
+            self.cb_preset["values"] = names
+        # 如果当前选项已被删除，则清空
+        cur = self.var_preset.get().strip()
+        if cur not in names:
+            self.var_preset.set("")
+            if hasattr(self, "lbl_preset_info"):
+                self.lbl_preset_info.configure(text="（未选择标准集合）")
+
+    def _apply_preset_to_entry(self, name: str):
+        """把指定集合写回到文本框，并在下方显示详情"""
+        items = getattr(self, "_ladder_items", [])
+        match = next((it for it in items if it["name"] == name), None)
+        if not match:
+            return
+        # 写回原有输入框（保持兼容渲染逻辑）
+        vals = match["values"]
+        self.ent_marker.delete(0, tk.END)
+        self.ent_marker.insert(0, ", ".join(f"{v:g}" for v in vals))
+        # 显示信息
+        note = match.get("note", "").strip()
+        info = f"条目：{name}｜条数：{len(vals)}｜值：{', '.join(f'{v:g}' for v in vals)}"
+        if note:
+            info += f"\n备注：{note}"
+        if hasattr(self, "lbl_preset_info"):
+            self.lbl_preset_info.configure(text=info)
+
+    def on_select_preset(self, *_):
+        name = self.var_preset.get().strip()
+        if name:
+            self._apply_preset_to_entry(name)
+
+    def open_preset_manager(self):
+        """查看/新建/编辑/删除 标准分子量集合"""
+        win = tk.Toplevel(self)
+        win.title("管理标准集合")
+        win.transient(self); win.grab_set()
+
+        frm = ttk.Frame(win); frm.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # 左：列表
+        left = ttk.Frame(frm); left.pack(side=tk.LEFT, fill=tk.Y)
+        ttk.Label(left, text="集合列表").pack(anchor="w")
+        lb = tk.Listbox(left, width=26, height=16)
+        lb.pack(fill=tk.Y, expand=False, pady=(4,8))
+        def _reload_list(select_name: str|None=None):
+            lb.delete(0, tk.END)
+            for it in self._ladder_items:
+                lb.insert(tk.END, it["name"])
+            if select_name:
+                try:
+                    idx = [it["name"] for it in self._ladder_items].index(select_name)
+                    lb.selection_set(idx); lb.see(idx)
+                except Exception:
+                    pass
+
+        # 右：编辑区
+        right = ttk.Frame(frm); right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        ttk.Label(right, text="名称").grid(row=0, column=0, sticky="w")
+        ent_name = ttk.Entry(right); ent_name.grid(row=0, column=1, sticky="ew", padx=(6,0))
+        ttk.Label(right, text="分子量（支持 , ; 空格/中文逗号，顺序大→小）").grid(row=1, column=0, columnspan=2, sticky="w", pady=(8,0))
+        txt_vals = tk.Text(right, height=5); txt_vals.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(4,0))
+        ttk.Label(right, text="备注").grid(row=3, column=0, sticky="w", pady=(8,0))
+        txt_note = tk.Text(right, height=4); txt_note.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=(4,0))
+
+        right.columnconfigure(1, weight=1)
+        right.rowconfigure(2, weight=1)
+        right.rowconfigure(4, weight=1)
+
+        def _parse_vals(raw: str) -> list[float]:
+            s = (raw or "").replace("，", ",").replace("；", ";").replace("、", ",")
+            for ch in [":", "：", ";", " ", "\t", "\n", "\r", ";"]:
+                s = s.replace(ch, ",")
+            out = []
+            for t in s.split(","):
+                t = t.strip()
+                if not t: continue
+                try:
+                    v = float(t)
+                    if np.isfinite(v) and v > 0:
+                        out.append(v)
+                except Exception:
+                    pass
+            return out
+
+        def _fill_editor(it: dict|None):
+            ent_name.delete(0, tk.END)
+            txt_vals.delete("1.0", tk.END)
+            txt_note.delete("1.0", tk.END)
+            if not it: return
+            ent_name.insert(0, it["name"])
+            txt_vals.insert("1.0", ", ".join(f"{v:g}" for v in it["values"]))
+            if it.get("note"):
+                txt_note.insert("1.0", it["note"])
+
+        def _current_item() -> dict|None:
+            sel = lb.curselection()
+            if not sel: return None
+            idx = sel[0]
+            if 0 <= idx < len(self._ladder_items):
+                return self._ladder_items[idx]
+            return None
+
+        def on_list_select(_evt=None):
+            _fill_editor(_current_item())
+
+        lb.bind("<<ListboxSelect>>", on_list_select)
+
+        # 按钮区
+        btns = ttk.Frame(right); btns.grid(row=5, column=0, columnspan=2, sticky="e", pady=(10,0))
+        def do_new():
+            _fill_editor({"name": "", "values": [], "note": ""})
+            ent_name.focus_set()
+
+        def do_save():
+            name = ent_name.get().strip()
+            vals = _parse_vals(txt_vals.get("1.0", "end"))
+            note = txt_note.get("1.0", "end").strip()
+            if not name:
+                messagebox.showwarning("提示", "请填写名称"); return
+            if not vals:
+                messagebox.showwarning("提示", "请至少填写一个有效分子量数值"); return
+            # 去重：同名覆盖
+            new_items = []
+            replaced = False
+            for it in self._ladder_items:
+                if it["name"] == name:
+                    new_items.append({"name": name, "values": vals, "note": note})
+                    replaced = True
+                else:
+                    new_items.append(it)
+            if not replaced:
+                new_items.append({"name": name, "values": vals, "note": note})
+            self._ladder_items = new_items
+            self._save_ladder_presets(self._ladder_items)
+            self._refresh_preset_ui()
+            _reload_list(select_name=name)
+            # 同步到主界面（若正选中）
+            self.var_preset.set(name)
+            self._apply_preset_to_entry(name)
+
+        def do_delete():
+            it = _current_item()
+            if not it: return
+            if not messagebox.askyesno("确认", f"确定要删除集合「{it['name']}」吗？"):
+                return
+            self._ladder_items = [x for x in self._ladder_items if x["name"] != it["name"]]
+            self._save_ladder_presets(self._ladder_items)
+            self._refresh_preset_ui()
+            _reload_list()
+            _fill_editor(None)
+            # 若删除的是当前选中项，清空显示
+            if self.var_preset.get().strip() == it["name"]:
+                self.var_preset.set("")
+                if hasattr(self, "lbl_preset_info"):
+                    self.lbl_preset_info.configure(text="（未选择标准集合）")
+
+        ttk.Button(btns, text="新建", command=do_new).pack(side=tk.LEFT, padx=(0,6))
+        ttk.Button(btns, text="保存", command=do_save).pack(side=tk.LEFT, padx=(0,6))
+        ttk.Button(btns, text="删除", command=do_delete).pack(side=tk.LEFT, padx=(0,6))
+        ttk.Button(btns, text="关闭", command=win.destroy).pack(side=tk.RIGHT)
+
+        _reload_list()
 
     # -------------------- UI：左侧 -------------------- #
     def _build_left(self):
@@ -492,6 +709,17 @@ class App(tk.Tk):
         ttk.Label(f_marker, text="标准分子量(kDa，大→小)：", wraplength=self.LEFT_WIDTH-24, justify="left").pack(anchor="w", padx=6)
         self.ent_marker = ttk.Entry(f_marker); self.ent_marker.insert(0, "180,130,95,65,52,41,31,25,17,10")
         self.ent_marker.pack(fill=tk.X, padx=6, pady=2)
+        row = ttk.Frame(f_marker); row.pack(fill=tk.X, padx=6, pady=(6,2))
+        ttk.Label(row, text="选择集合").pack(side=tk.LEFT)
+        self.var_preset = getattr(self, "var_preset", tk.StringVar(value=""))
+        self.cb_preset = ttk.Combobox(row, textvariable=self.var_preset, state="readonly", width=22)
+        self.cb_preset.pack(side=tk.LEFT, padx=(6,6))
+        self.cb_preset.bind("<<ComboboxSelected>>", self.on_select_preset)
+        ttk.Button(row, text="管理集合…", command=self.open_preset_manager).pack(side=tk.RIGHT)
+        # 信息标签（多行）
+        #self.lbl_preset_info = ttk.Label(f_marker, text="（未选择标准集合）", justify="left")
+        #self.lbl_preset_info.pack(fill=tk.X, padx=6, pady=(4,2))
+
         self.var_axis = tk.StringVar(value="left")
         ttk.Checkbutton(f_marker,text="显示绿线（分隔线）",variable=self.var_show_green,command=self.on_toggle_show_green ).pack(anchor="w", padx=6, pady=2) # <--- 轻量切换
 
