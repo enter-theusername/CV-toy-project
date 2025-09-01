@@ -830,7 +830,7 @@ class App(tk.Tk):
     def open_preset_manager(self):
         """查看/新建/编辑/删除 标准分子量集合"""
         win = tk.Toplevel(self)
-        win.title("管理标准集合")
+        win.title("管理")
         win.transient(self); win.grab_set()
 
         frm = ttk.Frame(win); frm.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
