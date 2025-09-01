@@ -1377,6 +1377,20 @@ class App(tk.Tk):
         else:
             self.orig_bgr = bgr
             self.image_path = path
+            
+            # === 新增：选择新图片后，清空“底部备注”和“行信息（列名与分子量）” ===
+            try:
+                self.bottom_note_text = ""   # 底部备注清空
+            except Exception:
+                setattr(self, "bottom_note_text", "")
+    
+            # “行信息”即左侧【自定义标签（每行：列名 + 本列分子量）】对应的数据源
+            self.lane_names = []            # 列名清空
+            self.lane_marks = []            # 每列分子量清空
+    
+            # （可选）清空渲染缓存，避免沿用上一张图像的底图/箭头等状态
+            self.render_cache = {}
+
             self.gi = 1
             self.boxes = []
             self.roi_editor.set_image(self.orig_bgr)
