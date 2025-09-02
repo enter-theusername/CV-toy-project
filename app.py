@@ -1535,30 +1535,49 @@ class App(tk.Tk):
         )
         if not path:
             return
+    
         bgr = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
         if bgr is None:
             messagebox.showerror("错误", "无法读取图片")
-        else:
+            return
+    
+        # ==== 新增：读取后即做“约 1MB”压缩（JPEG，有损） ====
+        try:
+            # 目标 1MB，可按需调整；容差 ±8%，避免频繁上下抖动
+            bgr_comp, est_bytes = self._compress_image_near_size(
+                bgr,
+                target_bytes=1_024_000,
+                tol_ratio=0.08,
+                min_quality=40,
+                max_quality=95,
+                min_side_px=720,
+                max_downscale_rounds=4
+            )
+            self.orig_bgr = bgr_comp
+            # 记录一下（可用于调试或后续显示）
+            self.image_path = path
+            self.image_load_est_bytes = int(est_bytes)
+        except Exception:
+            # 压缩失败则回退原图
             self.orig_bgr = bgr
             self.image_path = path
-            
-            # === 新增：选择新图片后，清空“底部备注”和“行信息（列名与分子量）” ===
-            try:
-                self.bottom_note_text = ""   # 底部备注清空
-            except Exception:
-                setattr(self, "bottom_note_text", "")
+            self.image_load_est_bytes = int(getattr(bgr, "nbytes", 0))
+    
+        # === 读取新图片后的原有清空逻辑保持不变 ===
+        try:
+            self.bottom_note_text = ""  # 底部备注清空
+        except Exception:
+            setattr(self, "bottom_note_text", "")
+    
+        self.lane_names = []  # 列名清空
+        self.lane_marks = []  # 每列分子量清空
+    
+        self.render_cache = {}
+        self.gi = 1
+        self.boxes = []
+        self.roi_editor.set_image(self.orig_bgr)
+        self.run_detect()
 
-            # “行信息”即左侧【自定义标签（每行：列名 + 本列分子量）】对应的数据源
-            self.lane_names = []            # 列名清空
-            self.lane_marks = []            # 每列分子量清空
-
-            # （可选）清空渲染缓存，避免沿用上一张图像的底图/箭头等状态
-            self.render_cache = {}
-
-            self.gi = 1
-            self.boxes = []
-            self.roi_editor.set_image(self.orig_bgr)
-            self.run_detect()
 
     def run_detect(self):
         if self.orig_bgr is None:
@@ -1649,6 +1668,90 @@ class App(tk.Tk):
         nx = M[0,0]*x + M[0,1]*y + M[0,2]
         ny = M[1,0]*x + M[1,1]*y + M[1,2]
         return nx, ny
+
+    def _compress_image_near_size(
+        self,
+        bgr: np.ndarray,
+        target_bytes: int = 1_024_000,   # 约 1MB
+        tol_ratio: float = 0.08,         # 目标大小的容差（±8%）
+        min_quality: int = 40,
+        max_quality: int = 95,
+        min_side_px: int = 720,          # 防止过度缩小
+        max_downscale_rounds: int = 4
+    ) -> tuple[np.ndarray, int]:
+        """
+        将 BGR 图像有损压缩到 ~target_bytes（默认 ~1MB）并返回 (压缩后BGR, 估算字节数)。
+        策略：
+          1) 先在当前分辨率下对 JPEG 质量做二分搜索，力求 <= target_bytes*(1+tol) 且尽量高质量；
+          2) 若最低质量仍超标，则按比例缩小分辨率后重试（最多 max_downscale_rounds 次）；
+          3) 最终用 cv2.imdecode 解码回 BGR，以便后续算法统一处理。
+        说明：
+          - 这一步是“读取后即做压缩”，会引入 JPEG 有损；如需无损保真，请告知改为仅缩放或使用 PNG。
+        """
+        if not isinstance(bgr, np.ndarray) or bgr.size == 0:
+            return bgr, 0
+
+        H, W = bgr.shape[:2]
+        img = bgr
+        target_hi = int(target_bytes * (1.0 + tol_ratio))
+
+        def _encode_with_quality(src: np.ndarray, q: int):
+            ok, buf = cv2.imencode(".jpg", src, [cv2.IMWRITE_JPEG_QUALITY, int(q)])
+            if not ok:
+                raise RuntimeError("JPEG 编码失败")
+            return buf
+
+        def _binary_search_quality(src: np.ndarray):
+            lo, hi = min_quality, max_quality
+            best_buf = None
+            best_q = None
+            # 质量二分：尽量逼近但不超过 target_hi；若超过，则降低质量
+            for _ in range(9):
+                if lo > hi:
+                    break
+                mid = (lo + hi) // 2
+                buf = _encode_with_quality(src, mid)
+                sz = int(buf.size)
+                if sz <= target_hi:
+                    best_buf = buf
+                    best_q = mid
+                    lo = mid + 1  # 还能更高质量
+                else:
+                    hi = mid - 1  # 需要更小
+            # 若不存在<=target_hi 的结果，则返回最小质量的编码作为兜底
+            if best_buf is not None:
+                return best_buf, best_q
+            return _encode_with_quality(src, min_quality), min_quality
+
+        # 尝试：最多若干轮“缩放 + 质量搜索”
+        for _round in range(max_downscale_rounds + 1):
+            # 质量搜索（当前分辨率）
+            buf, used_q = _binary_search_quality(img)
+            cur_sz = int(buf.size)
+            if cur_sz <= target_hi:
+                # 命中目标，解码为 BGR 返回
+                out = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                return (out if out is not None else img), cur_sz
+
+            # 仍超标：若还允许继续缩放，则估算缩放比例，缩小再试
+            if _round >= max_downscale_rounds:
+                # 达到缩放轮次上限，直接用当前最小质量结果
+                out = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                return (out if out is not None else img), cur_sz
+
+            # 估算缩放比例：文件大小 ~ 像素数 * 压缩率，粗略按 sqrt 比例缩小边长
+            scale = max(0.4, min(0.95, (target_bytes / float(cur_sz)) ** 0.5 * 0.97))
+            new_w = max(min_side_px, int(W * scale))
+            new_h = max(min_side_px, int(H * scale))
+            if new_w == W and new_h == H:
+                # 尺寸已经很小，避免死循环，直接返回当前结果
+                out = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                return (out if out is not None else img), cur_sz
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            H, W = img.shape[:2]
+
+        # 理论不会到此；兜底返回原图
+
 
     def render_current(self):
         if self.orig_bgr is None:
@@ -1742,7 +1845,7 @@ class App(tk.Tk):
             a_fit, b_fit = fit_log_mw_irls(y_used, lbl_used, w_used, iters=6)
             H_roi = gel_gray.shape[0]
             ok, r2, rmse = eval_fit_quality(y_used, lbl_used, a_fit, b_fit, H=H_roi,
-                                            r2_min=0.97, rmse_frac_max=0.02, rmse_abs_min_px=20.0)
+                                            r2_min=0.5, rmse_frac_max=0.02, rmse_abs_min_px=80.0)
             if ok:
                 a, b = a_fit, b_fit
                 fit_ok = True
