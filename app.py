@@ -295,6 +295,8 @@ class RightAnnoCanvas(tk.Canvas):
             pts_canvas.extend([cx, cy])
         return pts_canvas
 
+
+
     def _add_arrow(self, x_img: float, y_img: float, lane_idx: int, mw: float, color: tuple[int, int, int] = (255, 64, 64)):
             """在Canvas上新增一个箭头并绑定拖拽事件，同时创建配套红色可调方框+黄色灰度和。"""
             # Tk 颜色（BGR -> #RRGGBB）
@@ -454,7 +456,7 @@ class RightAnnoCanvas(tk.Canvas):
         self.coords(box["rect_id"], x1, y1, x2, y2)
 
         # 更新手柄（四角小方块）
-        hs = 1
+        hs = 2
         corners = {
             "nw": (x1, y1),
             "ne": (x2, y1),
@@ -1279,6 +1281,62 @@ class App(tk.Tk):
         self._render_autofit(widget)
 
         # app 23.py —— 在 App 类中新增一个辅助方法：根据 overlay/bounds/lanes 绘制绿线与刻度
+    def _font_scale_for_cap_height_px(self, cap_px: int, font=cv2.FONT_HERSHEY_SIMPLEX, thickness: int = 1) -> float:
+        """
+        给定目标像素字高（cap_px），返回 cv2.putText 的 fontScale。
+        做法：对样例文本（取 "Ag"）进行二分搜索，使 getTextSize 返回的高度 ≈ cap_px。
+        """
+        cap_px = max(1, int(cap_px))
+        lo, hi = 0.1, 5.0
+        target = cap_px
+
+        def height_for(scale: float) -> int:
+            (_, h), _ = cv2.getTextSize("Ag", font, scale, thickness)
+            return max(1, int(h))
+
+        for _ in range(20):
+            mid = (lo + hi) / 2.0
+            h = height_for(mid)
+            if h < target:
+                lo = mid
+            else:
+                hi = mid
+        return hi
+    def _standardize_gel_size(self, gel_bgr: np.ndarray, target_width_px: int) -> np.ndarray:
+        """
+        将 WB 后的凝胶图等比缩放到 target_width_px 像素宽（高度随比例变动）。
+        """
+        if gel_bgr is None or gel_bgr.size == 0:
+            return gel_bgr
+        H, W = gel_bgr.shape[:2]
+        target_width_px = max(200, int(target_width_px))  # 下限防呆
+        if W == target_width_px:
+            return gel_bgr
+        scale = target_width_px / float(W)
+        new_w = target_width_px
+        new_h = max(1, int(round(H * scale)))
+        return cv2.resize(gel_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR)
+    def _get_design_params(self) -> dict:
+        """
+        统一读取（若变量未创建则给默认值）：
+        - design_gel_width_px: 标准凝胶宽度
+        - top_cap_px: 顶部泳道名单行字高
+        - bottom_cap_px: 底部备注字高
+        """
+        design_gel_width_px = getattr(self, "var_design_gel_width_px", None)
+        top_cap_px = getattr(self, "var_top_font_cap_px", None)
+        bottom_cap_px = getattr(self, "var_bottom_font_cap_px", None)
+
+        design_gel_width_px = int(design_gel_width_px.get()) if design_gel_width_px else 1200
+        top_cap_px = int(top_cap_px.get()) if top_cap_px else 18
+        bottom_cap_px = int(bottom_cap_px.get()) if bottom_cap_px else 16
+        return {
+            "design_gel_width_px": max(200, design_gel_width_px),
+            "top_cap_px": max(8, top_cap_px),
+            "bottom_cap_px": max(8, bottom_cap_px),
+        }
+
+
     def _draw_overlays_on_core(
         self,
         img_core: np.ndarray,
@@ -1756,7 +1814,6 @@ class App(tk.Tk):
     def render_current(self):
         if self.orig_bgr is None:
             return
-
         # 1) 读取旋转ROI并校正、裁切（保持原逻辑）
         rroi = self.roi_editor.get_rotated_roi()
         if rroi is None:
@@ -1765,12 +1822,11 @@ class App(tk.Tk):
             return
         cx, cy, w, h, angle_ccw = rroi
         rot_img, M = self._rotate_bound_with_M(self.orig_bgr, -angle_ccw)
-
         def _affine_point(M_, x, y):
             return (M_[0,0]*x + M_[0,1]*y + M_[0,2], M_[1,0]*x + M_[1,1]*y + M_[1,2])
         cx2, cy2 = _affine_point(M, cx, cy)
         x0 = int(round(cx2 - w/2.0)); y0 = int(round(cy2 - h/2.0))
-        x1 = x0 + int(round(w));       y1 = y0 + int(round(h))
+        x1 = x0 + int(round(w)); y1 = y0 + int(round(h))
         H2, W2 = rot_img.shape[:2]
         x0 = max(0, min(x0, W2 - 1)); y0 = max(0, min(y0, H2 - 1))
         x1 = max(x0 + 1, min(x1, W2)); y1 = max(y0 + 1, min(y1, H2))
@@ -1787,6 +1843,10 @@ class App(tk.Tk):
             per_channel=bool(self.var_wb_per_channel.get()),
             gamma=gamma
         ) if self.var_wb_on.get() else gel
+
+        # === 2.5) 统一到“标准凝胶宽度（px）” ===
+        design = self._get_design_params()
+        gel_bgr = self._standardize_gel_size(gel_bgr, design["design_gel_width_px"])
         gel_gray = cv2.cvtColor(gel_bgr, cv2.COLOR_BGR2GRAY)
 
         # 3) 解析标准带标签（保持原逻辑）
@@ -1836,7 +1896,6 @@ class App(tk.Tk):
         ladder_peaks_for_draw = [int(round(p)) for p in peaks]
         ladder_labels_for_draw = sorted(ladder_labels_all, reverse=True)[:len(ladder_peaks_for_draw)]
         sel_p_idx, sel_l_idx = match_ladder_best(peaks, ladder_labels_all, prom, min_pairs=3)
-
         fit_ok = False; a, b = 1.0, 0.0; r2 = rmse = None
         if len(sel_p_idx) >= 2:
             y_used = [float(peaks[i]) for i in sel_p_idx]
@@ -1853,14 +1912,13 @@ class App(tk.Tk):
                 from tkinter import messagebox
                 messagebox.showwarning(
                     "提示",
-                    f"标准道拟合偏差较大（R²={r2:.3f}, RMSE={rmse:.1f}px），已放弃拟合。\n"
-                    "请检查标准道序号、分子量表、泳道与 ROI。"
+                    f"标准道拟合偏差较大（R²={r2:.3f}, RMSE={rmse:.1f}px），已放弃拟合。\n请检查标准道序号、分子量表、泳道与 ROI。"
                 )
         else:
             from tkinter import messagebox
             messagebox.showinfo("提示", "用于稳健拟合的标准带不足：已输出图像，但 Y 轴分子量刻度仅在拟合成功时显示。")
 
-        # 6) 核心标注底图（不包含绿线、不包含顶部/底部面板）
+        # 6) 核心标注底图（不包含绿线、不含顶部/底部面板）
         if bounds is not None:
             res = render_annotation_slanted(
                 gel_bgr, bounds, ladder_peaks_for_draw, ladder_labels_for_draw,
@@ -1875,7 +1933,7 @@ class App(tk.Tk):
             )
         annotated_core = res if not (isinstance(res, tuple) and len(res) == 2) else res[0]
 
-        # 7) “不带绿线”的核心图（仍是 core，本步骤只是保持管线一致）
+        # 7) “无绿线”的核心图
         annotated_core_no_green = self._draw_overlays_on_core(
             img_core=annotated_core, gel_bgr=gel_bgr,
             overlay=None, bounds=bounds, lanes=lanes,
@@ -1885,26 +1943,21 @@ class App(tk.Tk):
             show_green=False
         )
 
-        # === 关键：把“仅核心图 + 所需几何参数”完整放进缓存，供后续快速组合使用 ===
+        # 缓存核心（统一尺度）
         self.render_cache = {
-            # 最低限：核心图像（无绿线、无顶部/底部面板）
             "core_no_green": annotated_core_no_green,
-            # 组合所需参数
             "gi": int(self.gi),
             "gel_bgr": gel_bgr,
             "bounds": bounds,
             "lanes": lanes,
-            "a": float(a),
-            "b": float(b),
+            "a": float(a), "b": float(b),
             "fit_ok": bool(fit_ok),
             "tick_labels": tick_labels if fit_ok else [],
             "yaxis_side": self.var_axis.get(),
-            # 也保留首次组合结果（下方会填充）
             "annotated_base_no_green": None,
             "annotated_base_with_green": None,
         }
 
-        # === 首次也给出完整组合（保持你之前的行为），但以后编辑仅走 recompose_using_cache ===
         # 8) 顶部“列名”白板（如开启）
         annotated_final_base = annotated_core_no_green
         panel_top_h = 0
@@ -1915,11 +1968,10 @@ class App(tk.Tk):
             names_seq = (self.lane_names or [])
             names_use = (names_seq + [""] * n_nonladder)[:n_nonladder]
             labels_table = [names_use]  # 一行：列名
-
             if labels_table and any((t or "").strip() for t in labels_table[0]):
-                H0 = annotated_core_no_green.shape[0]
+                H0 = annotated_final_base.shape[0]
                 annotated_final_base = self._attach_labels_panel(
-                    img_bgr=annotated_core_no_green,
+                    img_bgr=annotated_final_base,
                     lanes=lanes, bounds=bounds,
                     labels_table=labels_table,
                     gel_bgr=gel_bgr,
@@ -1928,7 +1980,7 @@ class App(tk.Tk):
                 )
                 panel_top_h = annotated_final_base.shape[0] - H0
 
-        # 9) 在“无绿线最终底图”基础上，再生成一份“带绿线”的版本
+        # 9) 绿线
         annotated_final_with_green = self._draw_overlays_on_core(
             img_core=annotated_final_base, gel_bgr=gel_bgr,
             overlay=None, bounds=bounds, lanes=lanes,
@@ -1939,7 +1991,7 @@ class App(tk.Tk):
             y_offset=panel_top_h
         )
 
-        # 10) 读取底部备注文本，分别追加到底部（支持向右扩展）
+        # 10) 底部备注（使用“像素字高”控制）
         note_raw = ""
         try:
             note_raw = getattr(self, "bottom_note_text", "")
@@ -1975,10 +2027,9 @@ class App(tk.Tk):
             except Exception:
                 pass
         if bool(self.var_show_green.get()):
-            # 勾选“绿线”时，实时切换到底图（含备注）
             self.canvas_anno.update_base_image(annotated_final_with_green_with_note)
 
-        # 13) 更新缓存（含组合后两份）
+        # 13) 更新缓存两份导出图
         self.render_cache.update({
             "annotated_base_no_green": annotated_final_base_with_note,
             "annotated_base_with_green": annotated_final_with_green_with_note,
@@ -1987,6 +2038,7 @@ class App(tk.Tk):
         if not fit_ok:
             from tkinter import messagebox
             messagebox.showinfo("提示", "本次未绘制 Y 轴分子量刻度（拟合未通过质控），右侧不生成可拖动箭头。")
+
 
     def recompose_using_cache(self):
         """
@@ -2182,22 +2234,12 @@ class App(tk.Tk):
         yaxis_side: str
     ) -> np.ndarray:
         """
-        在 img_bgr 上方追加“白底黑字”的标签面板（竖向整段文本），支持多行。
-        - 非标准道：使用 labels_table 提供的文本（每行一列），整段水平排版后整体旋转 90° 贴到对应列中心。
-        - 标准道（ladder_lane）：本版新增逻辑，自动命名为 'Standard'，并且仅当同一行中其它非标准道至少有一列非空时才渲染。
-        - 自动根据列宽缩放字号，保证旋转后横向宽度不超过列宽。
-        - 兼容 auto-slanted（bounds）与 uniform（lanes），以及 y 轴左右侧的 X 偏移。
-
-        参数：
-          - img_bgr      : 已完成核心标注（不含顶部面板）的图
-          - lanes/bounds : 泳道几何（二选一；优先 bounds）
-          - labels_table : 行×列（通常一行），仅对应“非标准道”的列文本
-          - gel_bgr      : ROI 的图（用于凝胶宽度与偏移）
-          - ladder_lane  : 标准道（1-based）
-          - yaxis_side   : "left" / "right"
-
-        返回：
-          - 叠加了顶部面板的新图像
+        在 img_bgr 上方追加“白底黑字”的标签面板（竖排+列中心水平居中，纵向改为向下对齐）。
+        - 非标准道：使用 labels_table 提供的文本（每行一列），整段水平排版后整体旋转 90° 再贴到对应列中心；
+        - 标准道（ladder_lane）：仅当同一行中其它非标准道至少有一列非空时才渲染 'Standard'；
+        - 字号自适应列宽，避免越界；
+        - 兼容 auto-slanted（bounds）与 uniform（lanes），以及 y 轴左右侧的 X 偏移；
+        - 本版：纵向**向下对齐**（靠近该行底边/面板底边），不再垂直居中。
         """
         import numpy as np, cv2
 
@@ -2207,7 +2249,7 @@ class App(tk.Tk):
         H, W_total = img_bgr.shape[:2]
         Hg, Wg = gel_bgr.shape[:2]
 
-        # 轴侧决定的 X 偏移（左轴时凝胶整体右移 panel_w）
+        # 轴侧导致的 X 偏移（左轴时凝胶整体右移 panel_w）
         panel_w = max(0, W_total - Wg)
         x_offset = panel_w if (str(yaxis_side).lower() == "left") else 0
 
@@ -2227,9 +2269,12 @@ class App(tk.Tk):
             # 至少比使用列多 1（含标准道）
             real_nlanes = cols_use + 1
 
-        # 各真实泳道的中线 X 与宽度（取中间高度处）
+        # 各真实泳道的“中段”左右边界与宽度（用于估算列宽）
         centers_mid_all: list[int] = []
         widths_all: list[int] = []
+        lefts_all: list[int] = []
+        rights_all: list[int] = []
+
         if (
             bounds is not None
             and isinstance(bounds, np.ndarray)
@@ -2239,49 +2284,60 @@ class App(tk.Tk):
             yc = int(min(bounds.shape[0] - 1, max(0, H // 2)))
             for i in range(real_nlanes):
                 L = int(bounds[yc, i]); R = int(bounds[yc, i + 1])
-                centers_mid_all.append(int(round((L + R) / 2)))
+                centers_mid_all.append(int(round((L + R) / 2.0)))
+                lefts_all.append(L); rights_all.append(R)
                 widths_all.append(max(1, R - L))
         elif lanes is not None:
             for (l, r) in lanes[:real_nlanes]:
-                centers_mid_all.append(int(round((l + r) / 2)))
-                widths_all.append(max(1, r - l))
+                L, R = int(l), int(r)
+                centers_mid_all.append(int(round((L + R) / 2.0)))
+                lefts_all.append(L); rights_all.append(R)
+                widths_all.append(max(1, R - l))
         else:
+            # 兜底：等分
             step = max(1.0, Wg / max(1, real_nlanes))
             for i in range(real_nlanes):
-                centers_mid_all.append(int(round((i + 0.5) * step)))
-                widths_all.append(int(step))
+                L = int(round(i * step))
+                R = int(round((i + 1) * step))
+                centers_mid_all.append(int(round((L + R) / 2.0)))
+                lefts_all.append(L); rights_all.append(R)
+                widths_all.append(max(1, R - L))
 
         # 转到最终图像坐标（考虑左轴偏移）
         centers_mid_all = [int(x_offset + np.clip(c, 0, Wg - 1)) for c in centers_mid_all]
+        lefts_all  = [int(x_offset + max(0, L)) for L in lefts_all]
+        rights_all = [int(x_offset + min(Wg, R)) for R in rights_all]
+        widths_all = [max(1, r - l) for l, r in zip(lefts_all, rights_all)]
 
         # 非标准道索引（目标位置）
         skip_idx = max(0, int(ladder_lane) - 1)  # 标准道（0-based）
         target_lane_idx = [i for i in range(real_nlanes) if i != skip_idx]
 
-        # 字体与排版参数
+        # 字体与排版参数（竖排：先水平绘制再旋转）
         font = cv2.FONT_HERSHEY_SIMPLEX
         base_scale = 0.7
         min_scale = 0.35
         thick = 1
-        h_margin = 6                # 每列两侧保留的水平边距
-        top_pad, bot_pad, row_gap = 8, 10, 6
-        txt_pad = 2                 # 文本位图内部边距，防裁切
+        h_margin = 6           # 列内水平安全边距（用于限制字号）
+        top_pad, bot_pad = 8, 10
+        row_gap = 6
+        text_bottom_margin = 2  # ★ 新增：贴底时的下边距
 
-        # 方向：逆时针 90°。如需顺时针改为 cv2.ROTATE_90_CLOCKWISE
+        # 方向：逆时针 90°（保持和旧实现一致）
         _ROT_FLAG = cv2.ROTATE_90_COUNTERCLOCKWISE
 
         def render_rotated_text_img(text: str, lane_idx: int):
             """
-            生成整段文本的水平位图 -> 旋转 90° -> 返回 (rot_img, w_rot, h_rot, scale_used)
-            约束：旋转后横向宽度 w_rot (= 未旋转文字高度 th) <= lane_w
+            生成整段文本的水平位图 -> 旋转 90° -> 紧致裁剪白边
+            返回 (rot_img, w_rot, h_rot, scale_used)
+            约束：旋转后横向宽度 w_rot（即未旋转文字的高度 th）<= lane_w
             """
             text = (text or "").strip()
             if not text:
                 return None, 0, 0, 0.0
 
             lane_w = max(1, widths_all[lane_idx] - 2 * h_margin)
-
-            # 基础测量（水平）
+            # 初次测量（水平）
             (tw0, th0), _ = cv2.getTextSize(text, font, base_scale, thick)
             scale = base_scale
             if th0 > lane_w:
@@ -2289,6 +2345,7 @@ class App(tk.Tk):
             (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
 
             # 先生成水平文本位图，再旋转
+            txt_pad = 2
             w_horiz = max(1, tw + 2 * txt_pad)
             h_horiz = max(1, th + 2 * txt_pad)
             img = np.full((h_horiz, w_horiz, 3), 255, dtype=np.uint8)
@@ -2308,12 +2365,10 @@ class App(tk.Tk):
             h_rot, w_rot = rot.shape[:2]
             return rot, w_rot, h_rot, float(scale)
 
-        # === 行高测量（考虑“非标准道列文本”与“条件渲染的 Standard”） ===
+        # === 行高测量（考虑非标准道与（条件）标准道“Standard”）===
         rows_used_idx: list[int] = []
         row_heights: list[int] = []
         cell_cache: dict[tuple[int, int], tuple[np.ndarray | None, int, int, float]] = {}
-        # 用 (-1) 作为“标准道列”的缓存 key 的列索引占位
-        STD_KEY_COL = -1
         STD_TEXT = "Standard"
 
         for r in range(rows):
@@ -2324,24 +2379,21 @@ class App(tk.Tk):
                 continue
 
             max_h_rot = 0
-
             # 非标准道单元测量
             for c in range(min(cols_use, len(target_lane_idx))):
                 text = str(labels_table[r][c] or "").strip()
                 if not text:
                     continue
                 li = target_lane_idx[c]
-                key = (r, c)
                 cell = render_rotated_text_img(text, li)
-                cell_cache[key] = cell
+                cell_cache[(r, li)] = cell
                 _, w_rot, h_rot, _ = cell
                 max_h_rot = max(max_h_rot, h_rot)
 
             # 条件渲染：同一行若存在非标准道文本，则加上标准道“Standard”
             if 0 <= skip_idx < real_nlanes:
-                key_std = (r, STD_KEY_COL)
                 cell_std = render_rotated_text_img(STD_TEXT, skip_idx)
-                cell_cache[key_std] = cell_std
+                cell_cache[(r, skip_idx)] = cell_std
                 _, w_rot_s, h_rot_s, _ = cell_std
                 max_h_rot = max(max_h_rot, h_rot_s)
 
@@ -2353,7 +2405,7 @@ class App(tk.Tk):
 
         # 面板高度
         panel_h = top_pad + sum(row_heights[r] for r in rows_used_idx) \
-                  + (len(rows_used_idx) - 1) * row_gap + bot_pad
+                + (len(rows_used_idx) - 1) * row_gap + bot_pad
         panel = np.full((panel_h, W_total, 3), 255, dtype=np.uint8)
 
         # === 绘制：每行的非标准道 +（条件）标准道“Standard” ===
@@ -2363,38 +2415,36 @@ class App(tk.Tk):
                 continue
             rh = row_heights[r]
 
-            # 非标准道
+            # 非标准道（竖排、列中心水平居中 + 向下对齐）
             for c in range(min(cols_use, len(target_lane_idx))):
                 text = str(labels_table[r][c] or "").strip()
                 if not text:
                     continue
                 li = target_lane_idx[c]
-                key = (r, c)
-                if key not in cell_cache:
-                    cell_cache[key] = render_rotated_text_img(text, li)
-                rot_img, w_rot, h_rot, _ = cell_cache[key]
+                rot_img, w_rot, h_rot, _ = cell_cache.get((r, li), (None, 0, 0, 0.0))
                 if rot_img is None or w_rot <= 0 or h_rot <= 0:
                     continue
 
                 lane_center = centers_mid_all[li]
                 x_left = int(np.clip(lane_center - w_rot // 2, 2, W_total - w_rot - 2))
-                y_top = int(y_cursor + (rh - h_rot) / 2)
 
+                # ★ 纵向向下对齐（贴到底边，预留 bottom_margin）
+                y_top = int(y_cursor + (rh - h_rot) - max(0, text_bottom_margin))
+
+                # 边界裁剪后贴图
                 y1 = max(0, y_top); y2 = min(panel_h, y_top + h_rot)
                 x1 = max(0, x_left); x2 = min(W_total, x_left + w_rot)
                 if y2 > y1 and x2 > x1:
                     sub_h, sub_w = y2 - y1, x2 - x1
                     panel[y1:y2, x1:x2] = rot_img[0:sub_h, 0:sub_w]
 
-            # 标准道（只有当该行曾有非标准道非空时才绘制）
-            if 0 <= skip_idx < real_nlanes:
-                key_std = (r, STD_KEY_COL)
-                rot_img_s, w_rot_s, h_rot_s, _ = cell_cache.get(key_std, (None, 0, 0, 0.0))
+            # 标准道（条件绘制，仍竖排+列中心，向下对齐）
+            if 0 <= skip_idx < real_nlanes and any((labels_table[r][c] or "").strip() for c in range(cols_use)):
+                rot_img_s, w_rot_s, h_rot_s, _ = cell_cache.get((r, skip_idx), (None, 0, 0, 0.0))
                 if rot_img_s is not None and w_rot_s > 0 and h_rot_s > 0:
                     lane_center_s = centers_mid_all[skip_idx]
                     x_left_s = int(np.clip(lane_center_s - w_rot_s // 2, 2, W_total - w_rot_s - 2))
-                    y_top_s = int(y_cursor + (rh - h_rot_s) / 2)
-
+                    y_top_s = int(y_cursor + (rh - h_rot_s) - max(0, text_bottom_margin))
                     y1 = max(0, y_top_s); y2 = min(panel_h, y_top_s + h_rot_s)
                     x1 = max(0, x_left_s); x2 = min(W_total, x_left_s + w_rot_s)
                     if y2 > y1 and x2 > x1:
@@ -2404,9 +2454,7 @@ class App(tk.Tk):
             y_cursor += rh + row_gap
 
         # 顶部拼接
-        return np.vstack([panel, img_bgr])
-
-    
+        return np.vstack([panel, img_bgr])    
 
     def _expand_tabs_for_cv2(self, text: str, tab_size: int = 4) -> str:
             """
@@ -2436,7 +2484,6 @@ class App(tk.Tk):
         self,
         img_bgr: np.ndarray,
         note_text: str,
-        font_scale: float = 0.6,
         line_gap: int = 6,
         top_pad: int = 10,
         bot_pad: int = 10,
@@ -2446,21 +2493,15 @@ class App(tk.Tk):
     ) -> np.ndarray:
         """
         在最终图像底部追加“白底黑字”的多行备注栏。
-        - 保留用户输入的换行；支持制表符（Tab）并按固定制表位展开后渲染。
-        - 不做自动换行：若行太长且 allow_expand_width=False，则超宽部分会被截断（保持旧行为）；
-          若 allow_expand_width=True，则向右扩展整张图（白底）以容纳最长行。
+        改进：用“目标字高（px）”求 fontScale，保证字大小绝对一致。
         """
         if img_bgr is None or not isinstance(img_bgr, np.ndarray) or img_bgr.size == 0:
             return img_bgr
 
         raw = (note_text or "")
-        # 保留空行；先把 \r\n 等价化
         lines_raw = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        # 展开 \t 为固定列宽（复用已有工具）
         tab_size = 4
         lines = [self._expand_tabs_for_cv2(ln, tab_size=tab_size) for ln in lines_raw]
-
-        # 全为空白则直接返回原图
         if not any((ln.strip() for ln in lines)):
             return img_bgr
 
@@ -2468,48 +2509,50 @@ class App(tk.Tk):
         font = cv2.FONT_HERSHEY_SIMPLEX
         thickness = 1
 
-        # 逐行测量宽高，得到最长行像素宽
+        # 目标字高（px） -> fontScale
+        design = self._get_design_params()
+        target_cap_px = int(design["bottom_cap_px"])
+        font_scale = self._font_scale_for_cap_height_px(target_cap_px, font=font, thickness=thickness)
+
+        # 测量
         line_heights = []
         line_widths = []
         for ln in lines:
-            text = ln  # 已展开 Tab
+            text = ln
             (tw, th), _ = cv2.getTextSize(text if text else " ", font, font_scale, thickness)
             line_heights.append(max(1, th))
             line_widths.append(max(1, tw))
-
         max_line_w = max(line_widths) if line_widths else 0
+
         panel_h = top_pad + bot_pad
         if line_heights:
             panel_h += sum(line_heights) + max(0, (len(line_heights) - 1) * line_gap)
 
-        # 计算所需总宽度
         needed_w = left_pad + max_line_w + right_pad
         new_W = max(W, needed_w) if allow_expand_width else W
 
-        # 若需要扩展宽度，则在右侧填充白色
+        # 扩宽
         if new_W > W:
             pad = np.full((H, new_W - W, 3), 255, dtype=np.uint8)
             img_main = np.concatenate([img_bgr, pad], axis=1)
         else:
             img_main = img_bgr
 
-        # 生成备注面板（使用新宽度）
+        # 生成备注面板
         panel = np.full((panel_h, new_W, 3), 255, dtype=np.uint8)
 
-        # 绘制（左对齐），y 为逐行基线
+        # 绘制（左对齐）
         y = top_pad
         for i, ln in enumerate(lines):
             text = ln
             (tw, th), _ = cv2.getTextSize(text if text else " ", font, font_scale, thickness)
             x = left_pad
-            y_draw = y + th  # baseline
+            y_draw = y + th
             cv2.putText(panel, text, (x, y_draw), font, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
             y += line_heights[i] + line_gap
 
-        # 叠到原图底部
         return np.vstack([img_main, panel])
-
-
+    
     # -------------------- 其他 -------------------- #
     def export_current(self):
         """
