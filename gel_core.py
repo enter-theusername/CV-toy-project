@@ -1155,7 +1155,7 @@ def render_annotation_slanted(gel_bgr: np.ndarray,
         K = min(len(ys), len(lbs))
 
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale, thickness = 0.5, 1
+        font_scale, thickness = 0.8, 2
         color_text, color_tick = (0, 0, 0), (0, 0, 0)
         margin_right, tick_len, tick_gap = 2, 12, 3
         x2 = label_panel_w - 1 - margin_right
