@@ -1268,29 +1268,27 @@ class App(tk.Tk):
         统一读取 UI/图像文字相关的设计参数（像素字高）。
         """
         design_gel_width_px = getattr(self, "var_design_gel_width_px", None)
-        top_cap_px          = getattr(self, "var_top_font_cap_px", None)
-        bottom_cap_px       = getattr(self, "var_bottom_font_cap_px", None)
+        top_cap_px = getattr(self, "var_top_font_cap_px", None)
+        bottom_cap_px = getattr(self, "var_bottom_font_cap_px", None)
 
         # 原图宽度标准化（保持不变）
         design_gel_width_px = int(design_gel_width_px.get()) if design_gel_width_px else 1200
 
-        # ★ 泳道标注：加大一点（原 18 → 20）并会在渲染处加粗
-        top_cap_px    = int(top_cap_px.get()) if top_cap_px else 20
+        # 顶部列名面板：26（你当前已较清晰）
+        top_cap_px = int(top_cap_px.get()) if top_cap_px else 26
 
-        # ★ 底部备注：变大但不加粗（原 16 → 20）
-        bottom_cap_px = int(bottom_cap_px.get()) if bottom_cap_px else 20
+        # ★ 底部备注：统一走设计参数；默认 28（显著大且清晰）
+        bottom_cap_px = int(bottom_cap_px.get()) if bottom_cap_px else 28
 
-        # ★ 侧边刻度：稍微加大（新增参数）
-        axis_cap_px   = 16
+        # 侧边刻度：保持 16
+        axis_cap_px = 16
 
         return {
             "design_gel_width_px": max(200, design_gel_width_px),
-            "top_cap_px":    max(8, top_cap_px),
+            "top_cap_px": max(8, top_cap_px),
             "bottom_cap_px": max(8, bottom_cap_px),
-            "axis_cap_px":   max(8, axis_cap_px),
+            "axis_cap_px": max(8, axis_cap_px),
         }
-
-
     def _draw_overlays_on_core(
         self,
         img_core: np.ndarray,
@@ -1392,6 +1390,91 @@ class App(tk.Tk):
         tkimg = ImageTk.PhotoImage(pil)
         widget.configure(image=tkimg)
         widget.image = tkimg
+
+    def _find_font_ttf(self) -> str | None:
+        """
+        返回一个可用于 Pillow 的 TTF/TTC/OTF 字体文件路径。
+        ★ 优先尝试 Arial（满足你希望的统一风格）；找不到再回退到系统常见 CJK/通用字体。
+        """
+        import os, sys, glob
+
+        # 缓存，避免反复扫盘
+        cache_attr = "_font_ttf_cache_path"
+        if hasattr(self, cache_attr) and getattr(self, cache_attr):
+            return getattr(self, cache_attr)
+
+        candidates: list[str] = []
+        plat = sys.platform.lower()
+
+        def add(paths: list[str]):  # 仅加入存在的路径或通配匹配的文件
+            for p in paths:
+                if any(ch in p for ch in "*?[]"):
+                    for q in glob.glob(p):
+                        if os.path.isfile(q):
+                            candidates.append(q)
+                else:
+                    if os.path.isfile(p):
+                        candidates.append(p)
+
+        # ---- ① 强优先：Arial 系 ----
+        if plat.startswith("win"):
+            windir = os.environ.get("WINDIR", r"C:\Windows")
+            fontdir = os.path.join(windir, "Fonts")
+            add([
+                os.path.join(fontdir, "arial.ttf"),                # Arial
+                os.path.join(fontdir, "arialbd.ttf"),              # Arial Bold
+                os.path.join(fontdir, "ariali.ttf"),               # Arial Italic
+                os.path.join(fontdir, "arialbi.ttf"),              # Arial Bold Italic
+                os.path.join(fontdir, "arialuni.ttf"),             # Arial Unicode MS（更全字库）
+            ])
+        elif plat == "darwin":
+            add([
+                "/Library/Fonts/Arial.ttf",
+                "/Library/Fonts/Arial Bold.ttf",
+                "/Library/Fonts/Arial Unicode.ttf",
+                "/Library/Fonts/Arial Unicode MS.ttf",
+            ])
+        else:
+            # Linux 常见安装位置（含 msttcorefonts）
+            add([
+                "/usr/share/fonts/truetype/msttcorefonts/arial.ttf",
+                "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf",
+                "/usr/share/fonts/truetype/msttcorefonts/arialbd.ttf",
+            ])
+
+        # ---- ② 回退：常见 CJK/通用字体（保证中文/兼容性）----
+        if plat.startswith("win"):
+            windir = os.environ.get("WINDIR", r"C:\Windows")
+            fontdir = os.path.join(windir, "Fonts")
+            add([
+                os.path.join(fontdir, "msyh.ttc"),   # Microsoft YaHei
+                os.path.join(fontdir, "simsun.ttc"), # SimSun
+            ])
+        elif plat == "darwin":
+            add(glob.glob("/System/Library/Fonts/*PingFang*.ttc"))
+            add([
+                "/System/Library/Fonts/PingFang.ttc",
+                "/System/Library/Fonts/PingFangSC.ttc",
+                "/System/Library/Fonts/Supplemental/Songti.ttc",
+            ])
+        else:
+            add([
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+                "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/truetype/noto/NotoSansCJKsc-Regular.otf",
+                "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ])
+
+        # 用户字体目录
+        home = os.path.expanduser("~")
+        add(glob.glob(os.path.join(home, ".fonts", "**", "*.tt*")))
+        add(glob.glob(os.path.join(home, ".local", "share", "fonts", "**", "*.tt*")))
+
+        font_path = candidates[0] if candidates else None
+        setattr(self, cache_attr, font_path)
+        return font_path
 
     def _init_paned_positions(self):
         try:
@@ -2156,12 +2239,10 @@ class App(tk.Tk):
         yaxis_side: str
     ) -> np.ndarray:
         """
-        Add a white top panel with vertical column labels.
-        This version renders text with Pillow TrueType (Arial if available), avoiding descender clipping.
+        在 img_bgr 上方追加“白底黑字”的标签面板（竖排+列中心水平居中，纵向向下对齐）。
+        本版修复：字符被裁半的问题——包含 baseline、高度/边距放宽，并为旋转后位图添加安全留白。
         """
-        import numpy as np, cv2, os
-        from PIL import Image, ImageDraw, ImageFont
-
+        import numpy as np, cv2
         if img_bgr is None or img_bgr.size == 0:
             return img_bgr
 
@@ -2178,13 +2259,13 @@ class App(tk.Tk):
         if cols_use == 0:
             return img_bgr
 
-        # Determine real lane count
+        # 真实泳道数
         if bounds is not None and isinstance(bounds, np.ndarray):
             real_nlanes = max(0, bounds.shape[1] - 1)
         elif lanes is not None:
             real_nlanes = len(lanes)
         else:
-            real_nlanes = cols_use + 1  # include ladder
+            real_nlanes = cols_use + 1  # 至少比使用列多1（含标准道）
 
         centers_mid_all, widths_all, lefts_all, rights_all = [], [], [], []
         if (bounds is not None and isinstance(bounds, np.ndarray)
@@ -2215,100 +2296,78 @@ class App(tk.Tk):
         rights_all = [int(x_offset + min(Wg, R)) for R in rights_all]
         widths_all = [max(1, r - l) for l, r in zip(lefts_all, rights_all)]
 
-        skip_idx = max(0, int(ladder_lane) - 1)  # ladder (0-based)
+        skip_idx = max(0, int(ladder_lane) - 1)  # 标准道（0-based）
         target_lane_idx = [i for i in range(real_nlanes) if i != skip_idx]
 
-        # Typography & layout
+        # 字体参数（字号更大 + 加粗）
         design = self._get_design_params()
-        cap_px = int(design["top_cap_px"])           # target cap height in px
-        thick = 2
-        h_margin = 8
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        thick = 2  # 加粗
+        cap_px = int(design["top_cap_px"])
+        base_scale = self._font_scale_for_cap_height_px(cap_px, font=font, thickness=thick)
+        min_scale = 0.35
+
+        # 版面参数（适度放宽）
+        h_margin = 8                      # 列内安全边距
         top_pad, bot_pad = 8, 10
         row_gap = 6
-
-        # Try to load Arial
-        arial_path = self._find_arial_ttf()
-        def new_font(size_px: int):
-            # Pillow's size is roughly in pixels
-            return ImageFont.truetype(arial_path, size=max(6, int(size_px))) if arial_path else None
+        text_bottom_margin = 0            # 原先为 2，容易顶到行边导致视觉裁切，这里置 0
+        _ROT_FLAG = cv2.ROTATE_90_COUNTERCLOCKWISE
 
         def render_rotated_text_img(text: str, lane_idx: int):
             """
-            Render horizontal text (with baseline/descenders), rotate 90° CCW, trim with safe margin.
-            The rotated width must fit inside lane width.
+            生成整段文本的水平位图 -> 旋转 90° -> 紧致裁剪(保留安全边距)
+            关键：在水平位图阶段把 baseline 计入高度，避免 descender 被裁掉。
             """
             text = (text or "").strip()
             if not text:
-                return None, 0, 0
+                return None, 0, 0, 0.0
 
             lane_w = max(1, widths_all[lane_idx] - 2 * h_margin)
-            # Start with a size that achieves approx cap height
-            size_px = cap_px + 2
 
-            # Measure & downscale if needed (based on unrotated text height)
-            # Use a throwaway image for bbox measurement
-            fnt = new_font(size_px) if arial_path else None
-            if fnt:
-                tmp = Image.new("RGB", (8, 8), "white")
-                drw = ImageDraw.Draw(tmp)
-                bbox = drw.textbbox((0, 0), text, font=fnt)
-                th = bbox[3] - bbox[1]
-                if th > lane_w:
-                    scale = lane_w / (th + 1e-6)
-                    size_px = max(6, int(size_px * scale))
-                    fnt = new_font(size_px)
-                    bbox = drw.textbbox((0, 0), text, font=fnt)
-                    th = bbox[3] - bbox[1]
-                pad = 3
-                w_h = max(1, (bbox[2] - bbox[0]) + 2 * pad)
-                h_h = max(1, th + 2 * pad)
-                img = Image.new("RGB", (w_h, h_h), "white")
-                drw = ImageDraw.Draw(img)
-                drw.text((pad, pad), text, fill=(0, 0, 0), font=fnt)
-                rot = img.rotate(90, expand=True, resample=Image.BICUBIC)
-                # trim near-white, keep 1px safe border
-                np_rot = np.array(rot)
-                gray = np_rot.mean(axis=2).astype(np.uint8)
-                ys, xs = np.where(gray < 252)
-                if ys.size > 0:
-                    y1, y2 = max(0, ys.min() - 1), min(np_rot.shape[0] - 1, ys.max() + 1)
-                    x1, x2 = max(0, xs.min() - 1), min(np_rot.shape[1] - 1, xs.max() + 1)
-                    np_rot = np_rot[y1:y2 + 1, x1:x2 + 1]
-                # final 1px border
-                np_rot = cv2.copyMakeBorder(cv2.cvtColor(np_rot, cv2.COLOR_RGB2BGR),
-                                            1, 1, 1, 1, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-            else:
-                # Fallback to OpenCV Hershey if Arial not found
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                # map cap_px -> fontScale by your helper
-                scale = self._font_scale_for_cap_height_px(cap_px, font=font, thickness=thick)
+            # 先用目标字高对应的 scale
+            scale = base_scale
+            (tw, th), baseline = cv2.getTextSize(text, font, scale, thick)
+            # 如果旋转后高度(≈ 水平th)会超出列宽，则按比例收缩
+            if th > lane_w:
+                scale = max(min_scale, scale * (lane_w / (th + 1e-6)))
                 (tw, th), baseline = cv2.getTextSize(text, font, scale, thick)
-                if th > lane_w:
-                    scale = max(0.35, scale * (lane_w / (th + 1e-6)))
-                    (tw, th), baseline = cv2.getTextSize(text, font, scale, thick)
-                pad = 3
-                w_h = max(1, tw + 2 * pad)
-                h_h = max(1, th + baseline + 2 * pad)
-                img = np.full((h_h, w_h, 3), 255, dtype=np.uint8)
-                org = (pad, pad + th)
-                cv2.putText(img, text, org, font, scale, (0, 0, 0), thick, cv2.LINE_AA)
-                rot = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                gray = cv2.cvtColor(rot, cv2.COLOR_BGR2GRAY)
-                ys, xs = np.where(gray < 252)
-                if ys.size > 0:
-                    y1, y2 = max(0, ys.min() - 1), min(rot.shape[0] - 1, ys.max() + 1)
-                    x1, x2 = max(0, xs.min() - 1), min(rot.shape[1] - 1, xs.max() + 1)
-                    rot = rot[y1:y2 + 1, x1:x2 + 1]
-                rot = cv2.copyMakeBorder(rot, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-                np_rot = rot
 
-            h_rot, w_rot = np_rot.shape[:2]
-            return np_rot, w_rot, h_rot
+            # --- 关键修复点：高度包含 baseline，并增加内边距 ---
+            txt_pad = 3
+            w_horiz = max(1, tw + 2 * txt_pad)
+            h_horiz = max(1, th + baseline + 2 * txt_pad)
 
-        # Pre-measure rows
+            img = np.full((h_horiz, w_horiz, 3), 255, dtype=np.uint8)
+            # 基线位置：左下基线
+            org = (txt_pad, txt_pad + th)
+            cv2.putText(img, text, org, font, scale, (0, 0, 0), thick, cv2.LINE_AA)
+
+            # 旋转 90° 得到竖排
+            rot = cv2.rotate(img, _ROT_FLAG)
+
+            # 紧致裁剪但留安全边界，避免把抗锯齿边缘吃掉
+            rot_gray = cv2.cvtColor(rot, cv2.COLOR_BGR2GRAY)
+            nz = np.where(rot_gray < 252)  # 适当放宽阈值
+            if nz[0].size > 0:
+                y_min, y_max = int(nz[0].min()), int(nz[0].max())
+                x_min, x_max = int(nz[1].min()), int(nz[1].max())
+                # 安全扩展 1px
+                y_min = max(0, y_min - 1); y_max = min(rot.shape[0] - 1, y_max + 1)
+                x_min = max(0, x_min - 1); x_max = min(rot.shape[1] - 1, x_max + 1)
+                rot = rot[y_min:y_max + 1, x_min:x_max + 1]
+
+            # 再加一圈 1px 白边，避免贴边观感
+            rot = cv2.copyMakeBorder(rot, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+
+            h_rot, w_rot = rot.shape[:2]
+            return rot, w_rot, h_rot, float(scale)
+
+        # 行测量与缓存
         rows_used_idx, row_heights = [], []
-        cell_cache: dict[tuple[int, int], tuple[np.ndarray | None, int, int]] = {}
+        cell_cache: dict[tuple[int, int], tuple[np.ndarray | None, int, int, float]] = {}
         STD_TEXT = "Standard"
+
         for r in range(rows):
             row_has_nonstd = any((labels_table[r][c] or "").strip() for c in range(cols_use))
             if not row_has_nonstd:
@@ -2316,6 +2375,7 @@ class App(tk.Tk):
                 continue
 
             max_h_rot = 0
+            # 非标准道
             for c in range(min(cols_use, len(target_lane_idx))):
                 text = str(labels_table[r][c] or "").strip()
                 if not text:
@@ -2323,16 +2383,18 @@ class App(tk.Tk):
                 li = target_lane_idx[c]
                 cell = render_rotated_text_img(text, li)
                 cell_cache[(r, li)] = cell
-                _, w_rot, h_rot = cell
+                _, w_rot, h_rot, _ = cell
                 max_h_rot = max(max_h_rot, h_rot)
 
+            # 标准道（仅在该行存在任何文本时绘制“Standard”）
             if 0 <= skip_idx < real_nlanes:
                 cell_std = render_rotated_text_img(STD_TEXT, skip_idx)
                 cell_cache[(r, skip_idx)] = cell_std
-                _, w_rot_s, h_rot_s = cell_std
+                _, w_rot_s, h_rot_s, _ = cell_std
                 max_h_rot = max(max_h_rot, h_rot_s)
 
-            row_heights.append(max_h_rot + 2)  # +2 px safety
+            # 再加 2px 行安全高度，避免顶/底贴边
+            row_heights.append(max_h_rot + 2)
             rows_used_idx.append(r)
 
         if not rows_used_idx:
@@ -2348,25 +2410,30 @@ class App(tk.Tk):
                 continue
             rh = row_heights[r]
 
+            # 非标准道
             for c in range(min(cols_use, len(target_lane_idx))):
                 text = str(labels_table[r][c] or "").strip()
                 if not text:
                     continue
                 li = target_lane_idx[c]
-                rot_img, w_rot, h_rot = cell_cache.get((r, li), (None, 0, 0))
+                rot_img, w_rot, h_rot, _ = cell_cache.get((r, li), (None, 0, 0, 0.0))
                 if rot_img is None or w_rot <= 0 or h_rot <= 0:
                     continue
+
                 lane_center = centers_mid_all[li]
                 x_left = int(np.clip(lane_center - w_rot // 2, 2, W_total - w_rot - 2))
+                # 纵向：行内向下对齐；取消上抬 margin，避免顶边裁切
                 y_top = int(y_cursor + (rh - h_rot))
+
                 y1 = max(0, y_top); y2 = min(panel_h, y_top + h_rot)
                 x1 = max(0, x_left); x2 = min(W_total, x_left + w_rot)
                 if y2 > y1 and x2 > x1:
                     sub_h, sub_w = y2 - y1, x2 - x1
                     panel[y1:y2, x1:x2] = rot_img[0:sub_h, 0:sub_w]
 
+            # 标准道（条件绘制）
             if 0 <= skip_idx < real_nlanes and any((labels_table[r][c] or "").strip() for c in range(cols_use)):
-                rot_img_s, w_rot_s, h_rot_s = cell_cache.get((r, skip_idx), (None, 0, 0))
+                rot_img_s, w_rot_s, h_rot_s, _ = cell_cache.get((r, skip_idx), (None, 0, 0, 0.0))
                 if rot_img_s is not None and w_rot_s > 0 and h_rot_s > 0:
                     lane_center_s = centers_mid_all[skip_idx]
                     x_left_s = int(np.clip(lane_center_s - w_rot_s // 2, 2, W_total - w_rot_s - 2))
@@ -2380,6 +2447,7 @@ class App(tk.Tk):
             y_cursor += rh + row_gap
 
         return np.vstack([panel, img_bgr])
+
 
     def _expand_tabs_for_cv2(self, text: str, tab_size: int = 4) -> str:
             """
@@ -2417,7 +2485,13 @@ class App(tk.Tk):
         allow_expand_width: bool = True
     ) -> np.ndarray:
         """
-        Append a bottom white note panel rendered with Arial (Pillow). Left-aligned, multi-line.
+        追加底部白底备注，多行左对齐。优先使用支持 CJK 的 TTF/TTC。
+        找不到字体时回退到 OpenCV（仅英文可靠），但不会抛异常。
+        —— 本版改动：
+        1) 读取设计参数 bottom_cap_px（默认 28）作为“目标字高/字号”；
+        2) Pillow 分支用 bottom_cap_px 作为像素字号；
+        3) OpenCV 分支用 bottom_cap_px 计算 fontScale；
+        4) 两分支统一 thickness=2，缩放后更清晰。
         """
         import numpy as np, cv2
         from PIL import Image, ImageDraw, ImageFont
@@ -2428,7 +2502,7 @@ class App(tk.Tk):
         raw = (note_text or "")
         lines_raw = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
-        # Expand tabs for alignment (keep your existing logic)
+        # 展开 \t 以便对齐
         tab_size = 4
         lines = [self._expand_tabs_for_cv2(ln, tab_size=tab_size) for ln in lines_raw]
         if not any((ln.strip() for ln in lines)):
@@ -2436,63 +2510,98 @@ class App(tk.Tk):
 
         H, W = img_bgr.shape[:2]
         design = self._get_design_params()
-        target_cap_px = int(design["bottom_cap_px"])
+        cap_px = int(design.get("bottom_cap_px", 28))  # ★ 统一字号
 
-        # Try Arial
-        arial_path = self._find_arial_ttf()
-        if arial_path:
-            # Approximate font size to achieve target cap height
-            size_px = max(6, target_cap_px + 2)
-            font = ImageFont.truetype(arial_path, size=size_px)
+        font_path = self._find_font_ttf()
 
-            # Measure
-            tmp = Image.new("RGB", (8, 8), "white")
-            drw = ImageDraw.Draw(tmp)
-            line_heights, line_widths = [], []
-            for ln in lines:
-                text = ln if ln else " "
-                bbox = drw.textbbox((0, 0), text, font=font)
-                tw, th = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
-                line_heights.append(max(1, th))
-                line_widths.append(max(1, tw))
+        # —— 首选：Pillow + 可用 TTF（支持中文）
+        if font_path:
+            try:
+                size_px = max(12, cap_px)  # 直接作为像素字号
+                font = ImageFont.truetype(font_path, size=size_px)
 
-            max_line_w = max(line_widths) if line_widths else 0
-            panel_h = top_pad + bot_pad
-            if line_heights:
-                panel_h += sum(line_heights) + max(0, (len(line_heights) - 1) * line_gap)
-            needed_w = left_pad + max_line_w + right_pad
-            new_W = max(W, needed_w) if allow_expand_width else W
+                # 逐行测量
+                tmp = Image.new("RGB", (8, 8), "white")
+                drw = ImageDraw.Draw(tmp)
+                line_heights, line_widths = [], []
+                for ln in lines:
+                    text = ln if ln else " "
+                    bbox = drw.textbbox((0, 0), text, font=font)
+                    tw, th = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
+                    line_heights.append(max(1, th))
+                    line_widths.append(max(1, tw))
 
-            # Expand width if needed
-            if new_W > W:
-                pad = np.full((H, new_W - W, 3), 255, dtype=np.uint8)
-                img_main = np.concatenate([img_bgr, pad], axis=1)
-            else:
-                img_main = img_bgr
+                max_line_w = max(line_widths) if line_widths else 0
+                panel_h = top_pad + bot_pad
+                if line_heights:
+                    panel_h += sum(line_heights) + max(0, (len(line_heights) - 1) * line_gap)
 
-            # Render panel by Pillow, then convert to BGR and stack
-            panel_img = Image.new("RGB", (new_W, panel_h), "white")
-            drw = ImageDraw.Draw(panel_img)
+                needed_w = left_pad + max_line_w + right_pad
+                new_W = max(W, needed_w) if allow_expand_width else W
 
-            y = top_pad
-            for i, ln in enumerate(lines):
-                text = ln if ln else " "
-                bbox = drw.textbbox((0, 0), text, font=font)
-                tw, th = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
-                x = left_pad
-                y_draw = y  # bbox is top-left based; already has height th
-                drw.text((x, y_draw), text, fill=(0, 0, 0), font=font)
-                y += line_heights[i] + line_gap
+                # 宽度不足则右侧扩白
+                if new_W > W:
+                    pad = np.full((H, new_W - W, 3), 255, dtype=np.uint8)
+                    img_main = np.concatenate([img_bgr, pad], axis=1)
+                else:
+                    img_main = img_bgr
 
-            panel_bgr = cv2.cvtColor(np.array(panel_img), cv2.COLOR_RGB2BGR)
-            return np.vstack([img_main, panel_bgr])
+                panel_img = Image.new("RGB", (new_W, panel_h), "white")
+                drw = ImageDraw.Draw(panel_img)
+
+                y = top_pad
+                for i, ln in enumerate(lines):
+                    text = ln if ln else " "
+                    x = left_pad
+                    # 用描边模拟 thickness=2 的对比度（可选）
+                    drw.text((x, y), text, fill=(0, 0, 0), font=font)
+                    y += line_heights[i] + line_gap
+
+                panel_bgr = cv2.cvtColor(np.array(panel_img), cv2.COLOR_RGB2BGR)
+                return np.vstack([img_main, panel_bgr])
+            except Exception:
+                pass
+
+        # —— 回退：OpenCV Hershey
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        # 用 bottom_cap_px 推算 fontScale
+        scale = self._font_scale_for_cap_height_px(cap_px, font=font, thickness=2)
+        thickness = 2  # ★ 与顶端面板统一
+
+        # 估算行高与最大宽
+        line_sizes = [cv2.getTextSize(ln if ln else " ", font, scale, thickness)[0] for ln in lines]
+        line_heights = [sz[1] for sz in line_sizes]
+        line_widths = [sz[0] for sz in line_sizes]
+        max_line_w = max(line_widths) if line_widths else 0
+
+        panel_h = top_pad + bot_pad
+        if line_heights:
+            panel_h += sum(line_heights) + max(0, (len(line_heights) - 1) * line_gap)
+
+        needed_w = left_pad + max_line_w + right_pad
+        new_W = max(W, needed_w) if allow_expand_width else W
+
+        if new_W > W:
+            pad = np.full((H, new_W - W, 3), 255, dtype=np.uint8)
+            img_main = np.concatenate([img_bgr, pad], axis=1)
         else:
-            # Fallback to existing OpenCV text flow (Hershey)
-            return super(App, self)._attach_bottom_note_panel(  # type: ignore
-                img_bgr, note_text, line_gap, top_pad, bot_pad, left_pad, right_pad, allow_expand_width
-            )
-    
+            img_main = img_bgr
 
+        panel = np.full((panel_h, new_W, 3), 255, dtype=np.uint8)
+
+        y = top_pad
+        for i, ln in enumerate(lines):
+            text = ln if ln else " "
+            (tw, th), base = cv2.getTextSize(text, font, scale, thickness)
+            x = left_pad
+            y_baseline = y + th  # 基线
+            try:
+                cv2.putText(panel, text, (x, y_baseline), font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
+            except Exception:
+                cv2.putText(panel, "?", (x, y_baseline), font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
+            y += line_heights[i] + line_gap
+
+        return np.vstack([img_main, panel])
     # -------------------- 其他 -------------------- #
     def export_current(self):
         """
@@ -2687,17 +2796,18 @@ def setup_global_fonts(root):
     import tkinter.font as tkfont
     try:
         families = {f.lower() for f in tkfont.families(root)}
-
         def pick(*names):
             for n in names:
                 if n and n.lower() in families:
                     return n
             return None
 
-        # ★ Force Arial if available; otherwise fallback
+        # ★ 强制优先 Arial（若无则回退）
         base_family = pick('Arial') or pick('Helvetica', 'Segoe UI') \
-            or tkfont.nametofont('TkDefaultFont').cget('family')
-        base_size = 10  # UI base size
+                       or tkfont.nametofont('TkDefaultFont').cget('family')
+
+        # ★ UI 基础字号由 10 → 11（略微放大）
+        base_size = 11
 
         for name in ('TkDefaultFont', 'TkTextFont', 'TkFixedFont',
                      'TkMenuFont', 'TkHeadingFont', 'TkIconFont', 'TkTooltipFont'):
@@ -2707,7 +2817,7 @@ def setup_global_fonts(root):
             except Exception:
                 pass
 
-        # ttk default
+        # ttk 默认字体
         try:
             from tkinter import ttk
             ttk.Style().configure('.', font=(base_family, base_size))
