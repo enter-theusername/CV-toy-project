@@ -118,7 +118,8 @@ class RightAnnoCanvas(tk.Canvas):
         nlanes: int, ladder_lane: int,
         yaxis_side: str,
         lane_marks: list[list[float]] | None,
-        panel_top_h: int = 0
+        panel_top_h: int = 0,
+        panel_w: int | None = None,      # ★ 新增：显式传入左侧刻度白板宽度
     ):
         """设置底图与几何信息，并按 lane_marks 生成可拖拽红箭头。"""
         # 清空画布元素与缓存
@@ -128,7 +129,7 @@ class RightAnnoCanvas(tk.Canvas):
         self.arrows.clear()
 
         # 清空方框集合
-        self._delete_all_boxes()         # ← 统一删除（安全起见）
+        self._delete_all_boxes()  # ← 统一删除（安全起见）
         self.boxes.clear()
         self._box_drag.update({"box": None, "mode": None, "corner": None})
 
@@ -148,7 +149,13 @@ class RightAnnoCanvas(tk.Canvas):
 
         Ht, Wt = self.base_img_bgr.shape[:2]
         Hg, Wg = self.gel_size
-        self.panel_w = max(0, Wt - Wg)
+
+        # ★ 关键：panel_w 使用“显式传入值”，否则才退回到 Wt - Wg 的估算
+        if panel_w is not None:
+            self.panel_w = max(0, int(panel_w))
+        else:
+            self.panel_w = max(0, Wt - Wg)
+
         self.x_offset = self.panel_w if self.yaxis_side == "left" else 0
 
         # 渲染底图
@@ -160,9 +167,10 @@ class RightAnnoCanvas(tk.Canvas):
 
         # ★ 若当前启用了“显示方框”，则基于最新箭头一次性生成
         if self.boxes_enabled and self.arrows:
-            self._delete_all_boxes()           # 防止残留复用
+            self._delete_all_boxes()  # 防止残留复用
             for meta in self.arrows:
                 self._create_box_for_arrow(meta)
+
 
     def render_to_image(self) -> np.ndarray | None:
         """把当前箭头叠加到底图像素，返回BGR图（用于导出）。"""
@@ -1857,11 +1865,12 @@ class App(tk.Tk):
             return
         cx, cy, w, h, angle_ccw = rroi
         rot_img, M = self._rotate_bound_with_M(self.orig_bgr, -angle_ccw)
+
         def _affine_point(M_, x, y):
             return (M_[0,0]*x + M_[0,1]*y + M_[0,2], M_[1,0]*x + M_[1,1]*y + M_[1,2])
         cx2, cy2 = _affine_point(M, cx, cy)
         x0 = int(round(cx2 - w/2.0)); y0 = int(round(cy2 - h/2.0))
-        x1 = x0 + int(round(w));      y1 = y0 + int(round(h))
+        x1 = x0 + int(round(w)); y1 = y0 + int(round(h))
         H2, W2 = rot_img.shape[:2]
         x0 = max(0, min(x0, W2 - 1)); y0 = max(0, min(y0, H2 - 1))
         x1 = max(x0 + 1, min(x1, W2)); y1 = max(y0 + 1, min(y1, H2))
@@ -1895,7 +1904,7 @@ class App(tk.Tk):
                 except: pass
             return out
         ladder_labels_all = parse_list(self.ent_marker.get()) or [180,130,100,70,55,40,35,25,15,10]
-        tick_labels = ladder_labels_all  # 仅在拟合通过时交给底图绘刻度（保持原逻辑）
+        tick_labels = ladder_labels_all  # 仅在拟合通过时交给底图绘刻度
 
         # 4) 分道
         nlanes = int(self.var_nlanes.get())
@@ -1914,7 +1923,7 @@ class App(tk.Tk):
             )
             lanes = None
 
-        # 5) 标准道检测 + 拟合（拟合仅用于“轴刻度”与 kDa 推断；标注仍基于实际检测 peaks）
+        # 5) 标准道检测 + 拟合
         ladder_lane = max(1, min(int(self.var_ladder_lane.get()), nlanes))
         y0_roi, y1_roi = 0, None
         if bounds is not None:
@@ -1930,7 +1939,6 @@ class App(tk.Tk):
             )
         ladder_peaks_for_draw = [int(round(p)) for p in peaks]
         ladder_labels_for_draw = sorted(ladder_labels_all, reverse=True)[:len(ladder_peaks_for_draw)]
-
         sel_p_idx, sel_l_idx = match_ladder_best(peaks, ladder_labels_all, prom, min_pairs=3)
         fit_ok = False; a, b = 1.0, 0.0; r2 = rmse = None
         if len(sel_p_idx) >= 2:
@@ -1943,25 +1951,23 @@ class App(tk.Tk):
                                             r2_min=0.5, rmse_frac_max=0.02, rmse_abs_min_px=80.0)
             if ok: a, b, fit_ok = a_fit, b_fit, True
 
-        # 6) 核心底图（★ 由底图函数完成“实际检测到的峰位标注”；刻度仍交由底图在拟合通过时绘制）
+        # 6) 核心底图（底图函数负责峰位标注；刻度在拟合通过时由底图绘制）
         if bounds is not None:
             res = render_annotation_slanted(
                 gel_bgr, bounds, ladder_peaks_for_draw, ladder_labels_for_draw,
-                a, b, (tick_labels if fit_ok else []),      # ★ 保持原逻辑
+                a, b, (tick_labels if fit_ok else []),
                 yaxis_side=self.var_axis.get()
             )
         else:
             res = render_annotation(
                 gel_bgr, lanes, ladder_peaks_for_draw, ladder_labels_for_draw,
-                a, b, (tick_labels if fit_ok else []),      # ★ 保持原逻辑
+                a, b, (tick_labels if fit_ok else []),
                 yaxis_side=self.var_axis.get()
             )
         annotated_core = res if not (isinstance(res, tuple) and len(res) == 2) else res[0]
 
-        # 7) 基础图：此时已经包含“检测峰位标注”，且（若拟合通过）底图自身会绘制刻度
+        # 7) 核心（无绿线）
         annotated_core_no_green = annotated_core
-
-        # 缓存核心
         self.render_cache = {
             "core_no_green": annotated_core_no_green,
             "gi": int(self.gi),
@@ -1986,7 +1992,7 @@ class App(tk.Tk):
             names_seq = (self.lane_names or [])
             names_use = (names_seq + [""] * n_nonladder)[:n_nonladder]
             labels_table = [names_use]
-            if labels_table and any((t or "").strip() for t in labels_table[0]):
+            if labels_table and any(((t or "").strip() for t in labels_table[0])):
                 H0 = annotated_final_base.shape[0]
                 annotated_final_base = self._attach_labels_panel(
                     img_bgr=annotated_final_base,
@@ -1998,18 +2004,22 @@ class App(tk.Tk):
                 )
                 panel_top_h = annotated_final_base.shape[0] - H0
 
-        # 9) 绿线（仅绿线；刻度不再重复画）
+        # ★ 在“底部备注扩宽”之前，计算真实 panel_w 并保留
+        #    此时宽度仍然是：panel_w + Wg
+        panel_w_val = max(0, annotated_final_base.shape[1] - gel_bgr.shape[1])
+
+        # 9) 绿线（仅绿线）
         annotated_final_with_green = self._draw_overlays_on_core(
             img_core=annotated_final_base, gel_bgr=gel_bgr,
             overlay=None, bounds=bounds, lanes=lanes,
             a=a, b=b, fit_ok=fit_ok,
-            tick_labels=self.render_cache["tick_labels"],  # 传入但不会在该函数里被绘制
+            tick_labels=self.render_cache["tick_labels"],  # 不在该函数里绘制
             yaxis_side=self.var_axis.get(),
             show_green=True,
             y_offset=panel_top_h
         )
 
-        # 10) 底部备注（变大但不加粗）
+        # 10) 底部备注（可能会向右扩白）
         note_raw = getattr(self, "bottom_note_text", "") or ""
         annotated_final_base_with_note = self._attach_bottom_note_panel(
             annotated_final_base, note_raw, allow_expand_width=True
@@ -2021,7 +2031,7 @@ class App(tk.Tk):
         # 11) 左侧 ROI 预览
         self._set_autofit_image(self.canvas_roi_wb, gel_bgr)
 
-        # 12) 右侧交互画布
+        # 12) 右侧交互画布 —— ★ 显式传入 panel_w_val，避免箭头随右侧扩白漂移
         lane_marks_input = self.lane_marks or []
         ladder_lane_val = max(1, min(int(self.var_ladder_lane.get()), int(self.var_nlanes.get())))
         self.canvas_anno.set_scene(
@@ -2033,7 +2043,8 @@ class App(tk.Tk):
             ladder_lane=ladder_lane_val,
             yaxis_side=self.var_axis.get(),
             lane_marks=lane_marks_input,
-            panel_top_h=panel_top_h
+            panel_top_h=panel_top_h,
+            panel_w=panel_w_val,                # ★ 关键
         )
         if bool(self.var_show_boxes.get()):
             try: self.canvas_anno.set_boxes_enabled(True)
@@ -2049,7 +2060,10 @@ class App(tk.Tk):
 
         if not fit_ok:
             from tkinter import messagebox
-            messagebox.showinfo("Notice", "The Y-axis molecular weight scale was not plotted this time (fitting failed quality control), and no draggable arrow is generated on the right side.")
+            messagebox.showinfo(
+                "Notice",
+                "The Y-axis molecular weight scale was not plotted this time (fitting failed quality control), and no draggable arrow is generated on the right side."
+            )
 
     def recompose_using_cache(self):
         """
@@ -2066,12 +2080,12 @@ class App(tk.Tk):
                 pass
             return
 
-        gel_bgr   = rc.get("gel_bgr", None)
-        bounds    = rc.get("bounds", None)
-        lanes     = rc.get("lanes", None)
-        a         = rc.get("a", 1.0)
-        b         = rc.get("b", 0.0)
-        fit_ok    = bool(rc.get("fit_ok", False))
+        gel_bgr = rc.get("gel_bgr", None)
+        bounds = rc.get("bounds", None)
+        lanes = rc.get("lanes", None)
+        a = rc.get("a", 1.0)
+        b = rc.get("b", 0.0)
+        fit_ok = bool(rc.get("fit_ok", False))
         tick_lbls = rc.get("tick_labels", [])
         yaxis_side = rc.get("yaxis_side", "left")
 
@@ -2085,7 +2099,7 @@ class App(tk.Tk):
             names_seq = (self.lane_names or [])
             names_use = (names_seq + [""] * n_nonladder)[:n_nonladder]
             labels_table = [names_use]
-            if labels_table and any((t or "").strip() for t in labels_table[0]):
+            if labels_table and any(((t or "").strip() for t in labels_table[0])):
                 H0 = base_img.shape[0]
                 base_img = self._attach_labels_panel(
                     img_bgr=base_img,
@@ -2097,6 +2111,13 @@ class App(tk.Tk):
                 )
                 panel_top_h = base_img.shape[0] - H0
 
+        # ★ 在“底部备注扩宽”之前，计算真实 panel_w
+        panel_w_val = 0
+        try:
+            panel_w_val = max(0, base_img.shape[1] - gel_bgr.shape[1])
+        except Exception:
+            panel_w_val = 0
+
         # 2) 绿线（仅绿线；不重复画刻度）
         want_green = bool(self.var_show_green.get())
         if want_green:
@@ -2104,7 +2125,7 @@ class App(tk.Tk):
                 img_core=base_img, gel_bgr=gel_bgr,
                 overlay=None, bounds=bounds, lanes=lanes,
                 a=a, b=b, fit_ok=fit_ok,
-                tick_labels=tick_lbls,     # 传入但不会在该函数中使用
+                tick_labels=tick_lbls,  # 不在该函数中使用
                 yaxis_side=yaxis_side,
                 show_green=True,
                 y_offset=panel_top_h
@@ -2120,7 +2141,7 @@ class App(tk.Tk):
         else:
             with_green_note = None
 
-        # 4) 刷新右侧交互画布
+        # 4) 刷新右侧交互画布 —— ★ 显式传入 panel_w_val
         ladder_lane_val = max(1, min(int(self.var_ladder_lane.get()), int(self.var_nlanes.get())))
         self.canvas_anno.set_scene(
             base_img_bgr=base_with_note,
@@ -2131,7 +2152,8 @@ class App(tk.Tk):
             ladder_lane=ladder_lane_val,
             yaxis_side=yaxis_side,
             lane_marks=(self.lane_marks or []),
-            panel_top_h=panel_top_h
+            panel_top_h=panel_top_h,
+            panel_w=panel_w_val,               # ★ 关键
         )
         if bool(self.var_show_boxes.get()):
             try: self.canvas_anno.set_boxes_enabled(True)
