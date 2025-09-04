@@ -104,9 +104,6 @@ def auto_white_balance(
     out_u8 = (out * 255.0 + 0.5).astype(np.uint8)
     return out_u8
 
-
-
-
 # ---------- 胶块检测 ----------
 def detect_gel_regions(img_bgr: np.ndarray, expected: int = 2,
                        thr_block: int = 51, thr_C: int = 10,
@@ -152,38 +149,6 @@ def detect_gel_regions(img_bgr: np.ndarray, expected: int = 2,
         out.append((x2, y2, max(1, x3 - x2), max(1, y3 - y2)))
     return out
 
-# ---------- 泳道划分（直立/等宽） ----------
-def lanes_by_projection(gray: np.ndarray, n: int, smooth_px: int = 31,
-                        min_sep_ratio: float = 1.2) -> List[Tuple[int, int]]:
-    """
-    垂直方向强度投影 → 取峰为中心 → 中点切分。
-    峰值不足自动回退等宽。返回每条泳道的 (x1, x2)。
-    """
-    H, W = gray.shape
-    inv = 255 - gray
-    prof = inv.mean(axis=0)
-    k = max(3, int(smooth_px) if int(smooth_px) % 2 == 1 else int(smooth_px) + 1)
-    prof_s = np.convolve(prof, np.ones(k) / k, mode='same')
-    min_sep = W / (n * min_sep_ratio)
-    idx = np.argsort(prof_s)[::-1]
-    centers = []
-    for i in idx:
-        if len(centers) >= n:
-            break
-        if all(abs(int(i) - c) >= min_sep for c in centers):
-            centers.append(int(i))
-    centers = sorted(centers)
-    if len(centers) < 2:
-        step = W / n
-        return [(int(i * step), int((i + 1) * step)) for i in range(n)]
-    bounds = [0]
-    for i in range(len(centers) - 1):
-        bounds.append(int((centers[i] + centers[i + 1]) / 2))
-    bounds.append(W)
-    if len(bounds) - 1 < n:
-        step = W / n
-        return [(int(i * step), int((i + 1) * step)) for i in range(n)]
-    return [(max(0, bounds[i]), min(W, bounds[i + 1])) for i in range(n)]
 
 def lanes_uniform(gray: np.ndarray, n: int, left_pad: int = 0, right_pad: int = 0) -> List[Tuple[int, int]]:
     H, W = gray.shape
@@ -191,39 +156,7 @@ def lanes_uniform(gray: np.ndarray, n: int, left_pad: int = 0, right_pad: int = 
     step = L / n
     return [(int(left_pad + i * step), int(left_pad + (i + 1) * step)) for i in range(n)]
 
-# ---------- 标准带检测与拟合 ----------
-def detect_bands_along_y(gray_lane: np.ndarray, y0: int = 0, y1: int | None = None) -> List[int]:
-    H, W = gray_lane.shape
-    if y1 is None:
-        y1 = H
-    y0 = max(0, y0)
-    y1 = min(H, y1)
-    roi = gray_lane[y0:y1, :]
-    inv = 255 - roi
-    prof = inv.mean(axis=1)
-    k = max(5, int(max(3, roi.shape[0] * 0.01)) | 1)  # odd
-    prof_s = np.convolve(prof, np.ones(k) / k, mode='same')
-    win = max(7, int(max(3, roi.shape[0] * 0.02)) | 1)
-    half = win // 2
-    peaks = []
-    thr = float(prof_s.mean() + 0.5 * prof_s.std())
-    for i in range(half, roi.shape[0] - half):
-        if prof_s[i] >= thr and prof_s[i] == prof_s[i - half:i + half + 1].max():
-            peaks.append(i + y0)
-    min_sep = max(10, int(roi.shape[0] * 0.02))
-    filtered = []
-    for p in peaks:
-        if all(abs(p - q) >= min_sep for q in filtered):
-            filtered.append(p)
-    return filtered
 
-def fit_log_mw_to_y(y_positions: List[int], ladder_sizes: List[float]) -> tuple[float, float]:
-    """拟合 y = a*log10(MW) + b"""
-    x = np.log10(np.array(ladder_sizes, dtype=np.float64))
-    y = np.array(y_positions, dtype=np.float64)
-    A = np.vstack([x, np.ones_like(x)]).T
-    a, b = np.linalg.lstsq(A, y, rcond=None)[0]
-    return float(a), float(b)
 
 def y_from_mw(mw: float, a: float, b: float) -> float:
     return a * np.log10(mw) + b
@@ -281,61 +214,6 @@ def render_annotation(gel_bgr: np.ndarray,
 
     return canvas
 
-
-
-# ---------- 1D 峰检测（prominence） ----------
-def _moving_avg(x: np.ndarray, k: int) -> np.ndarray:
-    k = int(k); k = max(1, k + (k % 2 == 0))
-    kernel = np.ones(k, dtype=np.float32) / k
-    return np.convolve(x, kernel, mode='same')
-
-def find_peaks_1d(signal: np.ndarray, min_distance: int = 8, min_prominence: float = 5.0) -> Tuple[List[int], List[float]]:
-    """
-    返回峰位置索引 & 峰的prominence（显著性）。
-    signal 较大代表条带更深（建议用 255-gray 或行平均）
-    """
-    s = _moving_avg(signal.astype(np.float32), 7)
-    peaks = []
-    prom = []
-    N = len(s)
-    for i in range(1, N - 1):
-        if s[i] >= s[i - 1] and s[i] >= s[i + 1]:
-            # 向左右找“谷”
-            j = i - 1
-            left_min = s[i]
-            while j > 0 and s[j] <= s[j + 1]:
-                left_min = min(left_min, s[j])
-                j -= 1
-            j = i + 1
-            right_min = s[i]
-            while j < N - 1 and s[j] <= s[j - 1]:
-                right_min = min(right_min, s[j])
-                j += 1
-            p = s[i] - max(left_min, right_min)
-            if p >= min_prominence:
-                peaks.append(i)
-                prom.append(float(p))
-    # 距离去重（保留prominence更大）
-    filtered = []
-    for idx, p in sorted(zip(peaks, prom), key=lambda t: t[1], reverse=True):
-        if all(abs(idx - j) >= min_distance for j, _ in filtered):
-            filtered.append((idx, p))
-    filtered.sort(key=lambda t: t[0])
-    return [i for i, _ in filtered], [p for _, p in filtered]
-
-# ---------- 基线校正 ----------
-def baseline_subtract_1d(signal: np.ndarray, win: int = 51) -> np.ndarray:
-    s = signal.astype(np.float32, copy=False)
-    w = int(win)
-    if w < 3:
-        return np.clip(s - s.min(), 0, None)
-    if w % 2 == 0:
-        w += 1
-    kernel = np.ones(w, dtype=np.float32) / float(w)
-    base = np.convolve(s, kernel, mode='same')
-    corr = s - base
-    corr -= corr.min()
-    return corr
 
 # ---------- 二次曲线亚像素微调 ----------
 def refine_peaks_quadratic(signal: np.ndarray, peaks: List[int]) -> List[float]:

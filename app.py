@@ -9,8 +9,7 @@ import cv2
 import json
 from gel_core import (
     auto_white_balance, detect_gel_regions,
-    lanes_by_projection, lanes_uniform,
-    detect_bands_along_y,  # 旧的直线模式备用
+    lanes_uniform,
     render_annotation,     # 直立矩形渲染
     # 新增：斜线直线模式
     lanes_slanted,
@@ -23,9 +22,6 @@ from gel_core import (
 )
 from roi_editor import ROIEditorCanvas
 
-
-def bgr_to_rgb(bgr):
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 # ===== 新增：右侧交互编辑画布（用于显示标注结果并可拖动红色箭头） =====
 class RightAnnoCanvas(tk.Canvas):
@@ -119,10 +115,36 @@ class RightAnnoCanvas(tk.Canvas):
         yaxis_side: str,
         lane_marks: list[list[float]] | None,
         panel_top_h: int = 0,
-        panel_w: int | None = None,      # ★ 新增：显式传入左侧刻度白板宽度
+        panel_w: int | None = None,  # ★ 显式传入左侧刻度白板宽度
     ):
-        """设置底图与几何信息，并按 lane_marks 生成可拖拽红箭头。"""
-        # 清空画布元素与缓存
+        """
+        设置底图与几何信息，并按 lane_marks 生成可拖拽红箭头。
+        —— 改造点：在同一图像中再次渲染时，保留“已拖动且未被移除”的箭头位置不变。
+        """
+        # ===== ① 提前抓取“已拖动箭头”的相对凝胶坐标缓存 =====
+        # 以 (lane_idx, mw) 作为“箭头身份键”，缓存移动后位置（相对凝胶，不随 panel_top_h 与 x_offset 改变）
+        def _key(li: int, mwv: float) -> tuple[int, float]:
+            # 精度：直接用 float 即可（mw 来源于你的数据输入），若有需要可 round 到 1e-6
+            return (int(li), float(mwv))
+
+        prev_panel_top = getattr(self, "panel_top_h", 0)
+        prev_x_offset  = getattr(self, "x_offset", 0)
+        moved_cache: dict[tuple[int, float], dict] = {}
+        for a_meta in getattr(self, "arrows", []) or []:
+            if not a_meta or not a_meta.get("moved", False):
+                continue
+            li = int(a_meta.get("lane_idx", -1))
+            mw = float(a_meta.get("mw", float("nan")))
+            if li < 0 or not np.isfinite(mw):
+                continue
+            # 以当前箭头的图像坐标换算为“相对凝胶”的坐标（去除顶部与侧边偏移）
+            x_img = float(a_meta.get("x_img", prev_x_offset))
+            y_img = float(a_meta.get("y_img", prev_panel_top))
+            x_gel = x_img - prev_x_offset
+            y_gel = y_img - prev_panel_top
+            moved_cache[_key(li, mw)] = {"x_gel": x_gel, "y_gel": y_gel}
+
+        # ===== ② 清空画布元素与缓存 =====
         self.delete("all")
         self.img_item = None
         self.base_img_tk = None
@@ -133,7 +155,7 @@ class RightAnnoCanvas(tk.Canvas):
         self.boxes.clear()
         self._box_drag.update({"box": None, "mode": None, "corner": None})
 
-        # 基础数据
+        # ===== ③ 基础数据 =====
         self.base_img_bgr = base_img_bgr
         self.gel_bgr = gel_bgr.copy() if isinstance(gel_bgr, np.ndarray) else None
         self.gel_gray = cv2.cvtColor(self.gel_bgr, cv2.COLOR_BGR2GRAY) if self.gel_bgr is not None else None
@@ -146,7 +168,6 @@ class RightAnnoCanvas(tk.Canvas):
         self.ladder_lane = int(ladder_lane)
         self.yaxis_side = str(yaxis_side or "left").lower()
         self.panel_top_h = int(panel_top_h)
-
         Ht, Wt = self.base_img_bgr.shape[:2]
         Hg, Wg = self.gel_size
 
@@ -155,15 +176,15 @@ class RightAnnoCanvas(tk.Canvas):
             self.panel_w = max(0, int(panel_w))
         else:
             self.panel_w = max(0, Wt - Wg)
-
         self.x_offset = self.panel_w if self.yaxis_side == "left" else 0
 
-        # 渲染底图
+        # ===== ④ 渲染底图（不含红箭头） =====
         self._render_base_image()
 
-        # 生成箭头
+        # ===== ⑤ 生成/合并箭头 =====
         if self.fit_ok and lane_marks:
-            self._create_arrows_from_marks(lane_marks)
+            # 将“已拖动箭头”的相对凝胶坐标迁移到当前 scene 的偏移系（保持视觉位置不变）
+            self._create_arrows_from_marks(lane_marks, pos_cache=moved_cache)
 
         # ★ 若当前启用了“显示方框”，则基于最新箭头一次性生成
         if self.boxes_enabled and self.arrows:
@@ -178,24 +199,26 @@ class RightAnnoCanvas(tk.Canvas):
             return None
         img = self.base_img_bgr.copy()
         H, W = img.shape[:2]
+        # 三角箭头尺寸（像素坐标系）
+        w, h = 50, 10
 
-        # 三角箭头（像素坐标系，未缩放的固定尺寸）
-        w, h = 40, 10
         for a in self.arrows:
             y = int(np.clip(a["y_img"], 0, H - 1))
             if "x_img" in a:
                 x = int(np.clip(a["x_img"], 0, W - 1))
             else:
+                # ★ 改动点：默认 X = 左分界线（支持斜界线/等宽两种）
                 lane_idx = a["lane_idx"]
-                xc_gel = self._lane_center_x_at_y_gel(y - self.panel_top_h, lane_idx)
-                x = int(np.clip(self.x_offset + xc_gel, 0, W - 1))
-            tip = (x , y)
+                xl_gel = self._lane_left_x_at_y_gel(y - self.panel_top_h, lane_idx)
+                x = int(np.clip(self.x_offset + xl_gel, 0, W - 1))
+
+            tip = (x, y)
             p1 = (tip[0] - w // 2, int(np.clip(tip[1] + h, 0, H - 1)))
             p2 = (tip[0] - w // 2, int(np.clip(tip[1] - h, 0, H - 1)))
             pts = np.array([p1, p2, tip], dtype=np.int32)
             cv2.fillPoly(img, [pts], (0, 0, 255))
             cv2.polylines(img, [pts], isClosed=True, color=(255, 255, 255),
-                          thickness=1, lineType=cv2.LINE_AA)
+                        thickness=1, lineType=cv2.LINE_AA)
         return img
 
     # ---------- 内部：几何/绘制 ----------
@@ -258,9 +281,33 @@ class RightAnnoCanvas(tk.Canvas):
             step = Wg / max(1, self.nlanes)
             xc = int(round((lane_idx + 0.5) * step))
         return int(np.clip(xc, 0, max(0, Wg - 1)))
-
-    def _create_arrows_from_marks(self, lane_marks: list[list[float]]):
-        """依据 lane_marks 在非标准道生成箭头。"""
+    def _lane_left_x_at_y_gel(self, y_gel: int, lane_idx: int) -> int:
+        """
+        返回在“凝胶坐标系”(y_gel)下，第 lane_idx 条泳道的左侧分界线 X（相对凝胶左边界，单位：px）。
+        - 当使用斜率模型(bounds)时：取 bounds[y, lane_idx]；
+        - 当使用等宽/竖直模型(lanes)时：取 lanes[lane_idx][0]；
+        - 当两者都无时：按等分估计左边界 lane_idx * (Wg / nlanes)。
+        """
+        Hg, Wg = self.gel_size
+        y = int(np.clip(y_gel, 0, max(0, Hg - 1)))
+        if (
+            self.bounds is not None and isinstance(self.bounds, np.ndarray)
+            and self.bounds.ndim == 2 and self.bounds.shape[0] >= Hg
+            and 0 <= lane_idx < self.bounds.shape[1] - 1
+        ):
+            xl = int(self.bounds[y, lane_idx])
+        elif self.lanes is not None and 0 <= lane_idx < len(self.lanes):
+            xl = int(self.lanes[lane_idx][0])
+        else:
+            step = Wg / max(1, self.nlanes)
+            xl = int(round(lane_idx * step))
+        return int(np.clip(xl, 0, max(0, Wg - 1)))
+    def _create_arrows_from_marks(self, lane_marks: list[list[float]], pos_cache: dict | None = None):
+        """
+        依据 lane_marks 在非标准道生成箭头（默认 X 在泳道左分界线）。
+        —— 改造点：若 pos_cache 中存在“已拖动且未被移除”的箭头（以 lane_idx+mw 作为键），
+        则优先使用缓存的 x_gel,y_gel 复位位置，不再改动其位置。
+        """
         # 真实泳道数
         if self.bounds is not None and isinstance(self.bounds, np.ndarray):
             real_nlanes = max(0, self.bounds.shape[1] - 1)
@@ -273,6 +320,12 @@ class RightAnnoCanvas(tk.Canvas):
         target_lane_idx = [i for i in range(real_nlanes) if i != skip_idx]
 
         use_k = min(len(target_lane_idx), len(lane_marks))
+        Hg, Wg = self.gel_size
+        H_img, W_img = self.base_img_bgr.shape[:2]
+
+        def _key(li: int, mwv: float) -> tuple[int, float]:
+            return (int(li), float(mwv))
+
         for k in range(use_k):
             arr = lane_marks[k] or []
             lane_idx = target_lane_idx[k]
@@ -283,16 +336,32 @@ class RightAnnoCanvas(tk.Canvas):
                     continue
                 if not (np.isfinite(v) and v > 0):
                     continue
-                y_gel = int(round(self.a * np.log10(v) + self.b))
-                y_img = self.panel_top_h + y_gel
-                xc_gel = self._lane_center_x_at_y_gel(y_gel, lane_idx)
-                x_img = self.x_offset + xc_gel
+
+                # 默认位置（基于拟合将 mw 映射至 y_gel；x 取该 y 的“泳道左分界线”）
+                y_gel_default = int(round(self.a * np.log10(v) + self.b))
+                y_img_default = self.panel_top_h + y_gel_default
+                xl_gel = self._lane_left_x_at_y_gel(y_gel_default, lane_idx)
+                x_img_default = self.x_offset + xl_gel
+
+                # 若 pos_cache 命中“已拖动箭头”，则按缓存位置还原（保持视觉位置不变）
+                x_img, y_img = x_img_default, y_img_default
+                if pos_cache:
+                    entry = pos_cache.get(_key(lane_idx, v))
+                    if entry:
+                        x_img = self.x_offset + float(entry.get("x_gel", xl_gel))
+                        y_img = self.panel_top_h + float(entry.get("y_gel", y_gel_default))
+
+                # 夹取到图像范围内
+                x_img = float(np.clip(x_img, 0, W_img - 1))
+                y_img = float(np.clip(y_img, 0, H_img - 1))
+
+                # 创建箭头（新增 meta 字段 moved=False；若为缓存还原，不改变 moved 状态，仍置 False）
                 self._add_arrow(x_img, y_img, lane_idx, v)
 
     def _arrow_canvas_points(self, x_img: float, y_img: float) -> list[float]:
         """返回画布坐标下的三角形顶点序列（flat list）。"""
         # 以像素坐标为准的箭头尺寸（未缩放）
-        w_px, h_px = 40, 10
+        w_px, h_px = 50, 10
         tip_img = (x_img, y_img)
         p1_img = (tip_img[0] - w_px // 2, y_img + h_px)
         p2_img = (tip_img[0] - w_px // 2, y_img - h_px)
@@ -305,22 +374,34 @@ class RightAnnoCanvas(tk.Canvas):
 
 
 
-    def _add_arrow(self, x_img: float, y_img: float, lane_idx: int, mw: float, color: tuple[int, int, int] = (255, 64, 64)):
-            """在Canvas上新增一个箭头并绑定拖拽事件，同时创建配套红色可调方框+黄色灰度和。"""
-            # Tk 颜色（BGR -> #RRGGBB）
-            r, g, b = (255, 64, 64)
-            pts = self._arrow_canvas_points(x_img, y_img)
-            aid = self.create_polygon(pts, fill=f"#{r:02x}{g:02x}{b:02x}", outline="#ffffff", width=1, smooth=False)
-            meta = {"id": aid, "lane_idx": lane_idx, "x_img": float(x_img), "y_img": float(y_img), "mw": float(mw)}
-            self.arrows.append(meta)
+    def _add_arrow(self, x_img: float, y_img: float, lane_idx: int, mw: float,
+                color: tuple[int, int, int] = (255, 64, 64)):
+        """
+        在Canvas上新增一个箭头并绑定拖拽事件，同时创建配套红色可调方框+黄色灰度和。
+        —— 改造点：为每个箭头增加 'moved': False 状态位，用户拖动后会置 True。
+        """
+        # Tk 颜色（BGR -> #RRGGBB）
+        r, g, b = (255, 64, 64)
+        pts = self._arrow_canvas_points(x_img, y_img)
+        aid = self.create_polygon(pts, fill=f"#{r:02x}{g:02x}{b:02x}", outline="#ffffff", width=1, smooth=False)
 
-            # 仅绑定该箭头的拖拽事件（竖向拖拽）
-            self.tag_bind(aid, "<ButtonPress-1>", lambda e, a=meta: self._on_drag_start(e, a))
-            self.tag_bind(aid, "<B1-Motion>",     lambda e, a=meta: self._on_drag_move(e, a))
-            self.tag_bind(aid, "<ButtonRelease-1>", lambda e, a=meta: self._on_drag_end(e, a))
+        meta = {
+            "id": aid,
+            "lane_idx": int(lane_idx),
+            "x_img": float(x_img),
+            "y_img": float(y_img),
+            "mw": float(mw),
+            "moved": False,         # ★ 新增：是否被用户拖动过
+        }
+        self.arrows.append(meta)
 
-            # === 新增：为该箭头同步创建一个红色可调矩形框 + 顶部黄色文字 ===
-            #self._create_box_for_arrow(meta)
+        # 仅绑定该箭头的拖拽事件（竖向拖拽）
+        self.tag_bind(aid, "<ButtonPress-1>", lambda e, a=meta: self._on_drag_start(e, a))
+        self.tag_bind(aid, "<B1-Motion>",     lambda e, a=meta: self._on_drag_move(e, a))
+        self.tag_bind(aid, "<ButtonRelease-1>", lambda e, a=meta: self._on_drag_end(e, a))
+
+        # === 若需要：为该箭头同步创建一个红色可调矩形框 + 顶部黄色文字 ===
+        # self._create_box_for_arrow(meta)
 
     def _redraw_arrows(self):
         """画布变化时，按照最新缩放/偏移重画箭头形状。"""
@@ -330,9 +411,11 @@ class RightAnnoCanvas(tk.Canvas):
             if "x_img" in a:
                 x_img = float(a["x_img"])
             else:
-                xc_gel = self._lane_center_x_at_y_gel(int(round(y_img - self.panel_top_h)), lane_idx)
-                x_img = float(self.x_offset + xc_gel)
-            # 限制在整张图可见区域（你也可改成仅限 gel 区域）
+                # ★ 改动点：默认 X = 左分界线（随 y 逐行计算，支撑斜界线）
+                xg = self._lane_left_x_at_y_gel(int(round(y_img - self.panel_top_h)), lane_idx)
+                x_img = float(self.x_offset + xg)
+
+            # 限制在整张图可见区域
             H, W = self.base_img_bgr.shape[:2]
             x_img = float(np.clip(x_img, 0, W - 1))
             pts = self._arrow_canvas_points(x_img, y_img)
@@ -693,7 +776,53 @@ class RightAnnoCanvas(tk.Canvas):
             return
         self._on_box_release(evt, box)
 
-    # ---------- 交互：仅允许垂直拖动 ----------
+    def reset_arrows_to_default(self):
+        """
+        将当前画布上的所有箭头位置重置为默认位置：
+        - X：该 y 对应泳道“左分界线”；
+        - Y：按拟合 y = a*log10(mw) + b 映射的 y_gel，再加 panel_top_h；
+        同时把 'moved' 标记清零；若启用了红色方框，则按新箭头重建方框。
+        """
+        if not getattr(self, "arrows", None) or self.base_img_bgr is None:
+            return
+        Hg, Wg = self.gel_size
+        H_img, W_img = self.base_img_bgr.shape[:2]
+        ymin = self.panel_top_h
+        ymax = self.panel_top_h + max(0, Hg - 1)
+
+        for a in self.arrows:
+            try:
+                lane_idx = int(a.get("lane_idx", 0))
+                mw = float(a.get("mw", float("nan")))
+                if not (np.isfinite(mw) and mw > 0):
+                    continue
+                # 计算默认 y/x（相对当前 scene 的 panel_top_h 与 x_offset）
+                y_gel = int(round(self.a * np.log10(mw) + self.b))
+                y_img = float(np.clip(self.panel_top_h + y_gel, ymin, ymax))
+                xl_gel = self._lane_left_x_at_y_gel(y_gel, lane_idx)
+                x_img = float(np.clip(self.x_offset + xl_gel, 0, W_img - 1))
+
+                a["x_img"] = x_img
+                a["y_img"] = y_img
+                a["moved"] = False  # 清零移动标记
+
+                # 重绘箭头形状
+                pts = self._arrow_canvas_points(x_img, y_img)
+                self.coords(a["id"], *pts)
+            except Exception:
+                continue
+
+        # 若当前启用了“显示红色方框”：按最新箭头重建方框
+        if getattr(self, "boxes_enabled", False):
+            try:
+                self._delete_all_boxes()
+                for meta in self.arrows:
+                    self._create_box_for_arrow(meta)
+            except Exception:
+                pass
+
+
+
     def _on_drag_start(self, evt, arrow_meta: dict):
         self._drag["id"] = arrow_meta["id"]
         self._drag["y0_canvas"] = evt.y
@@ -705,7 +834,7 @@ class RightAnnoCanvas(tk.Canvas):
         # 画布坐标 → 图像坐标
         x_img, y_img = self._to_img(evt.x, evt.y)
 
-        # 边界：Y 仍限制在 gel 有效高度（不进入上方白板），X 限制在整图宽
+        # 边界：Y 限制在 gel 有效高度（不进入上方白板），X 限制在整图宽
         H, W = self.base_img_bgr.shape[:2]
         Hg, Wg = self.gel_size
         ymin = self.panel_top_h
@@ -716,9 +845,12 @@ class RightAnnoCanvas(tk.Canvas):
         # 保存坐标并重绘箭头
         arrow_meta["x_img"] = x_img
         arrow_meta["y_img"] = y_img
+
+        # ★ 关键：一旦发生拖动，标记 moved=True，以便后续渲染回放保持位置
+        arrow_meta["moved"] = True
+
         pts = self._arrow_canvas_points(x_img, y_img)
         self.coords(arrow_meta["id"], *pts)
-
 
 
 
@@ -1070,7 +1202,7 @@ class App(tk.Tk):
             f_marker, text="Show red boxes (generate from arrows when checked)",
             variable=self.var_show_boxes, command=self.on_toggle_show_boxes
         ).pack(anchor="w", padx=6, pady=2)
-
+        ttk.Button(f_marker,text="Reset all arrows to default",command=self.reset_all_arrows).pack(fill=tk.X, padx=6, pady=4)
         # ---- Actions ----
         f_action = ttk.Frame(left)
         f_action.pack(fill=tk.X, pady=10)
@@ -1504,25 +1636,6 @@ class App(tk.Tk):
         sp = ttk.Spinbox(f, textvariable=var, from_=from_, to=to, increment=step, width=8)
         sp.pack(side=tk.RIGHT)
 
-    def _normalize_labels(self, labels: list[list[str]], nlanes: int) -> list[list[str]]:
-        """
-        将 labels 规整为 rows × nlanes 的二维表：
-        - 每行不足 nlanes 用空串补齐；
-        - 超出则裁剪到 nlanes；
-        - labels 为空时返回 []。
-        """
-        if not labels:
-            return []
-        out: list[list[str]] = []
-        for row in labels:
-            row = list(row) if row else []
-            if len(row) < nlanes:
-                row = row + [""] * (nlanes - len(row))
-            else:
-                row = row[:nlanes]
-            out.append(row)
-        return out
-
     # -------------------- 文件/检测 -------------------- #
 
     def export_arrow_box_metrics(self):
@@ -1672,6 +1785,7 @@ class App(tk.Tk):
         self.lane_names = []
         self.lane_marks = []
         self.render_cache = {}
+        self._clear_right_canvas()
         self.gi = 1
         self.boxes = []
         self.roi_editor.set_image(self.orig_bgr)
@@ -1680,6 +1794,7 @@ class App(tk.Tk):
 
 
     def run_detect(self):
+        self._clear_all_caches_and_overlays()
         if self.orig_bgr is None:
             return
         block = self.var_block.get()
@@ -1702,7 +1817,53 @@ class App(tk.Tk):
         # 默认选第一块
         self.gi = 1
         self.roi_editor.set_roi(self.boxes[0])
+    def reset_all_arrows(self):
+        """
+        一键将右侧画布的所有箭头重置为默认位置。
+        """
+        if not hasattr(self, "canvas_anno") or self.canvas_anno is None:
+            messagebox.showwarning("Notice", "Right-side annotation canvas is unavailable. Please render first.")
+            return
+        try:
+            if not getattr(self.canvas_anno, "arrows", None):
+                messagebox.showinfo("Notice", "No arrow to reset currently.")
+                return
+            self.canvas_anno.reset_arrows_to_default()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to reset arrows: {e}")
+    def _clear_right_canvas(self):
+        """
+        清空右侧交互画布的底图、箭头、方框等叠加元素，避免跨 ROI/图像污染。
+        """
+        can = getattr(self, "canvas_anno", None)
+        if not can:
+            return
+        try:
+            can.delete("all")
+        except Exception:
+            pass
+        try:
+            if hasattr(can, "arrows"):
+                can.arrows.clear()
+            if hasattr(can, "boxes"):
+                can.boxes.clear()
+            # 同时清空底图相关状态，强制后续 set_scene 重建
+            can.base_img_bgr = None
+            can.base_img_tk = None
+            can.img_item = None
+        except Exception:
+            pass
 
+    def _clear_all_caches_and_overlays(self):
+        """
+        清空本次渲染缓存与右侧画布叠加物。
+        在 ROI 或图像发生变化时调用，避免缓存复用导致的数据污染。
+        """
+        try:
+            self.render_cache = {}
+        except Exception:
+            pass
+        self._clear_right_canvas()
     def on_toggle_show_green(self):
         """
         仅切换绿线显示，不做任何重算。
@@ -1728,12 +1889,14 @@ class App(tk.Tk):
                 pass
 
     def switch_gel(self, delta):
+        self._clear_all_caches_and_overlays()
         if not self.boxes:
             return
         self.gi = (self.gi - 1 + delta) % len(self.boxes) + 1  # 1..N 环绕
         self.roi_editor.set_roi(self.boxes[self.gi - 1])
 
     def reset_roi_from_detect(self):
+        self._clear_all_caches_and_overlays()
         if not self.boxes:
             return
         idx = max(1, min(self.gi, len(self.boxes))) - 1
@@ -2169,85 +2332,6 @@ class App(tk.Tk):
 
 
 
-    # -------- 新增：按“每列分子量列表”绘制红色箭头 -------- #
-    def _overlay_lane_marks(
-        self,
-        annotated_img: np.ndarray,
-        gel_bgr: np.ndarray,
-        bounds: np.ndarray | None,
-        lanes: list[tuple[int, int]] | None,
-        a: float, b: float, fit_ok: bool,
-        nlanes: int,
-        ladder_lane: int,
-        yaxis_side: str
-    ) -> np.ndarray:
-        """
-        将 self.lane_marks（编辑器的每行）顺序映射到“非标准道”各列，仅这些列绘制红色箭头。
-        规则：缺则空，多则省。Y 轴在左时自动做水平偏移。
-        """
-        img = annotated_img.copy()
-        if (not fit_ok) or (not isinstance(img, np.ndarray)) or img.size == 0:
-            return img
-
-        H, W_total = img.shape[:2]
-        Hg, Wg = gel_bgr.shape[:2]
-        if Hg != H:
-            Hg = H  # 兜底
-
-        # 白面板偏移：仅当 Y 轴在左
-        panel_w = max(0, W_total - Wg)
-        x_offset = panel_w if (str(yaxis_side).lower() == "left") else 0
-
-        # 给定 y、lane i（0-based）→ 该行两分隔线中点（加上 x_offset）
-        def lane_center_x_at_y(y_int: int, lane_idx: int) -> int:
-            y_clamp = int(np.clip(y_int, 0, Hg - 1))
-            if bounds is not None and isinstance(bounds, np.ndarray) and bounds.ndim == 2 and bounds.shape[0] >= Hg:
-                L = int(bounds[y_clamp, lane_idx])
-                R = int(bounds[y_clamp, lane_idx + 1])
-                xc = int(round((L + R) / 2.0))
-            elif lanes is not None and 0 <= lane_idx < len(lanes):
-                l, r = lanes[lane_idx]
-                xc = int(round((l + r) / 2.0))
-            else:
-                step = Wg / max(1, nlanes)
-                xc = int(round((lane_idx + 0.5) * step))
-            return int(x_offset + np.clip(xc, 0, Wg - 1))
-
-        # 目标列索引：所有非标准道，按左到右
-        skip_idx = max(0, int(ladder_lane) - 1)  # 标准道(0-based)
-        if bounds is not None and isinstance(bounds, np.ndarray):
-            real_nlanes = max(0, bounds.shape[1] - 1)
-        elif lanes is not None:
-            real_nlanes = len(lanes)
-        else:
-            real_nlanes = nlanes
-        target_lane_idx = [i for i in range(real_nlanes) if i != skip_idx]
-
-        # 小实心红箭头
-        def draw_arrow(xc: int, y: int, color=(0, 0, 255)):
-            tip = (int(xc), int(np.clip(y, 0, H - 1)))
-            w, h = 40, 10
-            p1 = (tip[0] - w // 2, int(np.clip(tip[1] + h, 0, H - 1)))
-            p2 = (tip[0] - w // 2, int(np.clip(tip[1] - h, 0, H - 1)))
-            pts = np.array([p1, p2, tip], dtype=np.int32)
-            cv2.fillPoly(img, [pts], color)
-            cv2.polylines(img, [pts], isClosed=True, color=(255, 255, 255), thickness=1, lineType=cv2.LINE_AA)
-
-        marks_seq = self.lane_marks or []  # 编辑器“每行”的分子量列表
-        # 仅取前 len(target_lane_idx) 个，缺则空，多则省
-        use_k = min(len(target_lane_idx), len(marks_seq))
-        for k in range(use_k):
-            arr = marks_seq[k] or []
-            lane_idx = target_lane_idx[k]
-            for mw in arr:
-                if not (isinstance(mw, (int, float)) and np.isfinite(mw) and mw > 0):
-                    continue
-                y = int(round(a * np.log10(float(mw)) + b))
-                xc = lane_center_x_at_y(y, lane_idx)
-                draw_arrow(xc, y)
-
-        # 若 marks_seq 比非标准道少：自动空出；比之多：已被省略
-        return img
 
     # -------- 保留：上方白底文本标签面板（与现有实现相同，略） -------- #
     def _attach_labels_panel(
@@ -2711,6 +2795,7 @@ class App(tk.Tk):
         """
         将右侧 ROI 编辑器中的“校准线”角度重置为 0°（水平），并立即重绘。
         """
+        self._clear_all_caches_and_overlays()
         if getattr(self, "roi_editor", None) is None:
             return
         # 优先调用 ROIEditorCanvas 的公有方法（若无则直接设置属性）
