@@ -17,6 +17,9 @@ from gel_core import (
     detect_bands_along_y_prominence,
     render_annotation_slanted,
     match_ladder_best,
+    build_piecewise_log_mw_model,
+    predict_y_from_mw_piecewise,
+    eval_fit_quality_piecewise,
     fit_log_mw_irls,
     eval_fit_quality
 )
@@ -103,41 +106,62 @@ class RightAnnoCanvas(tk.Canvas):
         self._render_base_image()
         self._redraw_arrows()
         self._redraw_boxes() 
+    def _mw_to_y_gel(self, mw: float) -> float:
+        """
+        把 MW（kDa）映射到“凝胶坐标系”的 Y，优先用分段模型；否则退回线性 y = a*log10(mw)+b。
+        """
+        try:
+            v = float(mw)
+            if not (np.isfinite(v) and v > 0):
+                return float('nan')
+            if self.calib_model is not None:
+                xk = self.calib_model['xk']; yk = self.calib_model['yk']
+                yv = predict_y_from_mw_piecewise([v], xk, yk)[0]
+                return float(yv)
+            # 退回线性
+            return float(self.a * np.log10(v) + self.b)
+        except Exception:
+            return float('nan')
+
+
 
     def set_scene(
         self,
-        base_img_bgr: np.ndarray,
-        gel_bgr: np.ndarray,
-        bounds: np.ndarray | None,
-        lanes: list[tuple[int, int]] | None,
+        base_img_bgr,                # np.ndarray
+        gel_bgr,                     # np.ndarray
+        bounds,                      # np.ndarray 或 None
+        lanes,                       # list[(int,int)] 或 None
         a: float, b: float, fit_ok: bool,
         nlanes: int, ladder_lane: int,
         yaxis_side: str,
-        lane_marks: list[list[float]] | None,
+        lane_marks,                  # list[list[float]] 或 None
         panel_top_h: int = 0,
-        panel_w: int | None = None,  # ★ 显式传入左侧刻度白板宽度
+        panel_w: int = None,         # ★ 显式传入左侧白板宽度
+        calib_model: dict = None,    # ★ 新增：分段标定模型 {'xk','yk'}
     ):
         """
         设置底图与几何信息，并按 lane_marks 生成可拖拽红箭头。
-        —— 改造点：在同一图像中再次渲染时，保留“已拖动且未被移除”的箭头位置不变。
+        —— 重要：若提供 calib_model（分段线性 log10(MW)-Y），则箭头默认 Y 映射优先采用分段模型；
+                否则退回到线性 y = a*log10(mw)+b。
         """
-        # ===== ① 提前抓取“已拖动箭头”的相对凝胶坐标缓存 =====
-        # 以 (lane_idx, mw) 作为“箭头身份键”，缓存移动后位置（相对凝胶，不随 panel_top_h 与 x_offset 改变）
-        def _key(li: int, mwv: float) -> tuple[int, float]:
-            # 精度：直接用 float 即可（mw 来源于你的数据输入），若有需要可 round 到 1e-6
+        # ===== ① 提前抓取“已拖动箭头”的相对凝胶坐标缓存（关键！避免 moved_cache 未定义） =====
+        def _key(li: int, mwv: float):
+            # 精度直接用 float（你的已有实现也是如此）
             return (int(li), float(mwv))
-
         prev_panel_top = getattr(self, "panel_top_h", 0)
-        prev_x_offset  = getattr(self, "x_offset", 0)
-        moved_cache: dict[tuple[int, float], dict] = {}
+        prev_x_offset = getattr(self, "x_offset", 0)
+        moved_cache = {}
         for a_meta in getattr(self, "arrows", []) or []:
             if not a_meta or not a_meta.get("moved", False):
                 continue
-            li = int(a_meta.get("lane_idx", -1))
-            mw = float(a_meta.get("mw", float("nan")))
+            try:
+                li = int(a_meta.get("lane_idx", -1))
+                mw = float(a_meta.get("mw", float("nan")))
+            except Exception:
+                continue
             if li < 0 or not np.isfinite(mw):
                 continue
-            # 以当前箭头的图像坐标换算为“相对凝胶”的坐标（去除顶部与侧边偏移）
+            # 将当前箭头的图像坐标换算为“相对凝胶坐标”（去掉顶部与侧边偏移）
             x_img = float(a_meta.get("x_img", prev_x_offset))
             y_img = float(a_meta.get("y_img", prev_panel_top))
             x_gel = x_img - prev_x_offset
@@ -151,7 +175,7 @@ class RightAnnoCanvas(tk.Canvas):
         self.arrows.clear()
 
         # 清空方框集合
-        self._delete_all_boxes()  # ← 统一删除（安全起见）
+        self._delete_all_boxes()
         self.boxes.clear()
         self._box_drag.update({"box": None, "mode": None, "corner": None})
 
@@ -159,7 +183,7 @@ class RightAnnoCanvas(tk.Canvas):
         self.base_img_bgr = base_img_bgr
         self.gel_bgr = gel_bgr.copy() if isinstance(gel_bgr, np.ndarray) else None
         self.gel_gray = cv2.cvtColor(self.gel_bgr, cv2.COLOR_BGR2GRAY) if self.gel_bgr is not None else None
-        self.gel_size = gel_bgr.shape[:2]  # (Hg, Wg)
+        self.gel_size = gel_bgr.shape[:2] if isinstance(gel_bgr, np.ndarray) else (0, 0)  # (Hg, Wg)
         self.bounds = bounds
         self.lanes = lanes
         self.a, self.b = float(a), float(b)
@@ -168,27 +192,41 @@ class RightAnnoCanvas(tk.Canvas):
         self.ladder_lane = int(ladder_lane)
         self.yaxis_side = str(yaxis_side or "left").lower()
         self.panel_top_h = int(panel_top_h)
+
         Ht, Wt = self.base_img_bgr.shape[:2]
         Hg, Wg = self.gel_size
 
-        # ★ 关键：panel_w 使用“显式传入值”，否则才退回到 Wt - Wg 的估算
+        # 面板宽（显式传入优先）
         if panel_w is not None:
             self.panel_w = max(0, int(panel_w))
         else:
             self.panel_w = max(0, Wt - Wg)
         self.x_offset = self.panel_w if self.yaxis_side == "left" else 0
 
+        # ★ 分段模型：要求 xk, yk 长度>=2
+        self.calib_model = None
+        try:
+            if calib_model and isinstance(calib_model, dict):
+                xk = np.asarray(calib_model.get('xk', []), dtype=np.float64)
+                yk = np.asarray(calib_model.get('yk', []), dtype=np.float64)
+                if xk.size >= 2 and yk.size >= 2 and xk.size == yk.size:
+                    self.calib_model = {'xk': xk, 'yk': yk}
+        except Exception:
+            self.calib_model = None
+
         # ===== ④ 渲染底图（不含红箭头） =====
         self._render_base_image()
+        self._redraw_arrows()
+        self._redraw_boxes()
 
-        # ===== ⑤ 生成/合并箭头 =====
+        # ===== ⑤ 生成/合并箭头（使用分段/线性默认 Y） =====
         if self.fit_ok and lane_marks:
-            # 将“已拖动箭头”的相对凝胶坐标迁移到当前 scene 的偏移系（保持视觉位置不变）
+            # 将“已拖动箭头”的相对凝胶坐标迁移到当前 scene（保持视觉位置不变）
             self._create_arrows_from_marks(lane_marks, pos_cache=moved_cache)
 
-        # ★ 若当前启用了“显示方框”，则基于最新箭头一次性生成
+        # 若当前启用了“显示方框”，则基于最新箭头一次性生成
         if self.boxes_enabled and self.arrows:
-            self._delete_all_boxes()  # 防止残留复用
+            self._delete_all_boxes()  # 防残留复用
             for meta in self.arrows:
                 self._create_box_for_arrow(meta)
 
@@ -338,8 +376,10 @@ class RightAnnoCanvas(tk.Canvas):
                     continue
 
                 # 默认位置（基于拟合将 mw 映射至 y_gel；x 取该 y 的“泳道左分界线”）
-                y_gel_default = int(round(self.a * np.log10(v) + self.b))
+                
+                y_gel_default = int(round(self._mw_to_y_gel(v)))
                 y_img_default = self.panel_top_h + y_gel_default
+
                 xl_gel = self._lane_left_x_at_y_gel(y_gel_default, lane_idx)
                 x_img_default = self.x_offset + xl_gel
 
@@ -797,7 +837,7 @@ class RightAnnoCanvas(tk.Canvas):
                 if not (np.isfinite(mw) and mw > 0):
                     continue
                 # 计算默认 y/x（相对当前 scene 的 panel_top_h 与 x_offset）
-                y_gel = int(round(self.a * np.log10(mw) + self.b))
+                y_gel = int(round(self._mw_to_y_gel(mw)))
                 y_img = float(np.clip(self.panel_top_h + y_gel, ymin, ymax))
                 xl_gel = self._lane_left_x_at_y_gel(y_gel, lane_idx)
                 x_img = float(np.clip(self.x_offset + xl_gel, 0, W_img - 1))
@@ -2019,7 +2059,6 @@ class App(tk.Tk):
     def render_current(self):
         if self.orig_bgr is None:
             return
-
         # 1) 旋转对齐并裁剪 ROI
         rroi = self.roi_editor.get_rotated_roi()
         if rroi is None:
@@ -2028,12 +2067,11 @@ class App(tk.Tk):
             return
         cx, cy, w, h, angle_ccw = rroi
         rot_img, M = self._rotate_bound_with_M(self.orig_bgr, -angle_ccw)
-
         def _affine_point(M_, x, y):
             return (M_[0,0]*x + M_[0,1]*y + M_[0,2], M_[1,0]*x + M_[1,1]*y + M_[1,2])
         cx2, cy2 = _affine_point(M, cx, cy)
         x0 = int(round(cx2 - w/2.0)); y0 = int(round(cy2 - h/2.0))
-        x1 = x0 + int(round(w)); y1 = y0 + int(round(h))
+        x1 = x0 + int(round(w));      y1 = y0 + int(round(h))
         H2, W2 = rot_img.shape[:2]
         x0 = max(0, min(x0, W2 - 1)); y0 = max(0, min(y0, H2 - 1))
         x1 = max(x0 + 1, min(x1, W2)); y1 = max(y0 + 1, min(y1, H2))
@@ -2051,12 +2089,12 @@ class App(tk.Tk):
             gamma=gamma
         ) if self.var_wb_on.get() else gel
 
-        # 2.5) 标准凝胶宽度
+        # 2.5) 标准宽度
         design = self._get_design_params()
         gel_bgr = self._standardize_gel_size(gel_bgr, design["design_gel_width_px"])
         gel_gray = cv2.cvtColor(gel_bgr, cv2.COLOR_BGR2GRAY)
 
-        # 3) 解析标准带
+        # 3) 解析标准带数字
         def parse_list(s: str):
             s = (s or "").replace("，", ",")
             out = []
@@ -2067,7 +2105,7 @@ class App(tk.Tk):
                 except: pass
             return out
         ladder_labels_all = parse_list(self.ent_marker.get()) or [180,130,100,70,55,40,35,25,15,10]
-        tick_labels = ladder_labels_all  # 仅在拟合通过时交给底图绘刻度
+        tick_labels = ladder_labels_all  # 仅在拟合通过时绘制刻度
 
         # 4) 分道
         nlanes = int(self.var_nlanes.get())
@@ -2086,7 +2124,7 @@ class App(tk.Tk):
             )
             lanes = None
 
-        # 5) 标准道检测 + 拟合
+        # 5) 标准道检测 + 【分段线性标定】
         ladder_lane = max(1, min(int(self.var_ladder_lane.get()), nlanes))
         y0_roi, y1_roi = 0, None
         if bounds is not None:
@@ -2100,21 +2138,47 @@ class App(tk.Tk):
             peaks, prom = detect_bands_along_y_prominence(
                 sub, y0=y0_roi, y1=y1_roi, min_distance=20, min_prominence=10.0
             )
+
+        # 侧边标注保持“按检测到的真实 y + 输入 labels 文本”一一对应（长度较短者为准）
         ladder_peaks_for_draw = [int(round(p)) for p in peaks]
         ladder_labels_for_draw = sorted(ladder_labels_all, reverse=True)[:len(ladder_peaks_for_draw)]
-        sel_p_idx, sel_l_idx = match_ladder_best(peaks, ladder_labels_all, prom, min_pairs=3)
-        fit_ok = False; a, b = 1.0, 0.0; r2 = rmse = None
-        if len(sel_p_idx) >= 2:
-            y_used = [float(peaks[i]) for i in sel_p_idx]
-            lbl_used = [sorted(ladder_labels_all, reverse=True)[j] for j in sel_l_idx]
-            w_used = [float(prom[i]) for i in sel_p_idx]
-            a_fit, b_fit = fit_log_mw_irls(y_used, lbl_used, w_used, iters=6)
-            H_roi = gel_gray.shape[0]
-            ok, r2, rmse = eval_fit_quality(y_used, lbl_used, a_fit, b_fit, H=H_roi,
-                                            r2_min=0.5, rmse_frac_max=0.02, rmse_abs_min_px=80.0)
-            if ok: a, b, fit_ok = a_fit, b_fit, True
 
-        # 6) 核心底图（底图函数负责峰位标注；刻度在拟合通过时由底图绘制）
+        # === 核心改动：分段线性模型（log10(MW)–Y），并质控 ===
+        import numpy as np
+        ys_sorted = sorted(int(round(float(p))) for p in peaks)
+        lbs_sorted = sorted([float(x) for x in ladder_labels_all], reverse=True)
+        K = min(len(ys_sorted), len(lbs_sorted))
+
+        # prominence 权重（用于可选的 a,b 兼容拟合；分段质控不强制用权重）
+        if len(prom) == len(peaks) and K >= 1:
+            order_by_y = np.argsort(np.array(peaks, dtype=np.float64))  # 上->下
+            w_sorted = [float(prom[i]) for i in order_by_y]
+            w_used = w_sorted[:K]
+        else:
+            w_used = None
+
+        fit_ok = False
+        a, b = 1.0, 0.0    # 兼容占位
+        calib_model = None # 分段标定模型（xk, yk）
+
+        if K >= 2:
+            y_used = [float(ys_sorted[i]) for i in range(K)]
+            lbl_used = [float(lbs_sorted[i]) for i in range(K)]
+            # 构建分段模型
+            model = build_piecewise_log_mw_model(y_used, lbl_used)
+            xk = model.get('xk', np.array([], dtype=np.float64))
+            yk = model.get('yk', np.array([], dtype=np.float64))
+            H_roi = gel_gray.shape[0]
+            ok, r2, rmse = eval_fit_quality_piecewise(y_used, lbl_used, xk, yk, H=H_roi,
+                                                    r2_min=0.5, rmse_frac_max=0.02, rmse_abs_min_px=80.0)
+            if ok and xk.size >= 2:
+                calib_model = {'xk': xk, 'yk': yk}
+                fit_ok = True
+                # （可选）同时给出 a,b 以兼容老逻辑/显示，不影响实际 y 映射
+                a_fit, b_fit = fit_log_mw_irls(y_used, lbl_used, w_used, iters=6)
+                a, b = a_fit, b_fit
+
+        # 6) 核心底图（侧标沿用检测真 y 位置；刻度在拟合通过时绘制）
         if bounds is not None:
             res = render_annotation_slanted(
                 gel_bgr, bounds, ladder_peaks_for_draw, ladder_labels_for_draw,
@@ -2141,6 +2205,8 @@ class App(tk.Tk):
             "fit_ok": bool(fit_ok),
             "tick_labels": tick_labels if fit_ok else [],
             "yaxis_side": self.var_axis.get(),
+            # === 新增：缓存分段模型 ===
+            "calib_model": calib_model,
             "annotated_base_no_green": None,
             "annotated_base_with_green": None,
         }
@@ -2167,8 +2233,7 @@ class App(tk.Tk):
                 )
                 panel_top_h = annotated_final_base.shape[0] - H0
 
-        # ★ 在“底部备注扩宽”之前，计算真实 panel_w 并保留
-        #    此时宽度仍然是：panel_w + Wg
+        # 计算真实 panel_w（留给右侧画布使用，避免扩白导致箭头水平漂移）
         panel_w_val = max(0, annotated_final_base.shape[1] - gel_bgr.shape[1])
 
         # 9) 绿线（仅绿线）
@@ -2176,13 +2241,13 @@ class App(tk.Tk):
             img_core=annotated_final_base, gel_bgr=gel_bgr,
             overlay=None, bounds=bounds, lanes=lanes,
             a=a, b=b, fit_ok=fit_ok,
-            tick_labels=self.render_cache["tick_labels"],  # 不在该函数里绘制
+            tick_labels=self.render_cache["tick_labels"],  # 不在该函数里画刻度
             yaxis_side=self.var_axis.get(),
             show_green=True,
             y_offset=panel_top_h
         )
 
-        # 10) 底部备注（可能会向右扩白）
+        # 10) 底部备注
         note_raw = getattr(self, "bottom_note_text", "") or ""
         annotated_final_base_with_note = self._attach_bottom_note_panel(
             annotated_final_base, note_raw, allow_expand_width=True
@@ -2194,7 +2259,7 @@ class App(tk.Tk):
         # 11) 左侧 ROI 预览
         self._set_autofit_image(self.canvas_roi_wb, gel_bgr)
 
-        # 12) 右侧交互画布 —— ★ 显式传入 panel_w_val，避免箭头随右侧扩白漂移
+        # 12) 右侧交互画布 —— ★ 显式传入 calib_model ★
         lane_marks_input = self.lane_marks or []
         ladder_lane_val = max(1, min(int(self.var_ladder_lane.get()), int(self.var_nlanes.get())))
         self.canvas_anno.set_scene(
@@ -2207,7 +2272,8 @@ class App(tk.Tk):
             yaxis_side=self.var_axis.get(),
             lane_marks=lane_marks_input,
             panel_top_h=panel_top_h,
-            panel_w=panel_w_val,                # ★ 关键
+            panel_w=panel_w_val,
+            calib_model=calib_model,   # <<< 新增
         )
         if bool(self.var_show_boxes.get()):
             try: self.canvas_anno.set_boxes_enabled(True)
@@ -2215,7 +2281,7 @@ class App(tk.Tk):
         if bool(self.var_show_green.get()):
             self.canvas_anno.update_base_image(annotated_final_with_green_with_note)
 
-        # 13) 更新缓存两份导出图
+        # 13) 更新缓存导出图
         self.render_cache.update({
             "annotated_base_no_green": annotated_final_base_with_note,
             "annotated_base_with_green": annotated_final_with_green_with_note,
@@ -2228,12 +2294,9 @@ class App(tk.Tk):
                 "The Y-axis molecular weight scale was not plotted this time (fitting failed quality control), and no draggable arrow is generated on the right side."
             )
 
+
+
     def recompose_using_cache(self):
-        """
-        不重复跑检测/分道/拟合：用缓存核心图 + 几何参数，
-        仅做：顶部列名（可选） -> 绿线（可选，注意 y_offset） -> 底部备注。
-        刻度/峰标注完全保留底图本身，不在这里重复绘制。
-        """
         rc = getattr(self, "render_cache", None) or {}
         core = rc.get("core_no_green", None)
         if core is None or not isinstance(core, np.ndarray) or core.size == 0:
@@ -2242,7 +2305,6 @@ class App(tk.Tk):
             except Exception:
                 pass
             return
-
         gel_bgr = rc.get("gel_bgr", None)
         bounds = rc.get("bounds", None)
         lanes = rc.get("lanes", None)
@@ -2251,8 +2313,9 @@ class App(tk.Tk):
         fit_ok = bool(rc.get("fit_ok", False))
         tick_lbls = rc.get("tick_labels", [])
         yaxis_side = rc.get("yaxis_side", "left")
+        calib_model = rc.get("calib_model", None)  # <<< 取出分段模型
 
-        # 1) 顶部列名（如开启）
+        # 1) 顶部列名（如启用）
         base_img = core
         panel_top_h = 0
         if self.var_labels_on.get():
@@ -2274,21 +2337,20 @@ class App(tk.Tk):
                 )
                 panel_top_h = base_img.shape[0] - H0
 
-        # ★ 在“底部备注扩宽”之前，计算真实 panel_w
-        panel_w_val = 0
+        # 面板宽
         try:
             panel_w_val = max(0, base_img.shape[1] - gel_bgr.shape[1])
         except Exception:
             panel_w_val = 0
 
-        # 2) 绿线（仅绿线；不重复画刻度）
+        # 2) 绿线（仅绿线）
         want_green = bool(self.var_show_green.get())
         if want_green:
             with_green = self._draw_overlays_on_core(
                 img_core=base_img, gel_bgr=gel_bgr,
                 overlay=None, bounds=bounds, lanes=lanes,
                 a=a, b=b, fit_ok=fit_ok,
-                tick_labels=tick_lbls,  # 不在该函数中使用
+                tick_labels=tick_lbls,
                 yaxis_side=yaxis_side,
                 show_green=True,
                 y_offset=panel_top_h
@@ -2304,7 +2366,7 @@ class App(tk.Tk):
         else:
             with_green_note = None
 
-        # 4) 刷新右侧交互画布 —— ★ 显式传入 panel_w_val
+        # 4) 刷新右侧交互画布 —— ★ 传入 calib_model
         ladder_lane_val = max(1, min(int(self.var_ladder_lane.get()), int(self.var_nlanes.get())))
         self.canvas_anno.set_scene(
             base_img_bgr=base_with_note,
@@ -2316,7 +2378,8 @@ class App(tk.Tk):
             yaxis_side=yaxis_side,
             lane_marks=(self.lane_marks or []),
             panel_top_h=panel_top_h,
-            panel_w=panel_w_val,               # ★ 关键
+            panel_w=panel_w_val,
+            calib_model=calib_model,  # <<< 新增
         )
         if bool(self.var_show_boxes.get()):
             try: self.canvas_anno.set_boxes_enabled(True)
@@ -2324,11 +2387,12 @@ class App(tk.Tk):
         if want_green and with_green_note is not None:
             self.canvas_anno.update_base_image(with_green_note)
 
-        # 5) 更新缓存导出图
+        # 5) 更新可导出的缓存
         self.render_cache.update({
             "annotated_base_no_green": base_with_note,
             "annotated_base_with_green": with_green_note or base_with_note,
         })
+
 
 
 
@@ -2472,7 +2536,7 @@ class App(tk.Tk):
         # 行测量与缓存
         rows_used_idx, row_heights = [], []
         cell_cache: dict[tuple[int, int], tuple[np.ndarray | None, int, int, float]] = {}
-        STD_TEXT = "Standard"
+        STD_TEXT = "Marker"
 
         for r in range(rows):
             row_has_nonstd = any((labels_table[r][c] or "").strip() for c in range(cols_use))

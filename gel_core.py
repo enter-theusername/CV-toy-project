@@ -426,6 +426,10 @@ def detect_bands_along_y_slanted(
     peaks = [float(p) + y0 for p in peaks_local]
     return peaks, scores
 # === [替换] 3) 基于RANSAC+顺序约束的鲁棒匹配（保留原函数名/签名） ===
+# gel_core.py
+from typing import List, Tuple
+import numpy as np
+
 def match_ladder_best(
     peaks_y: List[int],
     ladder_labels: List[float],
@@ -433,102 +437,209 @@ def match_ladder_best(
     min_pairs: int = 3
 ) -> Tuple[List[int], List[int]]:
     """
-    返回：选中“峰索引列表[相对原peaks_y]”、选中“标签索引列表[相对按大->小排序后的 ladder_labels]”
-    策略：RANSAC 随机两点拟合 -> 顺序约束下容差匹配 -> 以权重求和为目标
-    回退：若无有效模型则回退到‘Top-K by prominence’的旧策略
+    单调配对（上->下 对 应 大->小）+ 相对位置最小代价，支持峰权重微调。
+    返回：
+      - sel_peak_idx: 选中的“峰索引”（相对原 peaks_y 的索引）
+      - sel_label_idx: 选中的“标签索引”（相对‘降序后的 ladder_labels’的索引）
     """
     if not peaks_y or not ladder_labels:
         return [], []
 
-    # 预处理
-    y = np.array(peaks_y, dtype=np.float64)
-    order_y = np.argsort(y)           # y升序（上->下）
-    y = y[order_y]
-    N = len(y)
+    y = np.asarray(peaks_y, dtype=np.float64)
+    order_y = np.argsort(y)                  # 上->下
+    y_sorted = y[order_y]
+    # 归一化 [0,1]
+    y_min, y_max = float(y_sorted.min()), float(y_sorted.max())
+    y_norm = (y_sorted - y_min) / (y_max - y_min + 1e-12)
 
-    L_sorted = sorted(ladder_labels, reverse=True)  # kDa: 大->小
-    x = np.log10(np.array(L_sorted, dtype=np.float64))
-    M = len(x)
+    # 标签按 kDa 大->小
+    L_sorted = sorted([float(v) for v in ladder_labels if np.isfinite(v) and v > 0.0], reverse=True)
+    M = len(L_sorted)
+    if M == 0:
+        return [], []
 
-    # 权重
+    # 目标相对位置（头=0, 底=1）
+    t = np.array([0.5], dtype=np.float64) if M == 1 else np.linspace(0.0, 1.0, M, dtype=np.float64)
+
+    # 峰权重归一化（可选）
     if peak_weights is None or len(peak_weights) != len(peaks_y):
-        W = np.ones(N, dtype=np.float64)
+        w_sorted = np.ones_like(y_sorted, dtype=np.float64)
     else:
-        W_full = np.array(peak_weights, dtype=np.float64)
-        W = W_full[order_y]
-        if not np.all(np.isfinite(W)):
-            finite = W[np.isfinite(W)]
-            W = np.nan_to_num(W, nan=0.0, posinf=float(finite.max() if finite.size else 1.0), neginf=0.0)
+        w_raw = np.asarray(peak_weights, dtype=np.float64)[order_y]
+        w_raw = np.clip(w_raw, 1e-9, np.nanmax(w_raw) if np.nanmax(w_raw) > 0 else 1.0)
+        w_sorted = (w_raw - np.nanmin(w_raw)) / (np.nanmax(w_raw) - np.nanmin(w_raw) + 1e-12)
+        w_sorted = np.nan_to_num(w_sorted, nan=0.0, posinf=1.0, neginf=0.0)
 
-    # RANSAC参数
-    trials = min(400, max(60, 20 * min(N, M)))
-    tol_px = max(8.0, 0.08 * (y.max() - y.min() + 1e-6))  # 高度相关容差
-    rng = np.random.default_rng(20250827)
+    # 代价矩阵：|y_norm - t| - β*w（β>0 偏好强峰）
+    beta = 0.15
+    N = len(y_sorted)
+    C = np.abs(y_norm[None, :] - t[:, None]) - beta * w_sorted[None, :]
 
-    best_pairs: list[tuple[int, int]] = []
-    best_score = -1.0
-    best_ab = None
+    # DP：i=标签(0..M-1), j=峰(0..N-1)，保持递增
+    INF = 1e9
+    dp = np.full((M, N), INF, dtype=np.float64)
+    pre = np.full((M, N), -1, dtype=np.int32)
+    dp[0, :] = C[0, :]
+    for i in range(1, M):
+        best_val = INF
+        best_k = -1
+        for j in range(N):
+            if j > 0:
+                if dp[i-1, j-1] < best_val:
+                    best_val = dp[i-1, j-1]
+                    best_k = j-1
+            cand = best_val + C[i, j]
+            if cand < dp[i, j]:
+                dp[i, j] = cand
+                pre[i, j] = best_k
 
-    def eval_model(a: float, b: float) -> tuple[list[tuple[int, int]], float]:
-        # 预测每个标签的 y，并在顺序约束下与 y 匹配
-        y_pred = a * x + b  # 升序/降序不必强制，此处按标签顺序 j=0..M-1（kDa大->小，y应从小->大）
-        pairs = []
-        score = 0.0
-        i = 0
-        for j in range(M):
-            yp = y_pred[j]
-            # 找到第一个 >= yp - tol 的峰
-            while i < N and y[i] < yp - tol_px:
-                i += 1
-            if i < N and abs(y[i] - yp) <= tol_px:
-                pairs.append((i, j))
-                score += float(W[i])
-                i += 1
-        return pairs, score
+    # 回溯
+    j_end = int(np.argmin(dp[M-1, :]))
+    path_j = [j_end]
+    i, j = M - 1, j_end
+    while i > 0:
+        j = pre[i, j]
+        if j < 0:
+            break
+        path_j.append(int(j))
+        i -= 1
+    path_j = path_j[::-1]
+    used_len = min(len(path_j), M)
+    path_j = path_j[:used_len]
+    sel_peak_idx = [int(order_y[j]) for j in path_j]
+    sel_label_idx = list(range(used_len))
 
-    # RANSAC循环（随机两两对应拟合直线）
-    if N >= 2 and M >= 2:
-        for _ in range(trials):
-            i1, i2 = sorted(rng.choice(N, size=2, replace=False).tolist())
-            j1, j2 = sorted(rng.choice(M, size=2, replace=False).tolist())
-            if x[j2] == x[j1]:
-                continue
-            a = (y[i2] - y[i1]) / (x[j2] - x[j1])
-            b = y[i1] - a * x[j1]
-            if not np.isfinite(a) or not np.isfinite(b) or a >= -0.05:  # 经验：a 应为负，且不能太接近0
-                continue
-            pairs, score = eval_model(a, b)
-            if len(pairs) >= max(2, int(min_pairs)) and score > best_score:
-                best_score, best_pairs, best_ab = score, pairs, (a, b)
-
-    # 若RANSAC成功，做一次IRLS精炼并重筛
-    if best_pairs and len(best_pairs) >= max(2, int(min_pairs)):
-        sel_i = [p for p, _ in best_pairs]
-        sel_j = [q for _, q in best_pairs]
-        y_used = [float(y[i]) for i in sel_i]
-        lbl_used = [float(L_sorted[j]) for j in sel_j]
-        w_used = [float(W[i]) for i in sel_i]
-        a_fit, b_fit = fit_log_mw_irls(y_used, lbl_used, w_used, iters=6)
-
-        # 用精炼模型重新筛选对
-        pairs2, score2 = eval_model(a_fit, b_fit)
-        if len(pairs2) >= len(best_pairs):
-            best_pairs = pairs2
-        # 将索引还原到原 peaks_y 顺序空间
-        sel_i_fin = [order_y[int(i)] for i, _ in best_pairs]
-        sel_j_fin = [int(j) for _, j in best_pairs]
-        return sel_i_fin, sel_j_fin
-
-    # --- 回退：旧策略 Top-K by prominence ---
-    # 注意：这里复用你原本的逻辑，保证行为兼容
-    K = min(N, M)
-    order_by_prom = sorted(range(N), key=lambda i: (float(W[i]), -float(y[i])), reverse=True)
-    topk_idx = order_by_prom[:K]
-    sel_peak_idx = sorted(topk_idx, key=lambda i: float(y[i]))
-    sel_label_idx = list(range(len(sel_peak_idx)))
-    # 还原到原 peaks_y 的索引
-    sel_peak_idx = [int(order_y[int(i)]) for i in sel_peak_idx]
+    # 兜底：不足 min_pairs 时退回“顺序前K”
+    if len(sel_peak_idx) < max(1, int(min_pairs)):
+        K = min(len(peaks_y), len(L_sorted))
+        sel_peak_idx = [int(order_y[i]) for i in range(K)]
+        sel_label_idx = list(range(K))
     return sel_peak_idx, sel_label_idx
+
+# === 新增：分段线性（相邻两点线性，端点外延） ===
+from typing import Dict, List, Tuple
+import numpy as np
+
+def build_piecewise_log_mw_model(
+    y_positions: List[float],
+    ladder_sizes: List[float],
+) -> Dict[str, np.ndarray]:
+    """
+    构建分段线性标定模型：
+    - 输入：Y（像素，越下越大）与对应的分子量 MW（kDa，>0）
+    - 在 x = log10(MW) 空间建立相邻点直线段；xk 升序
+    - 返回：{'xk': np.ndarray, 'yk': np.ndarray}，长度>=2 方为可用
+    """
+    x = np.log10(np.asarray(ladder_sizes, dtype=np.float64))
+    y = np.asarray(y_positions, dtype=np.float64)
+    # 过滤非法
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    mask_pos = np.isfinite(x) & (x > -np.inf) & (x < np.inf)
+    x, y = x[mask_pos], y[mask_pos]
+    # 按 x 升序
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+    # 去重（同 x 的 y 取中位数）
+    if x.size == 0:
+        return {'xk': np.array([], dtype=np.float64), 'yk': np.array([], dtype=np.float64)}
+    xk, yk = [x[0]], [y[0]]
+    for i in range(1, len(x)):
+        if abs(x[i] - xk[-1]) < 1e-12:
+            # 合并到当前 knot：取中位数更稳健
+            yk[-1] = float(np.median([yk[-1], y[i]]))
+        else:
+            xk.append(float(x[i]))
+            yk.append(float(y[i]))
+    xk = np.asarray(xk, dtype=np.float64)
+    yk = np.asarray(yk, dtype=np.float64)
+    return {'xk': xk, 'yk': yk}
+
+def _predict_y_from_logx_piecewise(
+    logx: np.ndarray, xk: np.ndarray, yk: np.ndarray
+) -> np.ndarray:
+    """
+    在 log10(MW) 空间做分段线性插值/外推：
+    - 区间内线性插值
+    - 左端/右端用相邻段斜率做线性外推（“两端用最接近的两端延申”）
+    """
+    logx = np.asarray(logx, dtype=np.float64)
+    xk = np.asarray(xk, dtype=np.float64)
+    yk = np.asarray(yk, dtype=np.float64)
+    n = xk.size
+    if n < 2:
+        # 不足两点，无法分段；返回 NaN
+        return np.full_like(logx, np.nan, dtype=np.float64)
+
+    # 每段斜率
+    dx = np.diff(xk)
+    dy = np.diff(yk)
+    # 避免除零
+    dx = np.where(np.abs(dx) < 1e-12, np.sign(dx) * 1e-12, dx)
+    m = dy / dx  # 长度 n-1
+
+    # 逐点定位
+    idx = np.searchsorted(xk, logx, side='left')  # 0..n
+    out = np.empty_like(logx, dtype=np.float64)
+
+    # 左侧外推：idx == 0
+    left_mask = (idx == 0)
+    if np.any(left_mask):
+        out[left_mask] = yk[0] + m[0] * (logx[left_mask] - xk[0])
+
+    # 右侧外推：idx == n
+    right_mask = (idx == n)
+    if np.any(right_mask):
+        out[right_mask] = yk[-1] + m[-1] * (logx[right_mask] - xk[-1])
+
+    # 区间内插值：1..n-1
+    mid_mask = (~left_mask) & (~right_mask)
+    if np.any(mid_mask):
+        i = idx[mid_mask] - 1  # 段索引 0..n-2
+        out[mid_mask] = yk[i] + m[i] * (logx[mid_mask] - xk[i])
+
+    return out
+
+def predict_y_from_mw_piecewise(
+    mw_values: List[float], xk: np.ndarray, yk: np.ndarray
+) -> np.ndarray:
+    """
+    便捷：输入 MW 列表，输出预测 Y（像素，向下为正）。
+    """
+    mw = np.asarray(mw_values, dtype=np.float64)
+    logx = np.log10(np.clip(mw, 1e-12, np.inf))
+    return _predict_y_from_logx_piecewise(logx, xk, yk)
+
+def eval_fit_quality_piecewise(
+    y_positions: List[float],
+    ladder_sizes: List[float],
+    xk: np.ndarray,
+    yk: np.ndarray,
+    H: int,
+    r2_min: float = 0.97,
+    rmse_frac_max: float = 0.02,
+    rmse_abs_min_px: float = 5.0,
+) -> Tuple[bool, float, float]:
+    """
+    对分段模型做质控：把给定 (MW->logx) 的 y 与分段预测值比较，计算 R^2 / RMSE。
+    - 通过条件：R^2 >= r2_min 且 RMSE <= max(rmse_abs_min_px, rmse_frac_max * H)
+    - 斜率单调性不强制（由于是分段）
+    """
+    x = np.log10(np.asarray(ladder_sizes, dtype=np.float64))
+    y = np.asarray(y_positions, dtype=np.float64)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if x.size < 2 or xk.size < 2 or yk.size < 2:
+        return False, 0.0, np.inf
+    y_pred = _predict_y_from_logx_piecewise(x, xk, yk)
+    resid = y - y_pred
+    ss_res = float(np.sum(resid * resid))
+    ss_tot = float(np.sum((y - y.mean()) ** 2) + 1e-6)
+    r2 = 1.0 - ss_res / ss_tot
+    rmse = float(np.sqrt(np.mean(resid * resid)))
+    rmse_limit = max(float(rmse_abs_min_px), float(rmse_frac_max) * max(1, int(H)))
+    ok = (r2 >= float(r2_min)) and (rmse <= rmse_limit)
+    return ok, r2, rmse
 
 def fit_log_mw_irls(
     y_positions: List[int],
@@ -539,68 +650,36 @@ def fit_log_mw_irls(
     eps: float = 1e-8,
 ) -> Tuple[float, float]:
     """
-    鲁棒线性回归（Huber IRLS）：拟合 y = a*log10(MW) + b
-    修复点：
-    1) 加权最小二乘按“√w”行缩放；
-    2) Huber 权重更新为 w_eff = w0 * huber，其中 huber = min(1, k*s/|r|)；
-    3) 数值健壮性：x-范围过小/样本过少时做保底处理。
+    【简化版】标准最小二乘拟合（不再做IRLS/Huber/权重），拟合 y = a*log10(MW) + b
+
+    说明：
+    - 为保持对 app.py 的兼容，保留原函数名与签名，但内部直接用普通最小二乘。
+    - 仅使用“峰中心的 Y 值（y_positions）”与对应“分子量（ladder_sizes）”做配对拟合。
     """
+    import numpy as np
+
     x = np.log10(np.array(ladder_sizes, dtype=np.float64))
     y = np.array(y_positions, dtype=np.float64)
 
+    # 样本不足时给个温和的缺省模型（负斜率）
     if x.size < 2 or y.size < 2 or x.size != y.size:
-        # 保底：返回“温和负斜率”与均值截距
         a0 = -0.5
-        b0 = float(y.mean()) - a0 * float(x.mean() if x.size else 0.0)
+        b0 = float(y.mean()) - a0 * (float(x.mean()) if x.size else 0.0)
+        print(f"[fit_log_mw_irls] 样本不足，使用默认模型：a={a0}, b={b0}")
+        print(f"[fit_log_mw_irls] 输入数据 x={x.tolist()}, y={y.tolist()}")
         return float(a0), float(b0)
 
-    # 初始权重
-    if weights is None:
-        w0 = np.ones_like(y, dtype=np.float64)
-    else:
-        w0 = np.array(weights, dtype=np.float64)
-        # 非法值 → 0
-        w0 = np.nan_to_num(w0, nan=0.0, posinf=np.max(w0[np.isfinite(w0)]) if np.any(np.isfinite(w0)) else 1.0, neginf=0.0)
-    # 归一化到 [eps, 1]
-    w0 = w0 / (np.max(w0) + eps)
-    w0 = np.clip(w0, eps, 1.0)
-
-    # 初值：普通最小二乘
+    # 普通最小二乘
     A = np.vstack([x, np.ones_like(x)]).T
     try:
         a, b = np.linalg.lstsq(A, y, rcond=None)[0]
-    except Exception:
+        print(f"[fit_log_mw_irls] 拟合成功：a={a}, b={b}")
+    except Exception as e:
         a, b = 0.0, float(y.mean())
+        print(f"[fit_log_mw_irls] 拟合失败，使用默认值：a={a}, b={b}，错误信息：{e}")
 
-    # IRLS 主循环
-    w_eff = w0.copy()
-    for _ in range(max(1, int(iters))):
-        ws = np.sqrt(np.clip(w_eff, eps, 1.0))  # √w
-        Aw = A * ws[:, None]
-        yw = y * ws
-        try:
-            a, b = np.linalg.lstsq(Aw, yw, rcond=None)[0]
-        except Exception:
-            break
-
-        r = y - (a * x + b)
-        # 鲁棒尺度（MAD）
-        mad = np.median(np.abs(r - np.median(r))) + eps
-        # Huber 权重：min(1, k*s/|r|)
-        hub = np.minimum(1.0, (huber_k * mad) / (np.abs(r) + eps))
-        # 更新有效权重（保持到 [eps,1]）
-        w_eff = np.clip(w0 * hub, eps, 1.0)
-
+    print(f"[fit_log_mw_irls] 输入数据 x={x.tolist()}, y={y.tolist()}")
     return float(a), float(b)
-
-# ---------- 4) 斜线（线性）分道：逐行跟踪 + 线性拟合 ----------
-# （下略：与原实现一致，为篇幅起见不再改动，保持接口兼容）
-# ...（此处保留您现有的 lanes_slanted / detect_bands_along_y_slanted / render_annotation_slanted 实现）...
-
-
-# ---------- 4) 斜线（线性）分道：逐行跟踪 + 线性拟合 ----------
-# --- gel_core 3.py: 替换原 lanes_slanted ---
-
 from typing import Optional  # ← 放到 gel_core.py 顶部的 import 区
 
 def lanes_slanted(
