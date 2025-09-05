@@ -61,7 +61,7 @@ class RightAnnoCanvas(tk.Canvas):
         self.panel_top_h = 0
         self.panel_w = 0
         self.x_offset = 0
-
+        self.arrow_style: str = "tri"
         # 箭头集合
         self.arrows: list[dict] = []  # dict: {id, lane_idx, y_img, mw, color}
 
@@ -127,46 +127,65 @@ class RightAnnoCanvas(tk.Canvas):
 
     def set_scene(
         self,
-        base_img_bgr,                # np.ndarray
-        gel_bgr,                     # np.ndarray
-        bounds,                      # np.ndarray 或 None
-        lanes,                       # list[(int,int)] 或 None
+        base_img_bgr,            # np.ndarray
+        gel_bgr,                 # np.ndarray
+        bounds,                  # np.ndarray 或 None
+        lanes,                   # list[(int,int)] 或 None
         a: float, b: float, fit_ok: bool,
         nlanes: int, ladder_lane: int,
         yaxis_side: str,
-        lane_marks,                  # list[list[float]] 或 None
+        lane_marks,              # list[list[float]] 或 None
         panel_top_h: int = 0,
-        panel_w: int = None,         # ★ 显式传入左侧白板宽度
-        calib_model: dict = None,    # ★ 新增：分段标定模型 {'xk','yk'}
+        panel_w: int = None,     # ★ 显式传入左侧白板宽度
+        calib_model: dict = None,# ★ 分段标定模型 {'xk','yk'}
+        reset_positions: bool = False  # ★★★ False 时保留“已拖动箭头/方框”的相对凝胶坐标
     ):
         """
         设置底图与几何信息，并按 lane_marks 生成可拖拽红箭头。
-        —— 重要：若提供 calib_model（分段线性 log10(MW)-Y），则箭头默认 Y 映射优先采用分段模型；
-                否则退回到线性 y = a*log10(mw)+b。
+        新增：当 reset_positions=False 时，同时“缓存并复原”已存在的红色方框位置（以凝胶坐标为准）。
         """
-        # ===== ① 提前抓取“已拖动箭头”的相对凝胶坐标缓存（关键！避免 moved_cache 未定义） =====
-        def _key(li: int, mwv: float):
-            # 精度直接用 float（你的已有实现也是如此）
-            return (int(li), float(mwv))
-        prev_panel_top = getattr(self, "panel_top_h", 0)
-        prev_x_offset = getattr(self, "x_offset", 0)
+        # ===== ① 提前抓取“已拖动箭头”的相对凝胶坐标缓存（仅当 reset_positions=False 时） =====
         moved_cache = {}
-        for a_meta in getattr(self, "arrows", []) or []:
-            if not a_meta or not a_meta.get("moved", False):
-                continue
-            try:
-                li = int(a_meta.get("lane_idx", -1))
-                mw = float(a_meta.get("mw", float("nan")))
-            except Exception:
-                continue
-            if li < 0 or not np.isfinite(mw):
-                continue
-            # 将当前箭头的图像坐标换算为“相对凝胶坐标”（去掉顶部与侧边偏移）
-            x_img = float(a_meta.get("x_img", prev_x_offset))
-            y_img = float(a_meta.get("y_img", prev_panel_top))
-            x_gel = x_img - prev_x_offset
-            y_gel = y_img - prev_panel_top
-            moved_cache[_key(li, mw)] = {"x_gel": x_gel, "y_gel": y_gel}
+        boxes_cache = {}  # ★ 新增：方框缓存 key=(lane_idx,mw)-> {x_gel,y_gel,w,h}
+        if not reset_positions:
+            def _key(li: int, mwv: float):
+                return (int(li), float(mwv))
+            prev_panel_top = getattr(self, "panel_top_h", 0)
+            prev_x_offset  = getattr(self, "x_offset", 0)
+
+            # 1.1 箭头缓存（与原逻辑一致）
+            for a_meta in getattr(self, "arrows", []) or []:
+                if not a_meta or not a_meta.get("moved", False):
+                    continue
+                try:
+                    li = int(a_meta.get("lane_idx", -1))
+                    mw = float(a_meta.get("mw", float("nan")))
+                except Exception:
+                    continue
+                if li < 0 or not np.isfinite(mw):
+                    continue
+                x_img = float(a_meta.get("x_img", prev_x_offset))
+                y_img = float(a_meta.get("y_img", prev_panel_top))
+                x_gel = x_img - prev_x_offset
+                y_gel = y_img - prev_panel_top
+                moved_cache[_key(li, mw)] = {"x_gel": x_gel, "y_gel": y_gel}
+
+            # 1.2 ★ 新增：方框缓存（以绑定箭头 key 为索引）
+            if getattr(self, "boxes_enabled", False) and getattr(self, "boxes", None):
+                for box in self.boxes:
+                    try:
+                        arrow = box.get("arrow") or {}
+                        k = self._arrow_key(arrow)
+                        if not k:
+                            continue
+                        # 优先取已存的 x_gel/y_gel；无则由 x_img/y_img 与旧偏移换算
+                        x_gel = float(box.get("x_gel", box.get("x_img", 0.0) - prev_x_offset))
+                        y_gel = float(box.get("y_gel", box.get("y_img", 0.0) - prev_panel_top))
+                        w = float(box.get("w", 0.0))
+                        h = float(box.get("h", 0.0))
+                        boxes_cache[k] = {"x_gel": x_gel, "y_gel": y_gel, "w": w, "h": h}
+                    except Exception:
+                        continue
 
         # ===== ② 清空画布元素与缓存 =====
         self.delete("all")
@@ -192,7 +211,6 @@ class RightAnnoCanvas(tk.Canvas):
         self.ladder_lane = int(ladder_lane)
         self.yaxis_side = str(yaxis_side or "left").lower()
         self.panel_top_h = int(panel_top_h)
-
         Ht, Wt = self.base_img_bgr.shape[:2]
         Hg, Wg = self.gel_size
 
@@ -214,21 +232,154 @@ class RightAnnoCanvas(tk.Canvas):
         except Exception:
             self.calib_model = None
 
-        # ===== ④ 渲染底图（不含红箭头） =====
+        # ===== ④ 渲染底图（不含红箭头/方框） =====
         self._render_base_image()
         self._redraw_arrows()
         self._redraw_boxes()
 
-        # ===== ⑤ 生成/合并箭头（使用分段/线性默认 Y） =====
+        # ===== ⑤ 生成/合并箭头 =====
         if self.fit_ok and lane_marks:
-            # 将“已拖动箭头”的相对凝胶坐标迁移到当前 scene（保持视觉位置不变）
-            self._create_arrows_from_marks(lane_marks, pos_cache=moved_cache)
+            # 若 reset_positions=True，则不传缓存，强制默认位置；否则可用 moved_cache
+            self._create_arrows_from_marks(lane_marks, pos_cache=(moved_cache if not reset_positions else {}))
 
-        # 若当前启用了“显示方框”，则基于最新箭头一次性生成
+        # ===== ⑥ 根据“方框开关 & 箭头集合”恢复/生成方框 =====
         if self.boxes_enabled and self.arrows:
-            self._delete_all_boxes()  # 防残留复用
+            self._delete_all_boxes()  # 防复用
             for meta in self.arrows:
-                self._create_box_for_arrow(meta)
+                k = self._arrow_key(meta)
+                if k and boxes_cache and k in boxes_cache:
+                    # ★ 命中缓存：按凝胶坐标复原
+                    self._create_box_for_arrow(meta, preset=boxes_cache[k])
+                else:
+                    # 默认：沿用原有“基于箭头尖端”的初始策略
+                    self._create_box_for_arrow(meta)
+
+
+    def set_arrow_style(self, style: str):
+        """
+        设置右侧箭头样式，并强制【重建】每个箭头的多边形，以确保：
+        - 即时刷新，不需拖动；
+        - 不受 Tkinter 对 polygon 顶点数变化的刷新行为影响。
+        支持同义输入：'tri'/'triangle'；'star'/'★'；'diag_ne'/'↗'/'diag'.
+        """
+        s = (style or "").strip().lower()
+        if s in ("triangle", "tri", "arrow", "→"):
+            new_style = "tri"
+        elif s in ("star", "★"):
+            new_style = "star"
+        elif s in ("diag_ne", "diag", "↗"):
+            new_style = "diag_ne"
+        else:
+            new_style = "tri"
+
+        # 若样式未变化，仅做一次重绘（轻量）
+        changed = (getattr(self, "arrow_style", "tri") != new_style)
+        self.arrow_style = new_style
+
+        if not self.arrows:
+            # 没有箭头也要刷新底图（以防未来逻辑引用），但此处快速返回
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
+            return
+
+        # 逐个【删除并重建】polygon，保证顶点数变化后立即生效
+        r, g, b = (255, 64, 64)
+        fill = f"#{r:02x}{g:02x}{b:02x}"
+        rebuilt_ids = []
+        for a in self.arrows:
+            try:
+                # 当前位置（若无 x_img 则按当前 y 动态求泳道左界）
+                y_img = float(a.get("y_img", 0.0))
+                if "x_img" in a:
+                    x_img = float(a["x_img"])
+                else:
+                    lane_idx = int(a.get("lane_idx", 0))
+                    xg = self._lane_left_x_at_y_gel(int(round(y_img - self.panel_top_h)), lane_idx)
+                    x_img = float(self.x_offset + xg)
+
+                # 先删除旧 item
+                old_id = int(a["id"])
+                try:
+                    self.delete(old_id)
+                except Exception:
+                    pass
+
+                # 以新样式计算点位并新建 polygon
+                pts = self._arrow_canvas_points(x_img, y_img)
+                new_id = self.create_polygon(pts, fill=fill, outline="#ff0000", width=1, smooth=False)
+
+                # 重新绑定拖拽事件（闭包里用当前 meta）
+                self.tag_bind(new_id, "<ButtonPress-1>", lambda e, m=a: self._on_drag_start(e, m))
+                self.tag_bind(new_id, "<B1-Motion>",     lambda e, m=a: self._on_drag_move(e, m))
+                self.tag_bind(new_id, "<ButtonRelease-1>", lambda e, m=a: self._on_drag_end(e, m))
+
+                a["id"] = new_id
+                rebuilt_ids.append(new_id)
+            except Exception:
+                continue
+
+        # 提升 z 顺序，确保箭头位于底图之上
+        try:
+            for iid in rebuilt_ids:
+                self.tag_raise(iid)
+        except Exception:
+            pass
+
+        # 强制一次 UI 刷新
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+
+
+    def _shape_points_img(self, style: str, x_img: float, y_img: float) -> list[tuple[float, float]]:
+        """
+        返回“图像坐标系”下用于绘制的多边形顶点序列（[(x,y), ...]）。
+        - 'tri'：水平向右的三角箭头
+        - 'star'：五角星（中心在 x_img,y_img）
+        - 'diag_ne'：↗ 箭头的【三角头部】（箭杆改由 3px 线段绘制，不再用矩形）
+        """
+        import math
+        style = (style or "").lower()
+
+        if style == "star":
+            R, r = 5.0/self.s, 2.0/self.s
+            cx, cy = float(x_img), float(y_img)
+            pts = []
+            for i in range(10):
+                ang = math.radians(-90 + i * 36)
+                rad = R if i % 2 == 0 else r
+                pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+            return pts
+
+        if style == "diag_ne":
+            # ↗ 三角头（与 tri 的几何一致，但方向改为 NE）
+            head_len, head_half = 15/self.s,3/self.s
+            tip = (float(x_img), float(y_img))
+            # 单位方向向量（NE）
+            dx, dy = 1.0, -1.0
+            inv = (dx*dx + dy*dy) ** -0.5
+            ux, uy = dx*inv, dy*inv
+            # 垂直单位向量（顺时针 90°）
+            px, py = -uy, ux
+
+            base_cx = tip[0] - ux * (head_len * 0.5)
+            base_cy = tip[1] - uy * (head_len * 0.5)
+            p1 = (base_cx + px * head_half, base_cy + py * head_half)
+            p2 = (base_cx - px * head_half, base_cy - py * head_half)
+            pmid=(base_cx,base_cy)
+            p3=(base_cx-10/self.s,base_cy+10/self.s)
+            return [p1,pmid,p3,pmid,p2, tip]
+
+        # 默认水平向右三角头
+        w_px, h_px =15/self.s,3/self.s
+        tip = (float(x_img), float(y_img))
+        p1 = (tip[0] - w_px * 0.5, tip[1] + h_px)
+        p2 = (tip[0] - w_px * 0.5, tip[1] - h_px)
+        return [p1, p2, tip]
+        
 
 
     def render_to_image(self) -> np.ndarray | None:
@@ -237,28 +388,26 @@ class RightAnnoCanvas(tk.Canvas):
             return None
         img = self.base_img_bgr.copy()
         H, W = img.shape[:2]
-        # 三角箭头尺寸（像素坐标系）
-        w, h = 50, 10
 
         for a in self.arrows:
             y = int(np.clip(a["y_img"], 0, H - 1))
             if "x_img" in a:
                 x = int(np.clip(a["x_img"], 0, W - 1))
             else:
-                # ★ 改动点：默认 X = 左分界线（支持斜界线/等宽两种）
+                # 默认 X = 左分界线（支持斜界线/等宽两种）
                 lane_idx = a["lane_idx"]
                 xl_gel = self._lane_left_x_at_y_gel(y - self.panel_top_h, lane_idx)
                 x = int(np.clip(self.x_offset + xl_gel, 0, W - 1))
 
-            tip = (x, y)
-            p1 = (tip[0] - w // 2, int(np.clip(tip[1] + h, 0, H - 1)))
-            p2 = (tip[0] - w // 2, int(np.clip(tip[1] - h, 0, H - 1)))
-            pts = np.array([p1, p2, tip], dtype=np.int32)
-            cv2.fillPoly(img, [pts], (0, 0, 255))
-            cv2.polylines(img, [pts], isClosed=True, color=(255, 255, 255),
-                        thickness=1, lineType=cv2.LINE_AA)
-        return img
+            # 根据当前样式生成“图像坐标”顶点
+            pts_img = self._shape_points_img(self.arrow_style, float(x), float(y))
+            pts = np.array(pts_img, dtype=np.int32)
 
+            # 红色填充 + 白色描边
+            cv2.fillPoly(img, [pts], (0, 0, 255))
+            cv2.polylines(img, [pts], isClosed=True, color=(0, 0, 255), thickness=1, lineType=cv2.LINE_AA)
+
+        return img
     # ---------- 内部：几何/绘制 ----------
     def _on_resize(self, _evt=None):
         # 画布变化时重绘底图与箭头
@@ -285,9 +434,8 @@ class RightAnnoCanvas(tk.Canvas):
         )
         from PIL import Image, ImageTk
         pil = Image.fromarray(rgb)
-        self.base_img_tk = ImageTk.PhotoImage(pil)  # 保持强引用，防止GC
+        self.base_img_tk = ImageTk.PhotoImage(pil)  # 强引用，防GC
 
-        # 尝试复用旧的 image item，如已失效则创建新的
         try:
             if self.img_item is None:
                 self.img_item = self.create_image(self.ox, self.oy, image=self.base_img_tk, anchor="nw")
@@ -295,8 +443,13 @@ class RightAnnoCanvas(tk.Canvas):
                 self.coords(self.img_item, self.ox, self.oy)
                 self.itemconfig(self.img_item, image=self.base_img_tk)
         except tk.TclError:
-            # 旧 id 已无效，重建
             self.img_item = self.create_image(self.ox, self.oy, image=self.base_img_tk, anchor="nw")
+
+        # ★ 保证底图在最底层，避免组合重绘瑕疵
+        try:
+            self.tag_lower(self.img_item)
+        except Exception:
+            pass
 
     def _to_canvas(self, x_img: float, y_img: float) -> tuple[float, float]:
         return self.ox + x_img * self.s, self.oy + y_img * self.s
@@ -343,8 +496,8 @@ class RightAnnoCanvas(tk.Canvas):
     def _create_arrows_from_marks(self, lane_marks: list[list[float]], pos_cache: dict | None = None):
         """
         依据 lane_marks 在非标准道生成箭头（默认 X 在泳道左分界线）。
-        —— 改造点：若 pos_cache 中存在“已拖动且未被移除”的箭头（以 lane_idx+mw 作为键），
-        则优先使用缓存的 x_gel,y_gel 复位位置，不再改动其位置。
+        —— 改造点：若 pos_cache 中命中“已拖动”的箭头（以 lane_idx+mw 为键），
+        则以缓存位置还原，并且 moved=True，以便后续重绘/组合时持续保留。
         """
         # 真实泳道数
         if self.bounds is not None and isinstance(self.bounds, np.ndarray):
@@ -356,8 +509,8 @@ class RightAnnoCanvas(tk.Canvas):
 
         skip_idx = max(0, self.ladder_lane - 1)
         target_lane_idx = [i for i in range(real_nlanes) if i != skip_idx]
-
         use_k = min(len(target_lane_idx), len(lane_marks))
+
         Hg, Wg = self.gel_size
         H_img, W_img = self.base_img_bgr.shape[:2]
 
@@ -376,155 +529,183 @@ class RightAnnoCanvas(tk.Canvas):
                     continue
 
                 # 默认位置（基于拟合将 mw 映射至 y_gel；x 取该 y 的“泳道左分界线”）
-                
                 y_gel_default = int(round(self._mw_to_y_gel(v)))
                 y_img_default = self.panel_top_h + y_gel_default
-
                 xl_gel = self._lane_left_x_at_y_gel(y_gel_default, lane_idx)
                 x_img_default = self.x_offset + xl_gel
 
-                # 若 pos_cache 命中“已拖动箭头”，则按缓存位置还原（保持视觉位置不变）
+                # 若 pos_cache 命中“已拖动箭头”，按缓存位置还原，并显式标记 moved=True
                 x_img, y_img = x_img_default, y_img_default
+                moved_flag = False
                 if pos_cache:
                     entry = pos_cache.get(_key(lane_idx, v))
                     if entry:
                         x_img = self.x_offset + float(entry.get("x_gel", xl_gel))
                         y_img = self.panel_top_h + float(entry.get("y_gel", y_gel_default))
+                        moved_flag = True  # ★ 关键：保留“已拖动”状态
 
                 # 夹取到图像范围内
                 x_img = float(np.clip(x_img, 0, W_img - 1))
                 y_img = float(np.clip(y_img, 0, H_img - 1))
 
-                # 创建箭头（新增 meta 字段 moved=False；若为缓存还原，不改变 moved 状态，仍置 False）
-                self._add_arrow(x_img, y_img, lane_idx, v)
+                # 创建箭头（★ 携带 moved_flag）
+                self._add_arrow(x_img, y_img, lane_idx, v, moved=moved_flag)
+
 
     def _arrow_canvas_points(self, x_img: float, y_img: float) -> list[float]:
-        """返回画布坐标下的三角形顶点序列（flat list）。"""
-        # 以像素坐标为准的箭头尺寸（未缩放）
-        w_px, h_px = 50, 10
-        tip_img = (x_img, y_img)
-        p1_img = (tip_img[0] - w_px // 2, y_img + h_px)
-        p2_img = (tip_img[0] - w_px // 2, y_img - h_px)
-        pts_img = [p1_img, p2_img, tip_img]
-        pts_canvas = []
+        """
+        返回 Canvas 坐标系下的多边形顶点（flat list）。
+        会根据 self.arrow_style 选择不同形状。
+        """
+        pts_img = self._shape_points_img(self.arrow_style, x_img, y_img)
+        pts_canvas: list[float] = []
         for (x, y) in pts_img:
             cx, cy = self._to_canvas(x, y)
             pts_canvas.extend([cx, cy])
         return pts_canvas
 
 
-
     def _add_arrow(self, x_img: float, y_img: float, lane_idx: int, mw: float,
-                color: tuple[int, int, int] = (255, 64, 64)):
+                color: tuple[int, int, int] = (255, 64, 64),
+                moved: bool = False):
         """
-        在Canvas上新增一个箭头并绑定拖拽事件，同时创建配套红色可调方框+黄色灰度和。
-        —— 改造点：为每个箭头增加 'moved': False 状态位，用户拖动后会置 True。
+        在Canvas上新增一个箭头并绑定拖拽事件；支持保留 moved 状态。
         """
-        # Tk 颜色（BGR -> #RRGGBB）
         r, g, b = (255, 64, 64)
         pts = self._arrow_canvas_points(x_img, y_img)
-        aid = self.create_polygon(pts, fill=f"#{r:02x}{g:02x}{b:02x}", outline="#ffffff", width=1, smooth=False)
-
+        # ★ outline="" 彻底取消轮廓，避免 1px 栅格化残点
+        aid=self.create_polygon(pts, fill="#FF0000", outline="#ff0000", width=1, smooth=False)
         meta = {
             "id": aid,
             "lane_idx": int(lane_idx),
             "x_img": float(x_img),
             "y_img": float(y_img),
             "mw": float(mw),
-            "moved": False,         # ★ 新增：是否被用户拖动过
+            "moved": bool(moved),
         }
         self.arrows.append(meta)
-
-        # 仅绑定该箭头的拖拽事件（竖向拖拽）
-        self.tag_bind(aid, "<ButtonPress-1>", lambda e, a=meta: self._on_drag_start(e, a))
-        self.tag_bind(aid, "<B1-Motion>",     lambda e, a=meta: self._on_drag_move(e, a))
-        self.tag_bind(aid, "<ButtonRelease-1>", lambda e, a=meta: self._on_drag_end(e, a))
-
-        # === 若需要：为该箭头同步创建一个红色可调矩形框 + 顶部黄色文字 ===
-        # self._create_box_for_arrow(meta)
+        # 绑定拖拽
+        self.tag_bind(aid, "<ButtonPress-1>",  lambda e, a=meta: self._on_drag_start(e, a))
+        self.tag_bind(aid, "<B1-Motion>",      lambda e, a=meta: self._on_drag_move(e, a))
+        self.tag_bind(aid, "<ButtonRelease-1>",lambda e, a=meta: self._on_drag_end(e, a))
+        # ★ 保证箭头在底图之上
+        try: self.tag_raise(aid)
+        except Exception: pass
 
     def _redraw_arrows(self):
         """画布变化时，按照最新缩放/偏移重画箭头形状。"""
+        if not self.arrows:
+            return
         for a in self.arrows:
             lane_idx = a["lane_idx"]
-            y_img = a["y_img"]
+            y_img = float(a["y_img"])
+            # 若未显式记录 x_img，则动态取该 y 的左分界线（支持斜界线）
             if "x_img" in a:
                 x_img = float(a["x_img"])
             else:
-                # ★ 改动点：默认 X = 左分界线（随 y 逐行计算，支撑斜界线）
                 xg = self._lane_left_x_at_y_gel(int(round(y_img - self.panel_top_h)), lane_idx)
                 x_img = float(self.x_offset + xg)
-
-            # 限制在整张图可见区域
+            # 限制可见范围
             H, W = self.base_img_bgr.shape[:2]
             x_img = float(np.clip(x_img, 0, W - 1))
             pts = self._arrow_canvas_points(x_img, y_img)
-            self.coords(a["id"], *pts)
 
+
+
+
+    # 在 RightAnnoCanvas 类内新增此工具方法（位置不拘）
+    def _arrow_key(self, arrow_meta: dict):
+        """
+        生成可稳定识别箭头的绑定键： (lane_idx, mw:float)
+        lane_idx 与 mw 共同唯一标识一枚箭头。
+        """
+        try:
+            li = int(arrow_meta.get("lane_idx", -1))
+            mw = float(arrow_meta.get("mw", float("nan")))
+            if li < 0 or not np.isfinite(mw):
+                return None
+            return (li, mw)
+        except Exception:
+            return None
 
 # === 方框：创建/重绘/事件/灰度和 ===
-    def _create_box_for_arrow(self, arrow_meta: dict):
+    def _create_box_for_arrow(self, arrow_meta: dict, preset: dict=None):
         """
-        基于箭头位置，创建默认尺寸的红色可调矩形框及顶部黄色文字。
-        初始策略：在箭头尖端左侧，宽40px、高24px，纵向居中于箭头。
+        基于箭头位置创建红色可调矩形框及顶部黄色文字。
+        新增：
+        - 支持 preset={'x_gel','y_gel','w','h'} 以“凝胶坐标”为准恢复方框位置；
+        - 在 box 中同时记录 x_img/y_img 与 x_gel/y_gel，其中 x_gel/y_gel 为跨场景复原的权威坐标；
+        - 记录 bind_key 用于与箭头关联（箭头被删除则本框不再恢复）。
         """
         if self.base_img_bgr is None:
             return
 
-        # 箭头尖端在像素坐标（未缩放）
-        x_img = float(arrow_meta.get("x_img", 0.0))
-        y_img = float(arrow_meta.get("y_img", 0.0))
-
-        # 初始尺寸与位置（放在箭头尖端左侧）
-        w0, h0 = 40.0, 24.0
-        margin = 6.0
-        # 箭头的“tip”在 _arrow_canvas_points 里是 (x_img-20, y_img)
-        tip_x = x_img
-        bx = tip_x - margin - w0 +40  # 左上 x
-        by = y_img - h0 / 2.0      # 左上 y
-
-        # 限制在整图范围内
         H, W = self.base_img_bgr.shape[:2]
-        bx = float(np.clip(bx, 0, max(0, W - w0)))
-        by = float(np.clip(by, 0, max(0, H - h0)))
+        # ——— 计算初始/恢复位置（像素坐标系 & 凝胶坐标系） ———
+        if preset and all(k in preset for k in ("x_gel","y_gel","w","h")):
+            # 以 preset 的凝胶坐标为准，换算到当前像素坐标
+            x_gel = float(preset["x_gel"])
+            y_gel = float(preset["y_gel"])
+            w0 = float(preset["w"]); h0 = float(preset["h"])
+            bx = float(self.x_offset + x_gel)
+            by = float(self.panel_top_h + y_gel)
+            # 限制到图像范围
+            bx = float(np.clip(bx, 0, max(0, W - w0)))
+            by = float(np.clip(by, 0, max(0, H - h0)))
+        else:
+            # 沿用原逻辑：将方框放在箭头尖端左侧
+            x_img = float(arrow_meta.get("x_img", 0.0))
+            y_img = float(arrow_meta.get("y_img", 0.0))
+            w0, h0 = 40.0, 24.0
+            margin = 6.0
+            tip_x = x_img
+            bx = tip_x - margin - w0 + 40  # 左上 x（保持你原先修正）
+            by = y_img - h0 / 2.0
+            bx = float(np.clip(bx, 0, max(0, W - w0)))
+            by = float(np.clip(by, 0, max(0, H - h0)))
+            # 对应的凝胶坐标
+            x_gel = bx - self.x_offset
+            y_gel = by - self.panel_top_h
 
         rect_id = self.create_rectangle(0, 0, 0, 0, outline="#ff4545", width=2)
-        # 四角手柄（小方块）
-        hs = 5
         handles = {
             "nw": self.create_rectangle(0, 0, 0, 0, outline="#ff4545", fill="#ff4545", width=1),
             "ne": self.create_rectangle(0, 0, 0, 0, outline="#ff4545", fill="#ff4545", width=1),
             "se": self.create_rectangle(0, 0, 0, 0, outline="#ff4545", fill="#ff4545", width=1),
             "sw": self.create_rectangle(0, 0, 0, 0, outline="#ff4545", fill="#ff4545", width=1),
         }
-        text_id = self.create_text(0, 0, text="", fill="#ffd800", anchor="s")  # s=底对齐，显示在框上方
+        text_id = self.create_text(0, 0, text="", fill="#ffd800", anchor="s")
 
         box = {
             "rect_id": rect_id,
             "text_id": text_id,
             "handles": handles,
-            "x_img": bx, "y_img": by, "w": w0, "h": h0,
-            "arrow": arrow_meta
+            # —— 双坐标记录 ——（x_gel/y_gel 为权威，x_img/y_img 用于绘制与导出）
+            "x_gel": float(x_gel), "y_gel": float(y_gel),
+            "x_img": float(bx),    "y_img": float(by),
+            "w": float(w0), "h": float(h0),
+            # 绑定箭头元信息 & 绑定键
+            "arrow": arrow_meta,
+            "bind_key": self._arrow_key(arrow_meta),
         }
         self.boxes.append(box)
 
-        # 初次定位/绘制
+        # 初次绘制
         self._draw_box(box)
 
         # 绑定事件：矩形整体拖拽
-        self.tag_bind(rect_id, "<ButtonPress-1>",  lambda e, b=box: self._on_box_press(e, b, mode="move", corner=None))
+        self.tag_bind(rect_id, "<ButtonPress-1>",  lambda e, b=box: self._on_box_press(e, b, mode="move",   corner=None))
         self.tag_bind(rect_id, "<B1-Motion>",      lambda e, b=box: self._on_box_drag(e, b))
-        self.tag_bind(rect_id, "<ButtonRelease-1>", lambda e, b=box: self._on_box_release(e, b))
+        self.tag_bind(rect_id, "<ButtonRelease-1>",lambda e, b=box: self._on_box_release(e, b))
 
         # 手柄拖拽（四角缩放）
         self.tag_bind(handles["nw"], "<ButtonPress-1>", lambda e, b=box: self._on_box_press(e, b, mode="resize", corner="nw"))
         self.tag_bind(handles["ne"], "<ButtonPress-1>", lambda e, b=box: self._on_box_press(e, b, mode="resize", corner="ne"))
         self.tag_bind(handles["se"], "<ButtonPress-1>", lambda e, b=box: self._on_box_press(e, b, mode="resize", corner="se"))
         self.tag_bind(handles["sw"], "<ButtonPress-1>", lambda e, b=box: self._on_box_press(e, b, mode="resize", corner="sw"))
-
         for c in ("nw","ne","se","sw"):
             hid = handles[c]
-            self.tag_bind(hid, "<B1-Motion>",      lambda e, b=box: self._on_box_drag(e, b))
+            self.tag_bind(hid, "<B1-Motion>",       lambda e, b=box: self._on_box_drag(e, b))
             self.tag_bind(hid, "<ButtonRelease-1>", lambda e, b=box: self._on_box_release(e, b))
 
     def _redraw_boxes(self):
@@ -579,14 +760,26 @@ class RightAnnoCanvas(tk.Canvas):
             self._box_drag.update({"box": None, "mode": None, "corner": None})
 
     def _draw_box(self, box: dict):
-        """根据当前缩放/偏移，将 box 的图像坐标绘制为 Canvas 坐标，并更新黄色文字（灰度和）。"""
-        x, y, w, h = box["x_img"], box["y_img"], box["w"], box["h"]
+        """
+        根据当前缩放/偏移，将 box 的图像坐标绘制为 Canvas 坐标，并更新黄色文字（灰度和）。
+        新增：以 box['x_gel','y_gel'] + 当前 x_offset/panel_top_h 计算 x_img/y_img，并回填。
+        """
+        # 先由凝胶坐标换算像素坐标（权威 -> 表现）
+        x = float(self.x_offset + float(box.get("x_gel", box.get("x_img", 0.0) - self.x_offset)))
+        y = float(self.panel_top_h + float(box.get("y_gel", box.get("y_img", 0.0) - self.panel_top_h)))
+        w = float(box.get("w", 0.0)); h = float(box.get("h", 0.0))
+
+        # 回填像素坐标，供度量/兼容路径使用
+        box["x_img"], box["y_img"] = x, y
+
+        # 转为 Canvas 坐标
         x1, y1 = self._to_canvas(x, y)
         x2, y2 = self._to_canvas(x + w, y + h)
+
         # 更新矩形
         self.coords(box["rect_id"], x1, y1, x2, y2)
 
-        # 更新手柄（四角小方块）
+        # 更新手柄
         hs = 2
         corners = {
             "nw": (x1, y1),
@@ -597,13 +790,14 @@ class RightAnnoCanvas(tk.Canvas):
         for k, (cx, cy) in corners.items():
             self.coords(box["handles"][k], cx - hs, cy - hs, cx + hs, cy + hs)
 
-        # 计算灰度和，并更新文字在矩形上方居中（anchor="s"）
+        # 计算灰度和，更新文本位置
         val = self._gray_sum_in_box(box)
         txt = f"{int(val)}"
         cx = (x1 + x2) / 2.0
-        ty = y1 - 4  # 略高于顶部
+        ty = y1 - 4
         self.coords(box["text_id"], cx, ty)
         self.itemconfig(box["text_id"], text=txt)
+
 
     def _on_box_press(self, evt, box: dict, mode: str, corner: str | None):
         """开始拖拽/缩放方框。"""
@@ -616,13 +810,16 @@ class RightAnnoCanvas(tk.Canvas):
         self._box_drag["orig"] = (box["x_img"], box["y_img"], box["w"], box["h"])
 
     def _on_box_drag(self, evt, box: dict):
-        """拖拽过程：平移或按角缩放。"""
+        """
+        拖拽过程：平移或按角缩放。
+        新增：任何位置更新后，除更新 x_img/y_img 外，同时更新 x_gel/y_gel= x_img - x_offset, y_img - panel_top_h，
+            以保证跨场景复原的独立位置记录。
+        """
         if self._box_drag["box"] is not box:
             return
         ix, iy = self._to_img(evt.x, evt.y)
         sx, sy = self._box_drag["start_img"]
         dx, dy = float(ix - sx), float(iy - sy)
-
         x0, y0, w0, h0 = self._box_drag["orig"]
         H, W = self.base_img_bgr.shape[:2]
         min_w, min_h = 6.0, 6.0
@@ -632,7 +829,6 @@ class RightAnnoCanvas(tk.Canvas):
             ny = np.clip(y0 + dy, 0, max(0, H - h0))
             box["x_img"], box["y_img"] = float(nx), float(ny)
         else:
-            # 按角缩放：根据 corner 决定哪个角固定
             corner = self._box_drag["corner"]
             if corner == "nw":
                 nx1 = np.clip(x0 + dx, 0, x0 + w0 - min_w)
@@ -659,6 +855,11 @@ class RightAnnoCanvas(tk.Canvas):
                 box["h"] = ny2 - y0
                 box["x_img"], box["y_img"] = float(nx1), float(y0)
 
+        # ★ 同步更新凝胶坐标（权威记录）
+        box["x_gel"] = float(box["x_img"] - self.x_offset)
+        box["y_gel"] = float(box["y_img"] - self.panel_top_h)
+
+        # 重绘
         self._draw_box(box)
 
     def _on_box_release(self, _evt, _box: dict):
@@ -874,7 +1075,7 @@ class RightAnnoCanvas(tk.Canvas):
         # 画布坐标 → 图像坐标
         x_img, y_img = self._to_img(evt.x, evt.y)
 
-        # 边界：Y 限制在 gel 有效高度（不进入上方白板），X 限制在整图宽
+        # 边界：Y 在 gel 高度内；X 在整图宽度内
         H, W = self.base_img_bgr.shape[:2]
         Hg, Wg = self.gel_size
         ymin = self.panel_top_h
@@ -882,15 +1083,20 @@ class RightAnnoCanvas(tk.Canvas):
         x_img = float(np.clip(x_img, 0, W - 1))
         y_img = float(np.clip(y_img, ymin, ymax))
 
-        # 保存坐标并重绘箭头
+        # 保存并重绘
         arrow_meta["x_img"] = x_img
         arrow_meta["y_img"] = y_img
-
-        # ★ 关键：一旦发生拖动，标记 moved=True，以便后续渲染回放保持位置
         arrow_meta["moved"] = True
 
         pts = self._arrow_canvas_points(x_img, y_img)
         self.coords(arrow_meta["id"], *pts)
+
+        # ★ 抬高并请求一次 UI 刷新，减少残影概率
+        try:
+            self.tag_raise(arrow_meta["id"])
+            self.update_idletasks()
+        except Exception:
+            pass
 
 
 
@@ -1141,6 +1347,289 @@ class App(tk.Tk):
 
         _reload_list()
 
+    def open_right_table_editor(self):
+        """
+        打开“右侧表格”编辑窗口：
+        - 直接粘贴 Excel 多行多列内容（Tab 分隔，多行换行）
+        - 支持选项：首行表头、显示网格、对齐方式、字号（像素字高）
+        - 确认后仅做“组合”（不重复核心运算），与底注逻辑一致
+        """
+        win = tk.Toplevel(self)
+        win.title("Edit right-side table (paste from Excel)")
+        win.transient(self); win.grab_set()
+        win.resizable(True, True)
+
+        frm = ttk.Frame(win)
+        frm.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        ttk.Label(frm, text="Paste here (Excel -> Copy; Click here -> Ctrl+V):", justify="left").pack(anchor="w")
+        txt = tk.Text(frm, height=12, width=64, wrap="none")
+        txt.pack(fill=tk.BOTH, expand=True, pady=(6, 6))
+
+        # 预填
+        try:
+            pre = getattr(self, "right_table_text", "") or ""
+            if pre:
+                txt.insert("1.0", pre)
+        except Exception:
+            pass
+
+        # 选项区
+        opt = ttk.LabelFrame(frm, text="Options")
+        opt.pack(fill=tk.X, pady=(6, 0))
+
+        var_header = tk.BooleanVar(value=True)
+        var_grid   = tk.BooleanVar(value=True)
+        var_align  = tk.StringVar(value="center")
+        # 字号（像素字高）
+        design = self._get_design_params()
+        var_cap   = tk.IntVar(value=int(design.get("bottom_cap_px", 28)))
+
+        # 回显历史配置
+        prev_cfg = getattr(self, "right_table_opts", None) or {}
+        if "has_header" in prev_cfg: var_header.set(bool(prev_cfg.get("has_header")))
+        if "grid" in prev_cfg:       var_grid.set(bool(prev_cfg.get("grid")))
+        if "align" in prev_cfg:      var_align.set(str(prev_cfg.get("align") or "center"))
+        if "cap_px" in prev_cfg and isinstance(prev_cfg["cap_px"], (int, float)):
+            var_cap.set(int(prev_cfg["cap_px"]))
+
+        row1 = ttk.Frame(opt); row1.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Checkbutton(row1, text="First row is header (gray)", variable=var_header).pack(side=tk.LEFT)
+        ttk.Checkbutton(row1, text="Show grid lines", variable=var_grid).pack(side=tk.LEFT, padx=(12, 0))
+
+        row2 = ttk.Frame(opt); row2.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(row2, text="Align").pack(side=tk.LEFT)
+        cb_align = ttk.Combobox(row2, textvariable=var_align, state="readonly", values=["left", "center", "right"], width=8)
+        cb_align.pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(row2, text="Font height (px)").pack(side=tk.LEFT)
+        sp_cap = ttk.Spinbox(row2, textvariable=var_cap, from_=10, to=60, increment=1, width=6)
+        sp_cap.pack(side=tk.LEFT, padx=(6, 0))
+
+        # 按钮区
+        btns = ttk.Frame(frm)
+        btns.pack(fill=tk.X, pady=(10, 0))
+
+        def do_clear():
+            txt.delete("1.0", "end")
+
+        def do_cancel():
+            win.destroy()
+
+        def do_ok():
+            try:
+                self.right_table_text = txt.get("1.0", "end")
+            except Exception:
+                self.right_table_text = ""
+            self.right_table_opts = {
+                "has_header": bool(var_header.get()),
+                "grid": bool(var_grid.get()),
+                "align": (var_align.get() or "center"),
+                "cap_px": int(var_cap.get()),
+            }
+            win.destroy()
+            # 组合（若缓存可复用）——失败则回退完整渲染
+            try:
+                self.recompose_using_cache()
+            except Exception:
+                try: self.render_current()
+                except Exception: pass
+
+        ttk.Button(btns, text="Clear", command=do_clear).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Cancel", command=do_cancel).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Confirm", command=do_ok).pack(side=tk.RIGHT, padx=(0, 6))
+
+        win.bind("<Escape>", lambda e: (do_cancel(), "break"))
+
+    def _attach_right_table_panel(
+        self,
+        img_bgr: np.ndarray,
+        table_text: str,
+        has_header: bool = True,
+        show_grid: bool = True,
+        align: str = "center",      # "left" / "center" / "right"
+        cap_px: int = None,         # 像素字高（若为 None 则沿用 bottom_note 的字号）
+        cell_pad_x: int = 12,       # 单元格左右内边距
+        cell_pad_y: int = 8,        # 单元格上下内边距
+        line_color: tuple = (0, 0, 0)  # BGR
+    ) -> np.ndarray:
+        """
+        将“表格”（来自 Excel 粘贴的文本）以白底网格的形式**拼接到图像右侧**。
+        - 默认首行为表头（浅灰底），可关闭。
+        - 自动按每列最长文本决定列宽；各行高度统一为该行内最大文本高度 + 内边距。
+        - 若表格总高度 ≠ 图像高度，将对较短一侧**底部补白**，保持**等高后水平拼接**。
+        """
+        import numpy as np, cv2
+        from PIL import Image, ImageDraw, ImageFont
+
+        if img_bgr is None or not isinstance(img_bgr, np.ndarray) or img_bgr.size == 0:
+            return img_bgr
+
+        raw = (table_text or "").replace("\r\n", "\n").replace("\r", "\n")
+        rows_raw = raw.split("\n")
+        # 解析：优先 \t；无 \t 时回退逗号/分号/竖线
+        rows = []
+        for ln in rows_raw:
+            s = ln
+            if "\t" in s:
+                cells = s.split("\t")
+            else:
+                s2 = s.replace("，", ",").replace("；", ";").replace("、", ",")
+                if "," in s2:
+                    cells = s2.split(",")
+                elif ";" in s2:
+                    cells = s2.split(";")
+                elif "|" in s2:
+                    cells = s2.split("|")
+                else:
+                    cells = [s2]
+            rows.append([c.strip() for c in cells])
+
+        # 去掉完全空行；对齐列数
+        rows = [r for r in rows if any((c.strip() for c in r))]
+        if not rows:
+            return img_bgr
+
+        max_cols = max(len(r) for r in rows)
+        for r in rows:
+            if len(r) < max_cols:
+                r.extend([""] * (max_cols - len(r)))
+
+        H_img, W_img = img_bgr.shape[:2]
+        design = self._get_design_params()
+        if cap_px is None:
+            cap_px = int(design.get("bottom_cap_px", 28))  # 与底注字号保持视觉一致
+
+        # 字体（优先 TTF）
+        font_path = self._find_font_ttf()
+        use_pil = font_path is not None
+        if use_pil:
+            try:
+                font = ImageFont.truetype(font_path, size=max(12, int(cap_px)))
+            except Exception:
+                use_pil = False
+
+        # 先测量列宽与行高
+        def _measure_pil(text: str):
+            if not text:
+                text = " "
+            tmp = Image.new("RGB", (8, 8), "white")
+            drw = ImageDraw.Draw(tmp)
+            bbox = drw.textbbox((0, 0), text, font=font)
+            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            return max(1, w), max(1, h)
+
+        def _measure_cv(text: str):
+            if not text:
+                text = " "
+            f = cv2.FONT_HERSHEY_SIMPLEX
+            scale = self._font_scale_for_cap_height_px(cap_px, font=f, thickness=2)
+            (tw, th), base = cv2.getTextSize(text, f, scale, 2)
+            return max(1, tw), max(1, th)
+
+        meas = _measure_pil if use_pil else _measure_cv
+
+        col_widths = [0] * max_cols
+        row_heights = [0] * len(rows)
+        for i, r in enumerate(rows):
+            max_h = 0
+            for j, cell in enumerate(r):
+                tw, th = meas(cell)
+                col_widths[j] = max(col_widths[j], tw + 2 * cell_pad_x)
+                max_h = max(max_h, th + 2 * cell_pad_y)
+            row_heights[i] = max(1, max_h)
+
+        # 组装面板
+        grid_w = sum(col_widths) + (1 if show_grid else 0)  # 右侧最外边线
+        grid_h = sum(row_heights) + (1 if show_grid else 0) # 底部最外边线
+
+        # 先用 PIL 绘制（文字效果较好），后转 BGR
+        panel_img = Image.new("RGB", (grid_w, grid_h), "white")
+        draw = ImageDraw.Draw(panel_img)
+
+        # 画表头背景
+        header_rows = 1 if has_header and len(rows) >= 1 else 0
+        if header_rows == 1:
+            y_top = 0
+            hdr_h = row_heights[0]
+            draw.rectangle([(0, y_top), (grid_w - 1, y_top + hdr_h - 1)], fill=(240, 240, 240))
+
+        # 画网格线
+        if show_grid:
+            # 外框与内线
+            # 横线
+            y = 0
+            draw.line([(0, y), (grid_w - 1, y)], fill=(0, 0, 0), width=1)
+            for h in row_heights:
+                y += h
+                draw.line([(0, y), (grid_w - 1, y)], fill=(0, 0, 0), width=1)
+            # 竖线
+            x = 0
+            draw.line([(x, 0), (x, grid_h - 1)], fill=(0, 0, 0), width=1)
+            for w in col_widths:
+                x += w
+                draw.line([(x, 0), (x, grid_h - 1)], fill=(0, 0, 0), width=1)
+
+        # 文本对齐计算
+        def _x_for_cell(text_w: int, col_left: int, col_w: int):
+            if align == "left":
+                return col_left + cell_pad_x
+            elif align == "right":
+                return col_left + max(0, col_w - text_w - cell_pad_x)
+            else:
+                return col_left + max(0, (col_w - text_w) // 2)
+
+        # 绘制文本
+        y_cursor = 0
+        for i, r in enumerate(rows):
+            x_cursor = 0
+            for j, cell in enumerate(r):
+                col_w = col_widths[j]
+                # 文本宽高（再测一次，避免使用缓存造成误差）
+                if use_pil:
+                    tw, th = _measure_pil(cell)
+                    tx = _x_for_cell(tw, x_cursor, col_w)
+                    ty = y_cursor + max(0, (row_heights[i] - th) // 2)
+                    if has_header and i == 0:
+                        # 表头文字加粗：简单策略——稍加描边
+                        draw.text((tx, ty), cell or " ", fill=(0, 0, 0), font=font, stroke_width=1, stroke_fill=(0, 0, 0))
+                    else:
+                        draw.text((tx, ty), cell or " ", fill=(0, 0, 0), font=font)
+                else:
+                    # OpenCV 回退（英文字体表现可靠，中文退化为?）
+                    f = cv2.FONT_HERSHEY_SIMPLEX
+                    scale = self._font_scale_for_cap_height_px(cap_px, font=f, thickness=2)
+                    (tw, th), base = cv2.getTextSize(cell if cell else " ", f, scale, 2)
+                    tx = _x_for_cell(tw, x_cursor, col_w)
+                    ty = y_cursor + max(0, (row_heights[i] + th) // 2)  # 基线
+                    cv = cv2.cvtColor(np.array(panel_img), cv2.COLOR_RGB2BGR)
+                    try:
+                        cv2.putText(cv, cell if cell else " ", (tx, ty), f, scale, line_color, 2, cv2.LINE_AA)
+                    except Exception:
+                        cv2.putText(cv, "?", (tx, ty), f, scale, line_color, 2, cv2.LINE_AA)
+                    panel_img = Image.fromarray(cv2.cvtColor(cv, cv2.COLOR_BGR2RGB))
+                    draw = ImageDraw.Draw(panel_img)  # 续画其他单元格
+                x_cursor += col_w
+            y_cursor += row_heights[i]
+
+        panel_bgr = cv2.cvtColor(np.array(panel_img), cv2.COLOR_RGB2BGR)
+
+        # 与主图等高：较短者底部补白
+        Hp, Wp = panel_bgr.shape[:2]
+        if Hp != H_img:
+            if Hp < H_img:
+                pad = np.full((H_img - Hp, Wp, 3), 255, dtype=np.uint8)
+                panel_bgr = np.vstack([panel_bgr, pad])
+                Hp = H_img
+            else:
+                pad = np.full((Hp, W_img, 3), 255, dtype=np.uint8)
+                img_bgr = np.vstack([img_bgr, pad])
+                H_img = Hp
+
+        # 水平拼接到右侧
+        out = np.concatenate([img_bgr, panel_bgr], axis=1)
+        return out
+
+
     # -------------------- UI：左侧 -------------------- #
     def _build_left(self):
         # Fixed-width container
@@ -1234,8 +1723,8 @@ class App(tk.Tk):
 
         self.var_show_green = tk.BooleanVar(value=False)
         self.var_axis = tk.StringVar(value="left")
-        ttk.Checkbutton(f_marker, text="Show green separators", variable=self.var_show_green,
-                        command=self.on_toggle_show_green).pack(anchor="w", padx=6, pady=2)
+        #ttk.Checkbutton(f_marker, text="Show green separators", variable=self.var_show_green,
+        #                command=self.on_toggle_show_green).pack(anchor="w", padx=6, pady=2)
 
         self.var_show_boxes = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -1243,6 +1732,18 @@ class App(tk.Tk):
             variable=self.var_show_boxes, command=self.on_toggle_show_boxes
         ).pack(anchor="w", padx=6, pady=2)
         ttk.Button(f_marker,text="Reset all arrows to default",command=self.reset_all_arrows).pack(fill=tk.X, padx=6, pady=4)
+        
+        row2 = ttk.Frame(f_marker); row2.pack(fill=tk.X, padx=6, pady=(2,2))
+        ttk.Label(row2, text="Arrow shape").pack(side=tk.LEFT)
+        # 采用可读文本作为界面值，事件里做映射
+        self.var_arrow_style = getattr(self, "var_arrow_style", tk.StringVar(value="Arrow (→)"))
+        self.cb_arrow_style = ttk.Combobox(
+            row2, textvariable=self.var_arrow_style, state="readonly",
+            values=["Arrow (→)", "Diagonal ↗", "Star (★)"], width=18
+        )
+        self.cb_arrow_style.pack(side=tk.RIGHT)
+        self.cb_arrow_style.bind("<<ComboboxSelected>>", self.on_change_arrow_style)
+
         # ---- Actions ----
         f_action = ttk.Frame(left)
         f_action.pack(fill=tk.X, pady=10)
@@ -1256,6 +1757,8 @@ class App(tk.Tk):
         f_lab.pack(fill=tk.X, pady=6)
         ttk.Button(f_lab, text="Edit column names & MWs...", command=self.open_labels_editor)\
             .pack(fill=tk.X, padx=6, pady=(6, 6))
+        ttk.Button(f_lab, text="Edit right-side table...", command=self.open_right_table_editor)\
+        .pack(fill=tk.X, padx=6, pady=6)
 
         # ---- Bottom note ----
         f_note = ttk.LabelFrame(left, text="Bottom note")
@@ -1392,6 +1895,25 @@ class App(tk.Tk):
         # 回车=确定，Esc=取消
         #win.bind("<Return>", lambda e: (do_ok(), "break"))
         win.bind("<Escape>", lambda e: (do_cancel(), "break"))
+
+
+    def on_change_arrow_style(self, *_):
+        """
+        左侧下拉切换箭头样式 -> 通知右侧画布即时重绘
+        """
+        txt = (self.var_arrow_style.get() or "").strip().lower()
+        if "star" in txt or "★" in txt:
+            code = "star"
+        elif "diag" in txt or "↗" in txt:
+            code = "diag_ne"
+        else:
+            code = "tri"
+        if hasattr(self, "canvas_anno") and self.canvas_anno is not None:
+            try:
+                self.canvas_anno.set_arrow_style(code)
+            except Exception:
+                pass
+
 
     # -------------------- 自适应显示：注册 / 刷新 -------------------- #
     def _bind_autofit(self, widget: tk.Label):
@@ -2071,7 +2593,7 @@ class App(tk.Tk):
             return (M_[0,0]*x + M_[0,1]*y + M_[0,2], M_[1,0]*x + M_[1,1]*y + M_[1,2])
         cx2, cy2 = _affine_point(M, cx, cy)
         x0 = int(round(cx2 - w/2.0)); y0 = int(round(cy2 - h/2.0))
-        x1 = x0 + int(round(w));      y1 = y0 + int(round(h))
+        x1 = x0 + int(round(w)); y1 = y0 + int(round(h))
         H2, W2 = rot_img.shape[:2]
         x0 = max(0, min(x0, W2 - 1)); y0 = max(0, min(y0, H2 - 1))
         x1 = max(x0 + 1, min(x1, W2)); y1 = max(y0 + 1, min(y1, H2))
@@ -2124,7 +2646,7 @@ class App(tk.Tk):
             )
             lanes = None
 
-        # 5) 标准道检测 + 【分段线性标定】
+        # 5) 标准道检测 + 分段线性标定
         ladder_lane = max(1, min(int(self.var_ladder_lane.get()), nlanes))
         y0_roi, y1_roi = 0, None
         if bounds is not None:
@@ -2138,33 +2660,26 @@ class App(tk.Tk):
             peaks, prom = detect_bands_along_y_prominence(
                 sub, y0=y0_roi, y1=y1_roi, min_distance=20, min_prominence=10.0
             )
-
-        # 侧边标注保持“按检测到的真实 y + 输入 labels 文本”一一对应（长度较短者为准）
         ladder_peaks_for_draw = [int(round(p)) for p in peaks]
         ladder_labels_for_draw = sorted(ladder_labels_all, reverse=True)[:len(ladder_peaks_for_draw)]
 
-        # === 核心改动：分段线性模型（log10(MW)–Y），并质控 ===
         import numpy as np
         ys_sorted = sorted(int(round(float(p))) for p in peaks)
         lbs_sorted = sorted([float(x) for x in ladder_labels_all], reverse=True)
         K = min(len(ys_sorted), len(lbs_sorted))
-
-        # prominence 权重（用于可选的 a,b 兼容拟合；分段质控不强制用权重）
         if len(prom) == len(peaks) and K >= 1:
-            order_by_y = np.argsort(np.array(peaks, dtype=np.float64))  # 上->下
+            order_by_y = np.argsort(np.array(peaks, dtype=np.float64))
             w_sorted = [float(prom[i]) for i in order_by_y]
             w_used = w_sorted[:K]
         else:
             w_used = None
 
         fit_ok = False
-        a, b = 1.0, 0.0    # 兼容占位
-        calib_model = None # 分段标定模型（xk, yk）
-
+        a, b = 1.0, 0.0
+        calib_model = None
         if K >= 2:
             y_used = [float(ys_sorted[i]) for i in range(K)]
             lbl_used = [float(lbs_sorted[i]) for i in range(K)]
-            # 构建分段模型
             model = build_piecewise_log_mw_model(y_used, lbl_used)
             xk = model.get('xk', np.array([], dtype=np.float64))
             yk = model.get('yk', np.array([], dtype=np.float64))
@@ -2174,11 +2689,10 @@ class App(tk.Tk):
             if ok and xk.size >= 2:
                 calib_model = {'xk': xk, 'yk': yk}
                 fit_ok = True
-                # （可选）同时给出 a,b 以兼容老逻辑/显示，不影响实际 y 映射
-                a_fit, b_fit = fit_log_mw_irls(y_used, lbl_used, w_used, iters=6)
-                a, b = a_fit, b_fit
+            a_fit, b_fit = fit_log_mw_irls(y_used, lbl_used, w_used, iters=6)
+            a, b = a_fit, b_fit
 
-        # 6) 核心底图（侧标沿用检测真 y 位置；刻度在拟合通过时绘制）
+        # 6) 核心底图（侧标沿检测真 y；刻度在拟合通过时绘制）
         if bounds is not None:
             res = render_annotation_slanted(
                 gel_bgr, bounds, ladder_peaks_for_draw, ladder_labels_for_draw,
@@ -2205,7 +2719,6 @@ class App(tk.Tk):
             "fit_ok": bool(fit_ok),
             "tick_labels": tick_labels if fit_ok else [],
             "yaxis_side": self.var_axis.get(),
-            # === 新增：缓存分段模型 ===
             "calib_model": calib_model,
             "annotated_base_no_green": None,
             "annotated_base_with_green": None,
@@ -2233,7 +2746,7 @@ class App(tk.Tk):
                 )
                 panel_top_h = annotated_final_base.shape[0] - H0
 
-        # 计算真实 panel_w（留给右侧画布使用，避免扩白导致箭头水平漂移）
+        # 计算左白板宽度（仅在加头部面板后计算，避免被右侧拼接影响）
         panel_w_val = max(0, annotated_final_base.shape[1] - gel_bgr.shape[1])
 
         # 9) 绿线（仅绿线）
@@ -2241,7 +2754,7 @@ class App(tk.Tk):
             img_core=annotated_final_base, gel_bgr=gel_bgr,
             overlay=None, bounds=bounds, lanes=lanes,
             a=a, b=b, fit_ok=fit_ok,
-            tick_labels=self.render_cache["tick_labels"],  # 不在该函数里画刻度
+            tick_labels=self.render_cache["tick_labels"],
             yaxis_side=self.var_axis.get(),
             show_green=True,
             y_offset=panel_top_h
@@ -2256,10 +2769,31 @@ class App(tk.Tk):
             annotated_final_with_green, note_raw, allow_expand_width=True
         )
 
+        # >>> Right-side table：在添加底注之后拼接到右侧
+        rtxt = (getattr(self, "right_table_text", "") or "").strip()
+        if rtxt:
+            cfg = (getattr(self, "right_table_opts", None) or {})
+            annotated_final_base_with_note = self._attach_right_table_panel(
+                annotated_final_base_with_note,
+                rtxt,
+                has_header=bool(cfg.get("has_header", True)),
+                show_grid=bool(cfg.get("grid", True)),
+                align=str(cfg.get("align", "center")),
+                cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28)))
+            )
+            annotated_final_with_green_with_note = self._attach_right_table_panel(
+                annotated_final_with_green_with_note,
+                rtxt,
+                has_header=bool(cfg.get("has_header", True)),
+                show_grid=bool(cfg.get("grid", True)),
+                align=str(cfg.get("align", "center")),
+                cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28)))
+            )
+
         # 11) 左侧 ROI 预览
         self._set_autofit_image(self.canvas_roi_wb, gel_bgr)
 
-        # 12) 右侧交互画布 —— ★ 显式传入 calib_model ★
+        # 12) 右侧交互画布 —— 显式传入 calib_model（左板宽 panel_w_val 不受右侧表格影响）
         lane_marks_input = self.lane_marks or []
         ladder_lane_val = max(1, min(int(self.var_ladder_lane.get()), int(self.var_nlanes.get())))
         self.canvas_anno.set_scene(
@@ -2272,8 +2806,9 @@ class App(tk.Tk):
             yaxis_side=self.var_axis.get(),
             lane_marks=lane_marks_input,
             panel_top_h=panel_top_h,
-            panel_w=panel_w_val,
-            calib_model=calib_model,   # <<< 新增
+            panel_w=panel_w_val,     # 只统计左白板宽度
+            calib_model=calib_model,
+            reset_positions=True
         )
         if bool(self.var_show_boxes.get()):
             try: self.canvas_anno.set_boxes_enabled(True)
@@ -2281,7 +2816,7 @@ class App(tk.Tk):
         if bool(self.var_show_green.get()):
             self.canvas_anno.update_base_image(annotated_final_with_green_with_note)
 
-        # 13) 更新缓存导出图
+        # 13) 更新缓存导出图（已包含底注与右侧表格）
         self.render_cache.update({
             "annotated_base_no_green": annotated_final_base_with_note,
             "annotated_base_with_green": annotated_final_with_green_with_note,
@@ -2294,8 +2829,6 @@ class App(tk.Tk):
                 "The Y-axis molecular weight scale was not plotted this time (fitting failed quality control), and no draggable arrow is generated on the right side."
             )
 
-
-
     def recompose_using_cache(self):
         rc = getattr(self, "render_cache", None) or {}
         core = rc.get("core_no_green", None)
@@ -2305,6 +2838,7 @@ class App(tk.Tk):
             except Exception:
                 pass
             return
+
         gel_bgr = rc.get("gel_bgr", None)
         bounds = rc.get("bounds", None)
         lanes = rc.get("lanes", None)
@@ -2313,7 +2847,7 @@ class App(tk.Tk):
         fit_ok = bool(rc.get("fit_ok", False))
         tick_lbls = rc.get("tick_labels", [])
         yaxis_side = rc.get("yaxis_side", "left")
-        calib_model = rc.get("calib_model", None)  # <<< 取出分段模型
+        calib_model = rc.get("calib_model", None)
 
         # 1) 顶部列名（如启用）
         base_img = core
@@ -2337,7 +2871,7 @@ class App(tk.Tk):
                 )
                 panel_top_h = base_img.shape[0] - H0
 
-        # 面板宽
+        # 面板宽（左白板；此时尚未拼右侧表格）
         try:
             panel_w_val = max(0, base_img.shape[1] - gel_bgr.shape[1])
         except Exception:
@@ -2366,7 +2900,29 @@ class App(tk.Tk):
         else:
             with_green_note = None
 
-        # 4) 刷新右侧交互画布 —— ★ 传入 calib_model
+        # >>> Right-side table：在添加底注之后拼接到右侧
+        rtxt = (getattr(self, "right_table_text", "") or "").strip()
+        if rtxt:
+            cfg = (getattr(self, "right_table_opts", None) or {})
+            base_with_note = self._attach_right_table_panel(
+                base_with_note,
+                rtxt,
+                has_header=bool(cfg.get("has_header", True)),
+                show_grid=bool(cfg.get("grid", True)),
+                align=str(cfg.get("align", "center")),
+                cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28)))
+            )
+            if want_green and with_green_note is not None:
+                with_green_note = self._attach_right_table_panel(
+                    with_green_note,
+                    rtxt,
+                    has_header=bool(cfg.get("has_header", True)),
+                    show_grid=bool(cfg.get("grid", True)),
+                    align=str(cfg.get("align", "center")),
+                    cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28)))
+                )
+
+        # 4) 刷新右侧交互画布（panel_w 只给左白板，不含右侧表格宽度）
         ladder_lane_val = max(1, min(int(self.var_ladder_lane.get()), int(self.var_nlanes.get())))
         self.canvas_anno.set_scene(
             base_img_bgr=base_with_note,
@@ -2379,7 +2935,7 @@ class App(tk.Tk):
             lane_marks=(self.lane_marks or []),
             panel_top_h=panel_top_h,
             panel_w=panel_w_val,
-            calib_model=calib_model,  # <<< 新增
+            calib_model=calib_model,
         )
         if bool(self.var_show_boxes.get()):
             try: self.canvas_anno.set_boxes_enabled(True)
@@ -2392,8 +2948,6 @@ class App(tk.Tk):
             "annotated_base_no_green": base_with_note,
             "annotated_base_with_green": with_green_note or base_with_note,
         })
-
-
 
 
 
@@ -2914,7 +3468,7 @@ class App(tk.Tk):
                 s = (s.replace("，", ",").replace("；", ";")
                      .replace("、", ",").replace("\t", ",")
                      .replace(":", ",").replace("：", ","))
-                s = s.replace(";", ",").replace(" ", ",")
+                s = s.replace(";", ",")
                 toks = [t.strip() for t in s.split(",")]
                 return [t for t in toks if t]
             for ln in lines:
