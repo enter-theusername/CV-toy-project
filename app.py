@@ -2351,6 +2351,8 @@ class App(tk.Tk):
         self.gi = 1
         self.boxes = []
         self.roi_editor.set_image(self.orig_bgr)
+        self.right_table_text = ""
+        self.right_table_opts = {}
         self.run_detect()
 
 
