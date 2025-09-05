@@ -1450,13 +1450,17 @@ class App(tk.Tk):
         cap_px: int = None,         # 像素字高（若为 None 则沿用 bottom_note 的字号）
         cell_pad_x: int = 12,       # 单元格左右内边距
         cell_pad_y: int = 8,        # 单元格上下内边距
-        line_color: tuple = (0, 0, 0)  # BGR
+        line_color: tuple = (0, 0, 0),  # BGR
+        gap_px: int = 30,           # 主图与表格之间的水平空隙
+        panel_top_h: int = 0,       # 胶图上沿在整图中的 Y 偏移（像素）
+        gel_height_px: int = None   # 胶图像素高度（不含顶部面板与底注）
     ) -> np.ndarray:
         """
-        将“表格”（来自 Excel 粘贴的文本）以白底网格的形式**拼接到图像右侧**。
-        - 默认首行为表头（浅灰底），可关闭。
-        - 自动按每列最长文本决定列宽；各行高度统一为该行内最大文本高度 + 内边距。
-        - 若表格总高度 ≠ 图像高度，将对较短一侧**底部补白**，保持**等高后水平拼接**。
+        将“表格”（来自 Excel 粘贴的文本）渲染为白底网格，并拼接到图像右侧：
+        - 与主图之间插入固定 gap_px（默认 30px）白色竖条；
+        - 表格上沿与“胶图上沿”对齐（通过 panel_top_h 指定），
+        表格主体高度不超过 (整图高 - panel_top_h)，不足则底部补白，超出则裁切；
+        - 最终组合图整体高度保持不变。
         """
         import numpy as np, cv2
         from PIL import Image, ImageDraw, ImageFont
@@ -1464,9 +1468,13 @@ class App(tk.Tk):
         if img_bgr is None or not isinstance(img_bgr, np.ndarray) or img_bgr.size == 0:
             return img_bgr
 
+        H_img, W_img = img_bgr.shape[:2]
+        panel_top_h = max(0, int(panel_top_h))
+        body_avail_h = max(0, H_img - panel_top_h)  # 胶图及以下可用高度
+
+        # 解析粘贴文本（支持 \t / 逗号 / 分号 / 竖线）
         raw = (table_text or "").replace("\r\n", "\n").replace("\r", "\n")
         rows_raw = raw.split("\n")
-        # 解析：优先 \t；无 \t 时回退逗号/分号/竖线
         rows = []
         for ln in rows_raw:
             s = ln
@@ -1484,22 +1492,21 @@ class App(tk.Tk):
                     cells = [s2]
             rows.append([c.strip() for c in cells])
 
-        # 去掉完全空行；对齐列数
         rows = [r for r in rows if any((c.strip() for c in r))]
         if not rows:
-            return img_bgr
+            # 仍需插入 30px 空隙（视觉保持），但没有表格列
+            gap = np.full((H_img, max(1, gap_px), 3), 255, dtype=np.uint8)
+            return np.concatenate([img_bgr, gap], axis=1)
 
         max_cols = max(len(r) for r in rows)
         for r in rows:
             if len(r) < max_cols:
                 r.extend([""] * (max_cols - len(r)))
 
-        H_img, W_img = img_bgr.shape[:2]
+        # 字体设置
         design = self._get_design_params()
         if cap_px is None:
-            cap_px = int(design.get("bottom_cap_px", 28))  # 与底注字号保持视觉一致
-
-        # 字体（优先 TTF）
+            cap_px = int(design.get("bottom_cap_px", 28))
         font_path = self._find_font_ttf()
         use_pil = font_path is not None
         if use_pil:
@@ -1508,7 +1515,6 @@ class App(tk.Tk):
             except Exception:
                 use_pil = False
 
-        # 先测量列宽与行高
         def _measure_pil(text: str):
             if not text:
                 text = " "
@@ -1528,6 +1534,7 @@ class App(tk.Tk):
 
         meas = _measure_pil if use_pil else _measure_cv
 
+        # 计算列宽/行高
         col_widths = [0] * max_cols
         row_heights = [0] * len(rows)
         for i, r in enumerate(rows):
@@ -1538,24 +1545,22 @@ class App(tk.Tk):
                 max_h = max(max_h, th + 2 * cell_pad_y)
             row_heights[i] = max(1, max_h)
 
-        # 组装面板
-        grid_w = sum(col_widths) + (1 if show_grid else 0)  # 右侧最外边线
-        grid_h = sum(row_heights) + (1 if show_grid else 0) # 底部最外边线
+        grid_w = sum(col_widths) + (1 if show_grid else 0)
+        grid_h = sum(row_heights) + (1 if show_grid else 0)
 
-        # 先用 PIL 绘制（文字效果较好），后转 BGR
+        # 用 PIL 绘制（文本更清晰），再转 BGR
         panel_img = Image.new("RGB", (grid_w, grid_h), "white")
         draw = ImageDraw.Draw(panel_img)
 
-        # 画表头背景
+        # 表头背景
         header_rows = 1 if has_header and len(rows) >= 1 else 0
         if header_rows == 1:
             y_top = 0
             hdr_h = row_heights[0]
             draw.rectangle([(0, y_top), (grid_w - 1, y_top + hdr_h - 1)], fill=(240, 240, 240))
 
-        # 画网格线
+        # 网格线
         if show_grid:
-            # 外框与内线
             # 横线
             y = 0
             draw.line([(0, y), (grid_w - 1, y)], fill=(0, 0, 0), width=1)
@@ -1569,7 +1574,7 @@ class App(tk.Tk):
                 x += w
                 draw.line([(x, 0), (x, grid_h - 1)], fill=(0, 0, 0), width=1)
 
-        # 文本对齐计算
+        # 文本对齐
         def _x_for_cell(text_w: int, col_left: int, col_w: int):
             if align == "left":
                 return col_left + cell_pad_x
@@ -1584,50 +1589,56 @@ class App(tk.Tk):
             x_cursor = 0
             for j, cell in enumerate(r):
                 col_w = col_widths[j]
-                # 文本宽高（再测一次，避免使用缓存造成误差）
                 if use_pil:
                     tw, th = _measure_pil(cell)
                     tx = _x_for_cell(tw, x_cursor, col_w)
                     ty = y_cursor + max(0, (row_heights[i] - th) // 2)
                     if has_header and i == 0:
-                        # 表头文字加粗：简单策略——稍加描边
                         draw.text((tx, ty), cell or " ", fill=(0, 0, 0), font=font, stroke_width=1, stroke_fill=(0, 0, 0))
                     else:
                         draw.text((tx, ty), cell or " ", fill=(0, 0, 0), font=font)
                 else:
-                    # OpenCV 回退（英文字体表现可靠，中文退化为?）
+                    import numpy as np
+                    cv = cv2.cvtColor(np.array(panel_img), cv2.COLOR_RGB2BGR)
                     f = cv2.FONT_HERSHEY_SIMPLEX
                     scale = self._font_scale_for_cap_height_px(cap_px, font=f, thickness=2)
                     (tw, th), base = cv2.getTextSize(cell if cell else " ", f, scale, 2)
                     tx = _x_for_cell(tw, x_cursor, col_w)
-                    ty = y_cursor + max(0, (row_heights[i] + th) // 2)  # 基线
-                    cv = cv2.cvtColor(np.array(panel_img), cv2.COLOR_RGB2BGR)
+                    ty = y_cursor + max(0, (row_heights[i] + th) // 2)
                     try:
                         cv2.putText(cv, cell if cell else " ", (tx, ty), f, scale, line_color, 2, cv2.LINE_AA)
                     except Exception:
                         cv2.putText(cv, "?", (tx, ty), f, scale, line_color, 2, cv2.LINE_AA)
                     panel_img = Image.fromarray(cv2.cvtColor(cv, cv2.COLOR_BGR2RGB))
-                    draw = ImageDraw.Draw(panel_img)  # 续画其他单元格
+                    draw = ImageDraw.Draw(panel_img)
                 x_cursor += col_w
             y_cursor += row_heights[i]
 
         panel_bgr = cv2.cvtColor(np.array(panel_img), cv2.COLOR_RGB2BGR)
 
-        # 与主图等高：较短者底部补白
+        # === 顶对齐与高度适配 ===
+        # 可用主体高度（胶图及以下）为 body_avail_h；把表格裁切/补白到该高度
         Hp, Wp = panel_bgr.shape[:2]
-        if Hp != H_img:
-            if Hp < H_img:
-                pad = np.full((H_img - Hp, Wp, 3), 255, dtype=np.uint8)
-                panel_bgr = np.vstack([panel_bgr, pad])
-                Hp = H_img
-            else:
-                pad = np.full((Hp, W_img, 3), 255, dtype=np.uint8)
-                img_bgr = np.vstack([img_bgr, pad])
-                H_img = Hp
+        body_avail_h = max(0, body_avail_h)
+        if Hp < body_avail_h:
+            pad = np.full((body_avail_h - Hp, Wp, 3), 255, dtype=np.uint8)
+            panel_bgr = np.vstack([panel_bgr, pad])
+        elif Hp > body_avail_h:
+            panel_bgr = panel_bgr[:body_avail_h, :, :]
 
-        # 水平拼接到右侧
-        out = np.concatenate([img_bgr, panel_bgr], axis=1)
+        # 顶部补白 = panel_top_h，底部补白 = 0（因为上面已将表格主体适配为 body_avail_h）
+        top_pad = np.full((panel_top_h, Wp, 3), 255, dtype=np.uint8) if panel_top_h > 0 else None
+        column_full = panel_bgr if top_pad is None else np.vstack([top_pad, panel_bgr])
+
+        # 水平 30px 白色间隙
+        gap_px = max(0, int(gap_px))
+        gap = np.full((H_img, max(1, gap_px), 3), 255, dtype=np.uint8)
+
+        # 与主图等高（column_full 当前高度 = panel_top_h + body_avail_h = H_img）
+        # 拼接：主图 | gap | 表格列
+        out = np.concatenate([img_bgr, gap, column_full], axis=1)
         return out
+
 
 
     # -------------------- UI：左侧 -------------------- #
@@ -1682,14 +1693,6 @@ class App(tk.Tk):
         f_file.pack(fill=tk.X, pady=6)
         ttk.Button(f_file, text="Open image...", command=self.open_image).pack(fill=tk.X, padx=6, pady=6)
         ttk.Button(f_file, text="Reset angle (horizontal)", command=self.reset_angle).pack(fill=tk.X, padx=6, pady=4)
-        ttk.Label(
-            f_file,
-            text=("Tip: In the right canvas, drag ROI corners/edges to crop; wheel to zoom; right-drag to pan; "
-                "arrow keys for fine adjustments.\n"
-                "ROI now follows the calibration line angle for accurate selection on tilted gels."),
-            wraplength=self.LEFT_WIDTH-24,
-            justify="left"
-        ).pack(anchor="w", padx=6, pady=(0,6))
 
         # ---- Lane detection ----
         f_lane = ttk.LabelFrame(left, text="Lane detection")
@@ -1728,10 +1731,10 @@ class App(tk.Tk):
 
         self.var_show_boxes = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            f_marker, text="Show red boxes (generate from arrows when checked)",
+            f_marker, text="Show intensity box",
             variable=self.var_show_boxes, command=self.on_toggle_show_boxes
         ).pack(anchor="w", padx=6, pady=2)
-        ttk.Button(f_marker,text="Reset all arrows to default",command=self.reset_all_arrows).pack(fill=tk.X, padx=6, pady=4)
+        ttk.Button(f_marker,text="Reset all shapes",command=self.reset_all_arrows).pack(fill=tk.X, padx=6, pady=4)
         
         row2 = ttk.Frame(f_marker); row2.pack(fill=tk.X, padx=6, pady=(2,2))
         ttk.Label(row2, text="Arrow shape").pack(side=tk.LEFT)
@@ -1747,32 +1750,26 @@ class App(tk.Tk):
         # ---- Actions ----
         f_action = ttk.Frame(left)
         f_action.pack(fill=tk.X, pady=10)
-        ttk.Button(f_action, text="Render current ROI", command=self.render_current).pack(fill=tk.X, padx=6, pady=4)
+        ttk.Button(f_action, text="Render current gel", command=self.render_current).pack(fill=tk.X, padx=6, pady=4)
         ttk.Button(f_action, text="Export annotated image", command=self.export_current).pack(fill=tk.X, padx=6, pady=4)
-        ttk.Button(f_action, text="Export arrow-box intensities (CSV)", command=self.export_arrow_box_metrics)\
+        ttk.Button(f_action, text="Export intensities (CSV)", command=self.export_arrow_box_metrics)\
             .pack(fill=tk.X, padx=6, pady=4)
 
         # ---- Custom labels (column name + per-column MWs) ----
-        f_lab = ttk.LabelFrame(left, text="Custom labels (per column name + MWs)")
+        f_lab = ttk.LabelFrame(left, text="Custom labels")
         f_lab.pack(fill=tk.X, pady=6)
-        ttk.Button(f_lab, text="Edit column names & MWs...", command=self.open_labels_editor)\
+        ttk.Button(f_lab, text="Edit lane names & MWs...", command=self.open_labels_editor)\
             .pack(fill=tk.X, padx=6, pady=(6, 6))
         ttk.Button(f_lab, text="Edit right-side table...", command=self.open_right_table_editor)\
         .pack(fill=tk.X, padx=6, pady=6)
-
-        # ---- Bottom note ----
-        f_note = ttk.LabelFrame(left, text="Bottom note")
-        f_note.pack(fill=tk.X, pady=6)
-        if not hasattr(self, "bottom_note_text"):
-            self.bottom_note_text = ""
-        ttk.Button(f_note, text="Edit bottom note...", command=self.open_bottom_note_editor)\
+        ttk.Button(f_lab, text="Edit bottom note...", command=self.open_bottom_note_editor)\
             .pack(fill=tk.X, padx=6, pady=6)
 
         # ---- White balance / autoscale ----
-        f_wb = ttk.LabelFrame(left, text="White balance / Autoscale (ROI level, optional)")
+        f_wb = ttk.LabelFrame(left, text="White balance / Autoscale")
         f_wb.pack(fill=tk.X, pady=6)
         self.var_wb_on = tk.BooleanVar(value=True)
-        ttk.Checkbutton(f_wb, text="Enable white balance (linear percentile stretch)",
+        ttk.Checkbutton(f_wb, text="Enable white balance",
                         variable=self.var_wb_on).pack(anchor="w", padx=6)
 
         self.var_wb_exposure = tk.DoubleVar(value=1.0)
@@ -1785,15 +1782,11 @@ class App(tk.Tk):
         self._spin(f_wb, "Exposure (0.5–2.0)", self.var_wb_exposure, 0.5, 2.0, step=0.05)
         self._spin(f_wb, "Low percentile (0–50)", self.var_wb_p_low, 0.0, 50.0, step=0.1)
         self._spin(f_wb, "High percentile (50–100)", self.var_wb_p_high, 50.0, 100.0, step=0.1)
-        ttk.Checkbutton(
-            f_wb, text="Per-channel (max contrast, may change colors)",
-            variable=self.var_wb_per_channel
-        ).pack(anchor="w", padx=6, pady=(2,4))
 
         def _toggle_gamma_state():
             self.sp_gamma.configure(state=("normal" if self.var_gamma_on.get() else "disabled"))
         ttk.Checkbutton(
-            f_wb, text="Enable gamma (out = out ** (1/gamma))",
+            f_wb, text="Enable gamma",
             variable=self.var_gamma_on, command=_toggle_gamma_state
         ).pack(anchor="w", padx=6)
 
@@ -1812,7 +1805,7 @@ class App(tk.Tk):
         self.pw_main = tk.PanedWindow(right, orient=tk.VERTICAL, sashwidth=6, sashrelief="raised", opaqueresize=False)
         self.pw_main.pack(fill=tk.BOTH, expand=True)
 
-        top_grp = ttk.LabelFrame(self.pw_main, text="Original / ROI editor (drag corners & edges; wheel to zoom; right-drag to pan)")
+        top_grp = ttk.LabelFrame(self.pw_main, text="Gel editor (drag corners & edges; wheel to zoom; right-drag to pan)")
         self.roi_editor = ROIEditorCanvas(top_grp)
         self.roi_editor.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
@@ -1820,7 +1813,7 @@ class App(tk.Tk):
         self.pw_bottom = tk.PanedWindow(bottom_container, orient=tk.HORIZONTAL, sashwidth=6, sashrelief="raised", opaqueresize=False)
         self.pw_bottom.pack(fill=tk.BOTH, expand=True)
 
-        self.lbl_roi_wb = ttk.LabelFrame(self.pw_bottom, text="ROI - WB crop")
+        self.lbl_roi_wb = ttk.LabelFrame(self.pw_bottom, text="Gel - WB crop")
         self.canvas_roi_wb = tk.Label(self.lbl_roi_wb, bg="#222")
         self.canvas_roi_wb.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
@@ -2781,7 +2774,8 @@ class App(tk.Tk):
                 has_header=bool(cfg.get("has_header", True)),
                 show_grid=bool(cfg.get("grid", True)),
                 align=str(cfg.get("align", "center")),
-                cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28)))
+                cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28))),
+                panel_top_h=panel_top_h
             )
             annotated_final_with_green_with_note = self._attach_right_table_panel(
                 annotated_final_with_green_with_note,
@@ -2789,7 +2783,8 @@ class App(tk.Tk):
                 has_header=bool(cfg.get("has_header", True)),
                 show_grid=bool(cfg.get("grid", True)),
                 align=str(cfg.get("align", "center")),
-                cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28)))
+                cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28))),
+                panel_top_h=panel_top_h
             )
 
         # 11) 左侧 ROI 预览
@@ -2912,7 +2907,8 @@ class App(tk.Tk):
                 has_header=bool(cfg.get("has_header", True)),
                 show_grid=bool(cfg.get("grid", True)),
                 align=str(cfg.get("align", "center")),
-                cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28)))
+                cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28))),
+                panel_top_h=panel_top_h
             )
             if want_green and with_green_note is not None:
                 with_green_note = self._attach_right_table_panel(
@@ -2921,7 +2917,8 @@ class App(tk.Tk):
                     has_header=bool(cfg.get("has_header", True)),
                     show_grid=bool(cfg.get("grid", True)),
                     align=str(cfg.get("align", "center")),
-                    cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28)))
+                    cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28))),
+                    panel_top_h=panel_top_h
                 )
 
         # 4) 刷新右侧交互画布（panel_w 只给左白板，不含右侧表格宽度）
