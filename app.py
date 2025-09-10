@@ -1794,19 +1794,17 @@ class App(tk.Tk):
 
         self.var_show_green = tk.BooleanVar(value=False)
         self.var_axis = tk.StringVar(value="left")
-        #ttk.Checkbutton(f_marker, text="Show green separators", variable=self.var_show_green,
-        #                command=self.on_toggle_show_green).pack(anchor="w", padx=6, pady=2)
+        # self.var_show_green 复用 on_toggle_show_green（按钮在其他区域使用时再绑定）
 
         self.var_show_boxes = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             f_marker, text="Show intensity box",
             variable=self.var_show_boxes, command=self.on_toggle_show_boxes
         ).pack(anchor="w", padx=6, pady=2)
-        ttk.Button(f_marker,text="Reset all shapes",command=self.reset_all_arrows).pack(fill=tk.X, padx=6, pady=4)
-        
+        ttk.Button(f_marker, text="Reset all shapes", command=self.reset_all_arrows).pack(fill=tk.X, padx=6, pady=4)
+
         row2 = ttk.Frame(f_marker); row2.pack(fill=tk.X, padx=6, pady=(2,2))
         ttk.Label(row2, text="Arrow shape").pack(side=tk.LEFT)
-        # 采用可读文本作为界面值，事件里做映射
         self.var_arrow_style = getattr(self, "var_arrow_style", tk.StringVar(value="Arrow (→)"))
         self.cb_arrow_style = ttk.Combobox(
             row2, textvariable=self.var_arrow_style, state="readonly",
@@ -1823,42 +1821,38 @@ class App(tk.Tk):
         ttk.Button(f_action, text="Export intensities (CSV)", command=self.export_arrow_box_metrics)\
             .pack(fill=tk.X, padx=6, pady=4)
 
-
-        # --- Stash / Compose ---
+        # ---- Stash / Compose ----
         f_stash = ttk.LabelFrame(left, text="暂存 / 拼接")
         f_stash.pack(fill=tk.X, pady=6)
+        # >>> 重要：为“暂存当前截取”保留句柄，便于在拼接预览时禁用 <<<
+        self.btn_stash_current = ttk.Button(f_stash, text="暂存当前截取", command=self.stash_current_gel)
+        self.btn_stash_current.pack(fill=tk.X, padx=6, pady=(6, 2))
+        ttk.Button(f_stash, text="清空暂存", command=self.clear_stash).pack(fill=tk.X, padx=6, pady=2)
+        ttk.Button(f_stash, text="拼接已暂存（输入表格与底注）", command=self.compose_stash)\
+            .pack(fill=tk.X, padx=6, pady=(2, 6))
 
-        ttk.Button(f_stash, text="暂存当前截取",
-                command=self.stash_current_gel).pack(fill=tk.X, padx=6, pady=(6, 2))
-        ttk.Button(f_stash, text="清空暂存",
-                command=self.clear_stash).pack(fill=tk.X, padx=6, pady=2)
-        ttk.Button(f_stash, text="拼接已暂存（输入表格与底注）",
-                command=self.compose_stash).pack(fill=tk.X, padx=6, pady=(2, 6))
-
-        # ---- Custom labels (column name + per-column MWs) ----
+        # ---- Custom labels ----
         f_lab = ttk.LabelFrame(left, text="Custom labels")
         f_lab.pack(fill=tk.X, pady=6)
-        ttk.Button(f_lab, text="Edit lane names & MWs...", command=self.open_labels_editor)\
-            .pack(fill=tk.X, padx=6, pady=(6, 6))
-        ttk.Button(f_lab, text="Edit right-side table...", command=self.open_right_table_editor)\
-        .pack(fill=tk.X, padx=6, pady=6)
-        ttk.Button(f_lab, text="Edit bottom note...", command=self.open_bottom_note_editor)\
+        # >>> 重要：为“编辑列名 & MWs...”保留句柄，便于在拼接预览时禁用 <<<
+        self.btn_edit_labels = ttk.Button(f_lab, text="Edit lane names & MWs...", command=self.open_labels_editor)
+        self.btn_edit_labels.pack(fill=tk.X, padx=6, pady=(6, 6))
+        ttk.Button(f_lab, text="Edit right-side table...", command=self._edit_right_table_auto)\
+            .pack(fill=tk.X, padx=6, pady=6)
+        ttk.Button(f_lab, text="Edit bottom note...", command=self._edit_bottom_note_auto)\
             .pack(fill=tk.X, padx=6, pady=6)
 
         # ---- White balance / autoscale ----
         f_wb = ttk.LabelFrame(left, text="White balance / Autoscale")
         f_wb.pack(fill=tk.X, pady=6)
         self.var_wb_on = tk.BooleanVar(value=True)
-        ttk.Checkbutton(f_wb, text="Enable white balance",
-                        variable=self.var_wb_on).pack(anchor="w", padx=6)
-
+        ttk.Checkbutton(f_wb, text="Enable white balance", variable=self.var_wb_on).pack(anchor="w", padx=6)
         self.var_wb_exposure = tk.DoubleVar(value=1.0)
         self.var_wb_p_low = tk.DoubleVar(value=0.5)
         self.var_wb_p_high = tk.DoubleVar(value=99.5)
         self.var_wb_per_channel = tk.BooleanVar(value=False)
         self.var_gamma_on = tk.BooleanVar(value=False)
         self.var_gamma_val = tk.DoubleVar(value=1.0)
-
         self._spin(f_wb, "Exposure (0.5–2.0)", self.var_wb_exposure, 0.5, 2.0, step=0.05)
         self._spin(f_wb, "Low percentile (0–50)", self.var_wb_p_low, 0.0, 50.0, step=0.1)
         self._spin(f_wb, "High percentile (50–100)", self.var_wb_p_high, 50.0, 100.0, step=0.1)
@@ -1869,12 +1863,17 @@ class App(tk.Tk):
             f_wb, text="Enable gamma",
             variable=self.var_gamma_on, command=_toggle_gamma_state
         ).pack(anchor="w", padx=6)
-
         frm_g = ttk.Frame(f_wb); frm_g.pack(fill=tk.X, padx=6, pady=2)
         ttk.Label(frm_g, text="gamma (>0)", wraplength=self.LEFT_WIDTH-40, justify="left").pack(side=tk.LEFT)
         self.sp_gamma = ttk.Spinbox(frm_g, textvariable=self.var_gamma_val,
-                                    from_=0.2, to=3.0, increment=0.05, width=8, state="disabled")
+            from_=0.2, to=3.0, increment=0.05, width=8, state="disabled")
         self.sp_gamma.pack(side=tk.RIGHT)
+
+        # >>> 在左侧 UI 构建完成后，按当前模式（是否处于拼接预览）刷新按钮状态 <<<
+        try:
+            self._refresh_buttons_state()
+        except Exception:
+            pass
 
     # -------------------- UI：右侧（显示） -------------------- #
 
@@ -2080,6 +2079,88 @@ class App(tk.Tk):
         out = np.concatenate([gel_bgr, panel], axis=1) if side == "right" else np.concatenate([panel, gel_bgr], axis=1)
         return out, int(panel_w)
 
+    def _set_composed_preview(self, base_img: np.ndarray, display_img: np.ndarray):
+        """
+        进入“拼接整体预览”模式：
+        - base_img：未附加（或仅按当前值附加）的拼接底图（用于后续再次叠加表格/底注）
+        - display_img：当前显示的拼接图（右侧画布底图）
+        """
+        setattr(self, "_is_composed_preview", True)
+        setattr(self, "compose_preview", {"base": base_img, "display": display_img})
+        # >>> 进入拼接预览后，自动禁用“编辑列名 & MWs…”与“暂存当前截取”
+        try:
+            self._refresh_buttons_state()
+        except Exception:
+            pass
+
+    def _unset_composed_preview(self):
+        """
+        退出“拼接整体预览”模式。
+        """
+        setattr(self, "_is_composed_preview", False)
+        setattr(self, "compose_preview", {"base": None, "display": None})
+        # >>> 退出拼接预览后，恢复按钮可用
+        try:
+            self._refresh_buttons_state()
+        except Exception:
+            pass
+    def _refresh_buttons_state(self):
+        """
+        根据是否处于“拼接整体预览”状态，统一启/禁用左侧的部分按钮：
+        - 处于预览：禁用 “Edit lane names & MWs...” 与 “暂存当前截取”
+        - 非预览：恢复上述按钮为 normal
+        """
+        in_mosaic = bool(getattr(self, "_is_composed_preview", False))
+        state = "disabled" if in_mosaic else "normal"
+
+        # “编辑列名 & MWs...”
+        try:
+            if hasattr(self, "btn_edit_labels") and self.btn_edit_labels is not None:
+                self.btn_edit_labels.configure(state=state)
+        except Exception:
+            pass
+
+        # “暂存当前截取”
+        try:
+            if hasattr(self, "btn_stash_current") and self.btn_stash_current is not None:
+                self.btn_stash_current.configure(state=state)
+        except Exception:
+            pass
+
+
+    def _apply_mosaic_annotations(self, mosaic_base: np.ndarray) -> np.ndarray:
+        """
+        在拼接后的“基础图”上，按【拼接专用】right_table/bottom_note 进行叠加，
+        返回可直接用于显示/导出的整图（不改箭头、无重算）。
+        """
+        self._ensure_mosaic_vars()
+        if mosaic_base is None or not isinstance(mosaic_base, np.ndarray) or mosaic_base.size == 0:
+            return mosaic_base
+
+        out = mosaic_base
+
+        # —— 右侧表格（拼接专用变量） ——
+        rtxt = (self.mosaic_right_table_text or "").strip()
+        if rtxt:
+            cfg = (self.mosaic_right_table_opts or {})
+            out = self._attach_right_table_panel(
+                out,
+                rtxt,
+                has_header=bool(cfg.get("has_header", True)),
+                show_grid=bool(cfg.get("grid", True)),
+                align=str(cfg.get("align", "center")),
+                cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28))),
+                panel_top_h=0,
+                gel_height_px=out.shape[0],  # 以整图高度为参考，保证收缩适配
+            )
+
+        # —— 底部备注（拼接专用变量） ——
+        note_raw = self.mosaic_bottom_note_text or ""
+        if note_raw.strip():
+            out = self._attach_bottom_note_panel(out, note_raw, allow_expand_width=True)
+
+        return out
+
 
 
     def stash_current_gel(self):
@@ -2201,6 +2282,12 @@ class App(tk.Tk):
     def clear_stash(self):
         """清空暂存队列（内存）。"""
         from tkinter import messagebox
+        
+        try:
+            self._soft_reset_for_operation()
+        except Exception:
+            pass
+
         self.stash.clear()
         messagebox.showinfo("完成", "已清空暂存列表。")
 
@@ -2209,8 +2296,10 @@ class App(tk.Tk):
         拼接已暂存：
         - 仅第一张添加固定整数字号的侧标；
         - 各图顶部泳道栏加入后再对齐；
-        - 箭头优先按暂存的 arrows_manual 还原（考虑缩放 s、顶部栏高度、对齐补白、X 偏移与面板宽），
+        - 箭头优先按暂存的 arrows_manual 还原（考虑缩放/顶栏/对齐补白/左面板宽），
         无 arrows_manual 时再按 calib_model + lane_marks 推算。
+        - 不再在此处弹出“编辑表格/底注”的对话框；进入整体预览后，可通过左侧按钮编辑，
+        点“确定”直接渲染到拼接图上（不重算）。
         """
         from tkinter import messagebox
         import numpy as np, cv2
@@ -2228,7 +2317,7 @@ class App(tk.Tk):
         spans = [max(1.0, float(it["align"]["y_bot"]) - float(it["align"]["y_top"])) for it in items]
         S_ref = float(max(spans))
 
-        # 2) 逐张：缩放 + 侧标（首图）+ 顶部栏（全部），并计算 y_top_total/y_bot_total
+        # 2) 逐张缩放 + 侧标（首图）+ 顶部栏（全部）
         scaled_blocks, per_item_scale = [], []
         for idx, it in enumerate(items):
             gel = it["gel_bgr"]
@@ -2236,7 +2325,6 @@ class App(tk.Tk):
             y_top0 = float(it["align"]["y_top"])
             y_bot0 = float(it["align"]["y_bot"])
             s = float(S_ref / max(1.0, y_bot0 - y_top0))
-
             new_w = max(1, int(round(W0 * s)))
             new_h = max(1, int(round(H0 * s)))
             interp = cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
@@ -2244,12 +2332,12 @@ class App(tk.Tk):
             y_top1 = float(y_top0 * s); y_bot1 = float(y_bot0 * s)
 
             meta = it["meta"]
-            nlanes_i      = int(meta.get("nlanes", 0))
+            nlanes_i = int(meta.get("nlanes", 0))
             ladder_lane_i = int(meta.get("ladder_lane", 1))
-            yaxis_side_i  = str(meta.get("yaxis_side", "left")).lower()
-            bounds_i      = meta.get("bounds", None)
-            lanes_i       = meta.get("lanes", None)
-            lane_names_i  = meta.get("lane_names", []) or []
+            yaxis_side_i = str(meta.get("yaxis_side", "left")).lower()
+            bounds_i = meta.get("bounds", None)
+            lanes_i = meta.get("lanes", None)
+            lane_names_i = meta.get("lane_names", []) or []
             tick_labels_i = meta.get("tick_labels", []) or []
             calib_model_i = meta.get("calib_model", None)
 
@@ -2259,10 +2347,14 @@ class App(tk.Tk):
             # 首图：固定整数字号侧标
             img_cur = gel_scaled
             panel_w_left = 0
+            try:
+                from gel_core import predict_y_from_mw_piecewise
+            except Exception:
+                predict_y_from_mw_piecewise = None
+
             if idx == 0:
                 try:
-                    from gel_core import predict_y_from_mw_piecewise
-                    if calib_model_i and "xk" in calib_model_i and "yk" in calib_model_i and tick_labels_i:
+                    if calib_model_i and "xk" in calib_model_i and "yk" in calib_model_i and tick_labels_i and predict_y_from_mw_piecewise:
                         ys = predict_y_from_mw_piecewise(
                             tick_labels_i, np.asarray(calib_model_i["xk"]), np.asarray(calib_model_i["yk"])
                         )
@@ -2277,7 +2369,7 @@ class App(tk.Tk):
                 )
                 panel_w_left = int(axis_w if yaxis_side_i == "left" else 0)
 
-            # 顶部泳道栏（加入后再对齐）
+            # 顶部泳道栏
             panel_top_h = 0
             try:
                 n_non = max(0, nlanes_i - 1)
@@ -2296,7 +2388,6 @@ class App(tk.Tk):
 
             y_top_total = panel_top_h + y_top1
             y_bot_total = panel_top_h + y_bot1
-
             scaled_blocks.append({
                 "img": img_cur,
                 "H": int(img_cur.shape[0]),
@@ -2309,12 +2400,12 @@ class App(tk.Tk):
                 "bounds_s": bounds_s, "lanes_s": lanes_s,
                 "nlanes": nlanes_i, "ladder_lane": ladder_lane_i,
                 "yaxis_side": yaxis_side_i,
-                "arrows_manual": meta.get("arrows_manual", []) or [],  # ★ 从暂存读出
+                "arrows_manual": meta.get("arrows_manual", []) or [],
                 "calib_model": calib_model_i,
             })
             per_item_scale.append(s)
 
-        # 3) 跨块对齐（考虑顶部栏）
+        # 3) 跨块对齐
         y_tops_total = [b["y_top_total"] for b in scaled_blocks]
         Y_top_ref_total = float(max(y_tops_total))
         tails_total = [b["H"] - b["y_bot_total"] for b in scaled_blocks]
@@ -2331,10 +2422,10 @@ class App(tk.Tk):
                 img = cv2.copyMakeBorder(img, pad_top, pad_bot, 0, 0, cv2.BORDER_CONSTANT, value=(255,255,255))
                 b["img"] = img
                 b["H"], b["W"] = img.shape[0], img.shape[1]
-            b["pad_top"] = int(pad_top); b["pad_bot"] = int(pad_bot)
+            b["pad_top"], b["pad_bot"] = int(pad_top), int(pad_bot)
             pad_tops.append(pad_top); pad_bots.append(pad_bot)
 
-        # 4) 横向拼接 & 记录每块 X 偏移
+        # 4) 横向拼接
         gap = 30
         columns, x_offsets = [], []
         x_cursor = 0
@@ -2345,50 +2436,32 @@ class App(tk.Tk):
             columns.append(b["img"])
             x_offsets.append(x_cursor)
             x_cursor += b["W"]
-        mosaic = np.concatenate(columns, axis=1) if columns else None
-        if mosaic is None:
+        mosaic_base = np.concatenate(columns, axis=1) if columns else None
+        if mosaic_base is None:
             messagebox.showerror("错误", "拼接失败：没有有效图像。")
             return
-
-        # 5) 右侧表格/底注（略，同你现有逻辑）
-        try: self.open_right_table_editor()
-        except Exception: pass
-        try: self.open_bottom_note_editor()
-        except Exception: pass
-        rtxt = (getattr(self, "right_table_text", "") or "").strip()
-        if rtxt:
-            cfg = (getattr(self, "right_table_opts", None) or {})
-            mosaic = self._attach_right_table_panel(
-                mosaic, rtxt,
-                has_header=bool(cfg.get("has_header", True)),
-                show_grid=bool(cfg.get("grid", True)),
-                align=str(cfg.get("align", "center")),
-                cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28))),
-                panel_top_h=0, gel_height_px=mosaic.shape[0],
-            )
-        note_raw = getattr(self, "bottom_note_text", "") or ""
-        if note_raw.strip():
-            mosaic = self._attach_bottom_note_panel(mosaic, note_raw, allow_expand_width=True)
+        # 5) —— 不再弹出编辑弹窗 —— 直接按当前值（若有）叠加表格/底注
+        mosaic_display = self._apply_mosaic_annotations(mosaic_base)
 
         # 6) 刷新右侧画布（允许全图拖动；不重置位置）
         if hasattr(self, "canvas_anno") and self.canvas_anno is not None:
             try:
                 self.canvas_anno.set_scene(
-                    base_img_bgr=mosaic,
-                    gel_bgr=np.zeros_like(mosaic),     # 拖动边界=整图
+                    base_img_bgr=mosaic_display,
+                    gel_bgr=np.zeros_like(mosaic_display),  # 拖动边界=整图
                     bounds=None, lanes=None,
                     a=0.0, b=0.0, fit_ok=True,
                     nlanes=0, ladder_lane=1,
                     yaxis_side="left",
-                    lane_marks=[],                     # 不通过默认生成
+                    lane_marks=[],     # 不通过默认生成
                     panel_top_h=0, panel_w=0,
                     calib_model=None,
-                    reset_positions=False              # 保留后续拖动
+                    reset_positions=False  # 保留后续拖动
                 )
             except Exception:
                 pass
 
-        # 7) 复原箭头：优先 arrows_manual；无则回退模型计算
+        # 7) 复原箭头（优先 arrows_manual；否则模型推算）
         try:
             from gel_core import predict_y_from_mw_piecewise
         except Exception:
@@ -2396,19 +2469,19 @@ class App(tk.Tk):
 
         if hasattr(self, "canvas_anno") and self.canvas_anno is not None:
             can = self.canvas_anno
-            Hm, Wm = mosaic.shape[:2]
+            Hm, Wm = mosaic_display.shape[:2]
 
             for i, it in enumerate(items):
                 b = scaled_blocks[i]
-                s         = float(b["s"])
-                x_left    = int(x_offsets[i])
-                pad_top   = int(b.get("pad_top", 0))
+                s = float(b["s"])
+                x_left = int(x_offsets[i])
+                pad_top = int(b.get("pad_top", 0))
                 panel_top = int(b.get("panel_top_h", 0))
                 panel_w_l = int(b.get("panel_w_left", 0))
-                bounds_s  = b["bounds_s"]; lanes_s = b["lanes_s"]
-                nlanes_i  = int(b["nlanes"]); ladder_lane_i = int(b["ladder_lane"])
+                bounds_s = b["bounds_s"]; lanes_s = b["lanes_s"]
+                nlanes_i = int(b["nlanes"]); ladder_lane_i = int(b["ladder_lane"])
 
-                # 真实泳道数（用于回退估算）
+                # 真实泳道数
                 if isinstance(bounds_s, np.ndarray):
                     real_n = max(0, bounds_s.shape[1] - 1)
                 elif isinstance(lanes_s, list) and lanes_s:
@@ -2416,7 +2489,7 @@ class App(tk.Tk):
                 else:
                     real_n = nlanes_i
 
-                # --- 7.a 有 arrows_manual：直接按缓存位置还原 ---
+                # 7.a arrows_manual
                 manual = it["meta"].get("arrows_manual", []) or b.get("arrows_manual", []) or []
                 if manual:
                     for ar in manual:
@@ -2425,27 +2498,22 @@ class App(tk.Tk):
                             mw = float(ar.get("mw", float("nan")))
                             x_gel = float(ar.get("x_gel", float("nan")))
                             y_gel = float(ar.get("y_gel", float("nan")))
-                            if li < 0 or not (np.isfinite(mw) and mw > 0): 
+                            if li < 0 or not (np.isfinite(mw) and mw > 0):
                                 continue
                             if not (np.isfinite(x_gel) and np.isfinite(y_gel)):
                                 continue
-                            x_img = float(x_left + panel_w_l + x_gel)           # 面板在左时要加 panel_w_left
-                            y_img = float(pad_top + panel_top + y_gel * s)      # 注意缩放 + 顶部栏 + 对齐补白
-                            # 限幅到拼接图范围
+                            x_img = float(x_left + panel_w_l + x_gel * s)
+                            y_img = float(pad_top + panel_top + y_gel * s)
                             x_img = float(np.clip(x_img, 0, Wm-1))
                             y_img = float(np.clip(y_img, 0, Hm-1))
-                            can._add_arrow(x_img, y_img, lane_idx=li, mw=mw, moved=True)  # 标记 moved=True 便于后续复原
+                            can._add_arrow(x_img, y_img, lane_idx=li, mw=mw, moved=True)
                         except Exception:
                             continue
-                    continue  # 本块已还原，无需回退
+                    continue  # 本块已还原
 
-                # --- 7.b 无 arrows_manual：回退按模型 + lane_marks 推算（保持你原有逻辑） ---
+                # 7.b 回退：模型 + lane_marks 推算
                 lane_marks_i = it["meta"].get("lane_marks", []) or []
-                if predict_y_from_mw_piecewise and it["meta"].get("calib_model", None):
-                    cm = it["meta"]["calib_model"]
-                else:
-                    cm = None
-
+                cm = it["meta"].get("calib_model", None) if predict_y_from_mw_piecewise else None
                 skip_idx = max(0, ladder_lane_i - 1)
                 nonladder_idx = [li for li in range(real_n) if li != skip_idx]
                 use_k = min(len(nonladder_idx), len(lane_marks_i))
@@ -2454,15 +2522,16 @@ class App(tk.Tk):
                     for mw in (lane_marks_i[k] or []):
                         try:
                             v = float(mw)
-                            if not (np.isfinite(v) and v > 0):
+                            if not (np.isfinite(v) and v > 0): 
                                 continue
                             if cm and "xk" in cm and "yk" in cm and predict_y_from_mw_piecewise:
-                                y_gel = float(predict_y_from_mw_piecewise([v],
-                                        np.asarray(cm["xk"]), np.asarray(cm["yk"]))[0])
+                                y_gel = float(predict_y_from_mw_piecewise(
+                                    [v], np.asarray(cm["xk"]), np.asarray(cm["yk"])
+                                )[0])
                             else:
-                                continue  # 无模型就不强行推
+                                continue
                             y_img = float(pad_top + panel_top + (y_gel * s))
-                            # x 取左界（斜界或等宽或等分估）
+                            # x 取左界
                             if isinstance(bounds_s, np.ndarray) and bounds_s.ndim == 2 and bounds_s.shape[0] > 0:
                                 y_row = int(np.clip(round(y_gel * s), 0, bounds_s.shape[0]-1))
                                 xl = int(bounds_s[y_row, li])
@@ -2478,8 +2547,6 @@ class App(tk.Tk):
                             can._add_arrow(x_img, y_img, lane_idx=li, mw=v, moved=True)
                         except Exception:
                             continue
-
-            # 抬升/重绘 & 方框（若开启）
             try: can._redraw_arrows()
             except Exception: pass
             try:
@@ -2488,7 +2555,7 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        # 8) 更新 compose_meta（保留）
+        # 8) 更新 compose_meta，进入“拼接整体预览模式”
         compose_items = []
         for i, it in enumerate(items):
             compose_items.append({
@@ -2508,7 +2575,11 @@ class App(tk.Tk):
             "Y_top_ref_total": float(max(y_tops_total)),
             "items": compose_items
         }
-        messagebox.showinfo("完成", f"已拼接 {len(self.stash)} 张（箭头已按暂存位置复原，支持继续拖动与导出）。")
+
+        # ★★ 记录并开启“拼接整体预览”模式（后续编辑按钮走另一套函数）
+        self._set_composed_preview(base_img=mosaic_base, display_img=mosaic_display)
+
+        #messagebox.showinfo("完成", f"已拼接 {len(self.stash)} 张（箭头已按暂存位置复原，支持继续拖动与导出）。")
 
 
     def _snapshot_arrows_from_canvas(self) -> list[dict]:
@@ -2949,6 +3020,7 @@ class App(tk.Tk):
 
 
     def open_image(self):
+        self._deep_reset_for_new_image()
         path = filedialog.askopenfilename(
             title="Choose image",
             filetypes=[("Image", "*.jpg;*.jpeg;*.png;*.tif;*.tiff"), ("All", "*.*")]
@@ -2977,10 +3049,12 @@ class App(tk.Tk):
             self.image_path = path
             self.image_load_est_bytes = int(getattr(bgr, "nbytes", 0))
 
+        # —— 清空（单图）注释 —— #
         try:
             self.bottom_note_text = ""
         except Exception:
             setattr(self, "bottom_note_text", "")
+
         self.lane_names = []
         self.lane_marks = []
         self.render_cache = {}
@@ -2988,9 +3062,19 @@ class App(tk.Tk):
         self.gi = 1
         self.boxes = []
         self.roi_editor.set_image(self.orig_bgr)
+
+        # —— 清空（单图）右侧表格 —— #
         self.right_table_text = ""
         self.right_table_opts = {}
+
+        # —— 关键：清空“拼接专用”变量，确保新工程互不影响 —— #
+        self._ensure_mosaic_vars()
+        self.mosaic_right_table_text = ""
+        self.mosaic_right_table_opts = {}
+        self.mosaic_bottom_note_text = ""
+
         self.run_detect()
+
 
 
 
@@ -3055,16 +3139,252 @@ class App(tk.Tk):
         except Exception:
             pass
 
-    def _clear_all_caches_and_overlays(self):
+    def _clear_all_caches_and_overlays(self,
+                                    preserve_inputs: bool = True, 
+                                    reset_composed: bool = True):
         """
-        清空本次渲染缓存与右侧画布叠加物。
-        在 ROI 或图像发生变化时调用，避免缓存复用导致的数据污染。
+        软初始化入口（增强版）：
+        - preserve_inputs=True：保留用户输入（lane_names、lane_marks、bottom_note_text、
+        right_table_text/opts 等），仅清空运行态（右侧画布/拼接态/render 缓存），
+        用于“编辑/渲染/清空暂存”等不希望丢当前编辑内容的场景。
+        - preserve_inputs=False：连同上述输入一并清空，用于“读取新图片”的全新开始。
+        - reset_composed=True：退出拼接模式并清理一次性标记。
         """
+        # 1) 清空渲染缓存
         try:
             self.render_cache = {}
         except Exception:
             pass
+
+        # 2) 清空右侧交互画布（底图/箭头/方框）
         self._clear_right_canvas()
+
+        # 3) 退出拼接模式并清理一次性标记
+        if reset_composed:
+            try:
+                self._unset_composed_preview()
+            except Exception:
+                pass
+            try:
+                # 避免下一次 recompose_using_cache 误触发 reset_positions
+                setattr(self, "_just_left_composed_preview", False)
+            except Exception:
+                pass
+
+        # 4) 拼接专用变量（一般不影响单图；若希望更“干净”可清空）
+        try:
+            self._ensure_mosaic_vars()
+            # 若保留输入，则只在读取新图片时清空
+            if not preserve_inputs:
+                self.mosaic_right_table_text = ""
+                self.mosaic_right_table_opts = {}
+                self.mosaic_bottom_note_text = ""
+        except Exception:
+            pass
+
+        # 5) 用户输入：根据 preserve_inputs 决定是否保留
+        if not preserve_inputs:
+            try:
+                self.bottom_note_text = ""
+            except Exception:
+                setattr(self, "bottom_note_text", "")
+            try:
+                self.right_table_text = ""
+                self.right_table_opts = {}
+            except Exception:
+                setattr(self, "right_table_text", "")
+                setattr(self, "right_table_opts", {})
+            # 列名/分子量清空（新图从零开始）
+            self.lane_names = []
+            self.lane_marks = []
+            # 也可视化开关归位
+            try: self.var_show_boxes.set(False)
+            except Exception: pass
+            try: self.var_show_green.set(False)
+            except Exception: pass
+
+    def _soft_reset_for_operation(self):
+        """操作前的轻量级软初始化：保留用户输入，仅清理运行态。"""
+        try:
+            self._clear_all_caches_and_overlays(preserve_inputs=True, reset_composed=True)
+        except Exception:
+            pass
+
+    def _deep_reset_for_new_image(self):
+        """读取新图片前的深度重置：不保留任何输入，彻底回到初始状态。"""
+        try:
+            self._clear_all_caches_and_overlays(preserve_inputs=False, reset_composed=True)
+        except Exception:
+            pass
+
+
+    def _edit_right_table_auto(self):
+        """
+        “编辑右侧表格”按钮的自动分发入口：
+        - 在拼接整体预览中：打开拼接专用编辑器（确认后直接改右侧预览底图）
+        - 否则：沿用原有单图编辑器（确认后走 recompose_using_cache/render_current）
+        """
+        if bool(getattr(self, "_is_composed_preview", False)):
+            self.open_right_table_editor_for_mosaic()
+        else:
+            self.open_right_table_editor()
+
+    def _edit_bottom_note_auto(self):
+        """
+        “编辑底注”按钮的自动分发入口（逻辑同上）。
+        """
+        if bool(getattr(self, "_is_composed_preview", False)):
+            self.open_bottom_note_editor_for_mosaic()
+        else:
+            self.open_bottom_note_editor()
+    def open_right_table_editor_for_mosaic(self):
+        """
+        仅在“拼接整体预览”中生效的右侧表格编辑器：
+        - 与 open_right_table_editor 相同的弹窗交互；
+        - Confirm 后：更新【mosaic_***】专用变量，并把结果直接叠加到 compose_preview['base'] 上，
+        再通过 canvas_anno.update_base_image() 刷新右侧预览底图（箭头/方框原地不动）。
+        """
+        if not bool(getattr(self, "_is_composed_preview", False)) or not getattr(self, "compose_preview", None):
+            # 若意外不在拼接模式，回退到原编辑器（单图全局变量）
+            return self.open_right_table_editor()
+
+        self._ensure_mosaic_vars()
+
+        win = tk.Toplevel(self)
+        win.title("Edit right-side table (mosaic)")
+        win.transient(self); win.grab_set()
+        win.resizable(True, True)
+
+        frm = ttk.Frame(win); frm.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        ttk.Label(frm, text="Paste here (Excel -> Copy; Click here -> Ctrl+V):", justify="left").pack(anchor="w")
+        txt = tk.Text(frm, height=12, width=64, wrap="none"); txt.pack(fill=tk.BOTH, expand=True, pady=(6, 6))
+
+        # 预填：拼接专用变量
+        pre = getattr(self, "mosaic_right_table_text", "") or ""
+        if pre:
+            txt.insert("1.0", pre)
+
+        opt = ttk.LabelFrame(frm, text="Options"); opt.pack(fill=tk.X, pady=(6, 0))
+        var_header = tk.BooleanVar(value=True)
+        var_grid = tk.BooleanVar(value=True)
+        var_align = tk.StringVar(value="center")
+        design = self._get_design_params()
+        var_cap = tk.IntVar(value=int(design.get("bottom_cap_px", 28)))
+
+        prev_cfg = getattr(self, "mosaic_right_table_opts", None) or {}
+        if "has_header" in prev_cfg: var_header.set(bool(prev_cfg.get("has_header")))
+        if "grid" in prev_cfg: var_grid.set(bool(prev_cfg.get("grid")))
+        if "align" in prev_cfg: var_align.set(str(prev_cfg.get("align") or "center"))
+        if "cap_px" in prev_cfg and isinstance(prev_cfg["cap_px"], (int, float)):
+            var_cap.set(int(prev_cfg["cap_px"]))
+
+        row1 = ttk.Frame(opt); row1.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Checkbutton(row1, text="First row is header (gray)", variable=var_header).pack(side=tk.LEFT)
+        ttk.Checkbutton(row1, text="Show grid lines", variable=var_grid).pack(side=tk.LEFT, padx=(12, 0))
+
+        row2 = ttk.Frame(opt); row2.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(row2, text="Align").pack(side=tk.LEFT)
+        cb_align = ttk.Combobox(row2, textvariable=var_align, state="readonly", values=["left", "center", "right"], width=8)
+        cb_align.pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(row2, text="Font height (px)").pack(side=tk.LEFT)
+        sp_cap = ttk.Spinbox(row2, textvariable=var_cap, from_=10, to=60, increment=1, width=6)
+        sp_cap.pack(side=tk.LEFT, padx=(6, 0))
+
+        # 按钮区
+        btns = ttk.Frame(frm); btns.pack(fill=tk.X, pady=(10, 0))
+        def do_clear(): txt.delete("1.0", "end")
+        def do_cancel(): win.destroy()
+
+        def do_ok():
+            # 写入拼接专用变量
+            try:
+                self.mosaic_right_table_text = txt.get("1.0", "end")
+            except Exception:
+                self.mosaic_right_table_text = ""
+            self.mosaic_right_table_opts = {
+                "has_header": bool(var_header.get()),
+                "grid": bool(var_grid.get()),
+                "align": (var_align.get() or "center"),
+                "cap_px": int(var_cap.get()),
+            }
+            win.destroy()
+
+            # 直接叠加到拼接 base 上并刷新右侧底图
+            try:
+                base = (getattr(self, "compose_preview", {}) or {}).get("base", None)
+                if base is not None:
+                    new_disp = self._apply_mosaic_annotations(base)
+                    if hasattr(self, "canvas_anno") and hasattr(self.canvas_anno, "update_base_image"):
+                        self.canvas_anno.update_base_image(new_disp)
+                    # 更新当前显示缓存
+                    self._set_composed_preview(base_img=base, display_img=new_disp)
+                    self.compose_stash()
+            except Exception:
+                pass
+
+        ttk.Button(btns, text="Clear", command=do_clear).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Cancel", command=do_cancel).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Confirm", command=do_ok).pack(side=tk.RIGHT, padx=(0, 6))
+        win.bind("<Escape>", lambda e: (do_cancel(), "break"))
+
+
+    def open_bottom_note_editor_for_mosaic(self):
+        """
+        仅在“拼接整体预览”中生效的底注编辑器：
+        - Confirm 后：更新【mosaic_bottom_note_text】专用变量，
+        并把结果直接叠加到 compose_preview['base'] 上，再刷新右侧预览底图。
+        """
+        if not bool(getattr(self, "_is_composed_preview", False)) or not getattr(self, "compose_preview", None):
+            # 若意外不在拼接模式，回退到原编辑器（单图全局变量）
+            return self.open_bottom_note_editor()
+
+        self._ensure_mosaic_vars()
+
+        win = tk.Toplevel(self)
+        win.title("edit foot note (mosaic)")
+        win.transient(self); win.grab_set()
+        win.resizable(True, True)
+
+        frm = ttk.Frame(win); frm.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        ttk.Label(frm, text="Note content:", justify="left").pack(anchor="w")
+        txt = tk.Text(frm, height=10, width=60, wrap="none")
+        txt.pack(fill=tk.BOTH, expand=True, pady=(6, 6))
+
+        # 预填：拼接专用变量
+        txt.insert("1.0", getattr(self, "mosaic_bottom_note_text", "") or "")
+
+        btns = ttk.Frame(frm); btns.pack(fill=tk.X)
+
+        def do_ok():
+            try:
+                self.mosaic_bottom_note_text = txt.get("1.0", "end")
+            except Exception:
+                self.mosaic_bottom_note_text = ""
+            win.destroy()
+
+            # 直接叠加到拼接 base 上并刷新右侧底图
+            try:
+                base = (getattr(self, "compose_preview", {}) or {}).get("base", None)
+                if base is not None:
+                    new_disp = self._apply_mosaic_annotations(base)
+                    if hasattr(self, "canvas_anno") and hasattr(self.canvas_anno, "update_base_image"):
+                        self.canvas_anno.update_base_image(new_disp)
+                    self._set_composed_preview(base_img=base, display_img=new_disp)
+                    self.compose_stash()
+            except Exception:
+                pass
+
+        def do_clear():
+            txt.delete("1.0", "end")
+
+        def do_cancel():
+            win.destroy()
+
+        ttk.Button(btns, text="Clear", command=do_clear).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Cancel", command=do_cancel).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Confirm", command=do_ok).pack(side=tk.RIGHT, padx=(0, 6))
+        win.bind("<Escape>", lambda e: (do_cancel(), "break"))
+
     def on_toggle_show_green(self):
         """
         仅切换绿线显示，不做任何重算。
@@ -3217,7 +3537,21 @@ class App(tk.Tk):
         # 理论不会到此；兜底返回原图
 
 
+# 在 App 类中新增（位置不拘，和其它小工具方法放一起即可）
+    def _ensure_mosaic_vars(self):
+        """确保拼接专用变量已存在。"""
+        if not hasattr(self, "mosaic_right_table_text"):
+            self.mosaic_right_table_text = ""
+        if not hasattr(self, "mosaic_right_table_opts"):
+            self.mosaic_right_table_opts = {}
+        if not hasattr(self, "mosaic_bottom_note_text"):
+            self.mosaic_bottom_note_text = ""
+
+
     def render_current(self):
+        self._soft_reset_for_operation()
+        try: self._unset_composed_preview()
+        except Exception: pass
         if self.orig_bgr is None:
             return
         # 1) 旋转对齐并裁剪 ROI
@@ -3471,6 +3805,10 @@ class App(tk.Tk):
             )
 
     def recompose_using_cache(self):
+        
+        try: self._unset_composed_preview()
+        except Exception: pass
+
         rc = getattr(self, "render_cache", None) or {}
         core = rc.get("core_no_green", None)
         if core is None or not isinstance(core, np.ndarray) or core.size == 0:
@@ -4063,6 +4401,7 @@ class App(tk.Tk):
         - 提交后不再全量渲染，而是基于缓存核心图快速组合顶部面板与备注；
         - 依旧支持空行（不标注）。
         """
+        #self._soft_reset_for_operation()
         win = tk.Toplevel(self)
         win.title("Edit column names and molecular weights (one column per line; empty line = no label).")
         win.transient(self); win.grab_set()
