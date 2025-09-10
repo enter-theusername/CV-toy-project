@@ -1126,6 +1126,8 @@ class App(tk.Tk):
         # widget -> {"img": np.ndarray, "last": (w,h)}
         self._autofit_store: dict[tk.Label, dict] = {}
 
+        self.stash: list[dict] = []
+
         # 左右UI
         self._build_left()
         self._build_right()
@@ -1446,42 +1448,44 @@ class App(tk.Tk):
         table_text: str,
         has_header: bool = True,
         show_grid: bool = True,
-        align: str = "center",      # "left" / "center" / "right"
-        cap_px: int = None,         # 像素字高（若为 None 则沿用 bottom_note 的字号）
-        cell_pad_x: int = 12,       # 单元格左右内边距
-        cell_pad_y: int = 8,        # 单元格上下内边距
+        align: str = "center",  # "left" / "center" / "right"
+        cap_px: int = None,     # 用户可见的“Font height (px)”；在 cap_policy 下可能被上限约束
+        cell_pad_x: int = 12,
+        cell_pad_y: int = 8,
         line_color: tuple = (0, 0, 0),  # BGR
-        gap_px: int = 30,           # 主图与表格之间的水平空隙
-        panel_top_h: int = 0,       # 胶图上沿在整图中的 Y 偏移（像素）
-        gel_height_px: int = None   # 胶图像素高度（不含顶部面板与底注）
+        gap_px: int = 30,
+        panel_top_h: int = 0,
+        gel_height_px: int = None,      # 参考高度优先使用胶高；否则 H_img - panel_top_h
+        cap_policy: str = "max_auto"    # "max_auto"（默认）|"auto_only"|"free"
     ) -> np.ndarray:
         """
-        将“表格”（来自 Excel 粘贴的文本）渲染为白底网格，并拼接到图像右侧：
-        - 与主图之间插入固定 gap_px（默认 30px）白色竖条；
-        - 表格上沿与“胶图上沿”对齐（通过 panel_top_h 指定），
-        表格主体高度不超过 (整图高 - panel_top_h)，不足则底部补白，超出则裁切；
-        - 最终组合图整体高度保持不变。
+        右侧白底表格列（从 Excel 粘贴文本解析）：
+        - shrink-to-fit：表格过高则自动等比缩小“字号+内边距”，直到完整适配可用高度；
+        - cap_policy 控制“用户设置 cap_px 与按高度自动计算的上限”的关系：
+            · "max_auto"（默认）：字号 <= 按高度计算的 auto_cap；用户设置只能调小，不能放大；
+            · "auto_only"：完全忽略 cap_px，始终用 auto_cap；
+            · "free"：尊重 cap_px（与前一版相同）。
         """
         import numpy as np, cv2
         from PIL import Image, ImageDraw, ImageFont
 
+        # ---------- 基础 ----------
         if img_bgr is None or not isinstance(img_bgr, np.ndarray) or img_bgr.size == 0:
             return img_bgr
-
         H_img, W_img = img_bgr.shape[:2]
         panel_top_h = max(0, int(panel_top_h))
-        body_avail_h = max(0, H_img - panel_top_h)  # 胶图及以下可用高度
+        body_avail_h = max(0, H_img - panel_top_h)  # 表格主体可用高度（顶对齐）
 
-        # 解析粘贴文本（支持 \t / 逗号 / 分号 / 竖线）
+        # ---------- 解析粘贴文本 ----------
         raw = (table_text or "").replace("\r\n", "\n").replace("\r", "\n")
         rows_raw = raw.split("\n")
         rows = []
         for ln in rows_raw:
-            s = ln
-            if "\t" in s:
-                cells = s.split("\t")
+            sline = ln
+            if "\t" in sline:
+                cells = sline.split("\t")
             else:
-                s2 = s.replace("，", ",").replace("；", ";").replace("、", ",")
+                s2 = sline.replace("，", ",").replace("；", ";").replace("、", ",")
                 if "," in s2:
                     cells = s2.split(",")
                 elif ";" in s2:
@@ -1491,154 +1495,218 @@ class App(tk.Tk):
                 else:
                     cells = [s2]
             rows.append([c.strip() for c in cells])
-
         rows = [r for r in rows if any((c.strip() for c in r))]
         if not rows:
-            # 仍需插入 30px 空隙（视觉保持），但没有表格列
             gap = np.full((H_img, max(1, gap_px), 3), 255, dtype=np.uint8)
             return np.concatenate([img_bgr, gap], axis=1)
-
         max_cols = max(len(r) for r in rows)
         for r in rows:
             if len(r) < max_cols:
                 r.extend([""] * (max_cols - len(r)))
 
-        # 字体设置
-        design = self._get_design_params()
-        if cap_px is None:
-            cap_px = int(design.get("bottom_cap_px", 28))
+        # ---------- 初始字号：按“高度/1000”为基准，叠加 cap_policy 上限 ----------
+        ref_h = int(gel_height_px) if isinstance(gel_height_px, (int, float)) and gel_height_px else int(body_avail_h)
+        ref_h = max(1, ref_h)
+        s_ref = max(0.35, float(ref_h) / 1000.0)  # 下限避免过小
+        design = self._get_design_params()         # bottom_cap_px ≈ 28
+        base_cap = int(design.get("bottom_cap_px", 28))
+        auto_cap = max(10, int(round(base_cap * s_ref)))  # “按高度自动”字号上限
+
+        # 处理 cap_policy
+        if str(cap_policy).lower() == "auto_only":
+            cap_init = auto_cap
+        elif str(cap_policy).lower() == "max_auto":
+            user_cap = int(cap_px) if isinstance(cap_px, (int, float)) and cap_px else auto_cap
+            cap_init = min(int(user_cap), int(auto_cap))   # << 关键：不允许超过自动上限
+        else:  # "free"
+            cap_init = int(cap_px) if isinstance(cap_px, (int, float)) and cap_px else auto_cap
+
+        # 内边距随 s 缩放（不提供外部放大开关，因此直接按 auto）
+        pad_x_init = max(6, int(round(cell_pad_x * s_ref)))
+        pad_y_init = max(4, int(round(cell_pad_y * s_ref)))
+
+        # ---------- 最小限（可按需调整） ----------
+        MIN_CAP   = 12
+        MIN_PAD_X = 4
+        MIN_PAD_Y = 3
+        # ---------- 字体引擎（Pillow 优先，回退 OpenCV） ----------
         font_path = self._find_font_ttf()
         use_pil = font_path is not None
-        if use_pil:
-            try:
-                font = ImageFont.truetype(font_path, size=max(12, int(cap_px)))
-            except Exception:
-                use_pil = False
 
-        def _measure_pil(text: str):
-            if not text:
-                text = " "
+        def _measure_table(cap_px_cur: int, pad_x_cur: int, pad_y_cur: int, want_pil: bool):
+            """测量列宽/行高，返回 (col_widths, row_heights, grid_w, grid_h, engine, ctx)。"""
+            if want_pil:
+                try:
+                    font = ImageFont.truetype(font_path, size=max(12, int(cap_px_cur)))
+                except Exception:
+                    return _measure_table(cap_px_cur, pad_x_cur, pad_y_cur, False)
+                tmp = Image.new("RGB", (8, 8), "white")
+                drw = ImageDraw.Draw(tmp)
+                def meas(text: str):
+                    t = text if text else " "
+                    bbox = drw.textbbox((0, 0), t, font=font)
+                    return max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
+                col_widths = [0] * max_cols
+                row_heights = [0] * len(rows)
+                for i, r in enumerate(rows):
+                    max_h = 0
+                    for j, cell in enumerate(r):
+                        tw, th = meas(cell)
+                        col_widths[j] = max(col_widths[j], tw + 2 * pad_x_cur)
+                        max_h = max(max_h, th + 2 * pad_y_cur)
+                    row_heights[i] = max(1, max_h)
+                grid_w = sum(col_widths) + (1 if show_grid else 0)
+                grid_h = sum(row_heights) + (1 if show_grid else 0)
+                return col_widths, row_heights, grid_w, grid_h, "pil", font
+            else:
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                scale = self._font_scale_for_cap_height_px(int(cap_px_cur), font=font, thickness=2)
+                def meas_cv(text: str):
+                    t = text if text else " "
+                    (tw, th), _ = cv2.getTextSize(t, font, scale, 2)
+                    return max(1, tw), max(1, th)
+                col_widths = [0] * max_cols
+                row_heights = [0] * len(rows)
+                for i, r in enumerate(rows):
+                    max_h = 0
+                    for j, cell in enumerate(r):
+                        tw, th = meas_cv(cell)
+                        col_widths[j] = max(col_widths[j], tw + 2 * pad_x_cur)
+                        max_h = max(max_h, th + 2 * pad_y_cur)
+                    row_heights[i] = max(1, max_h)
+                grid_w = sum(col_widths) + (1 if show_grid else 0)
+                grid_h = sum(row_heights) + (1 if show_grid else 0)
+                return col_widths, row_heights, grid_w, grid_h, "cv", scale
+
+        # ---------- shrink-to-fit：过高时循环缩小（字号+内边距） ----------
+        cap_cur  = int(cap_init)
+        padx_cur = int(pad_x_init)
+        pady_cur = int(pad_y_init)
+        engine   = "pil" if use_pil else "cv"
+        ctx      = None
+
+        MAX_ITERS = 8
+        for _ in range(MAX_ITERS):
+            col_w, row_h, grid_w, grid_h, engine, ctx = _measure_table(cap_cur, padx_cur, pady_cur, engine == "pil")
+            if grid_h <= body_avail_h:
+                break  # 已适配
+            f = float(body_avail_h) / float(grid_h)
+            f = max(0.50, min(0.98, f))  # 收缩但不过猛
+            new_cap  = max(MIN_CAP,   int(round(cap_cur  * f)))
+            new_padx = max(MIN_PAD_X, int(round(padx_cur * f)))
+            new_pady = max(MIN_PAD_Y, int(round(pady_cur * f)))
+            if new_cap == cap_cur and new_padx == padx_cur and new_pady == pady_cur:
+                if cap_cur > MIN_CAP:
+                    cap_cur -= 1; continue
+                if pady_cur > MIN_PAD_Y:
+                    pady_cur -= 1; continue
+                if padx_cur > MIN_PAD_X:
+                    padx_cur -= 1; continue
+                break
+            cap_cur, padx_cur, pady_cur = new_cap, new_padx, new_pady
+
+        # 最终尺寸
+        col_w, row_h, grid_w, grid_h, engine, ctx = _measure_table(cap_cur, padx_cur, pady_cur, engine == "pil")
+
+        # ---------- 绘制表格 ----------
+        if engine == "pil":
+            font = ctx  # PIL Font
+            panel_img = Image.new("RGB", (grid_w, grid_h), "white")
+            draw = ImageDraw.Draw(panel_img)
+            header_rows = 1 if has_header and len(rows) >= 1 else 0
+            if header_rows == 1:
+                y_top = 0
+                hdr_h = row_h[0]
+                draw.rectangle([(0, y_top), (grid_w - 1, y_top + hdr_h - 1)], fill=(240, 240, 240))
+            if show_grid:
+                y = 0
+                draw.line([(0, y), (grid_w - 1, y)], fill=(0, 0, 0), width=1)
+                for h in row_h:
+                    y += h
+                    draw.line([(0, y), (grid_w - 1, y)], fill=(0, 0, 0), width=1)
+                x = 0
+                draw.line([(x, 0), (x, grid_h - 1)], fill=(0, 0, 0), width=1)
+                for w in col_w:
+                    x += w
+                    draw.line([(x, 0), (x, grid_h - 1)], fill=(0, 0, 0), width=1)
+            def _x_for_cell(tw: int, col_left: int, col_wid: int):
+                if align == "left":  return col_left + padx_cur
+                if align == "right": return col_left + max(0, col_wid - tw - padx_cur)
+                return col_left + max(0, (col_wid - tw) // 2)
             tmp = Image.new("RGB", (8, 8), "white")
             drw = ImageDraw.Draw(tmp)
-            bbox = drw.textbbox((0, 0), text, font=font)
-            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            return max(1, w), max(1, h)
-
-        def _measure_cv(text: str):
-            if not text:
-                text = " "
-            f = cv2.FONT_HERSHEY_SIMPLEX
-            scale = self._font_scale_for_cap_height_px(cap_px, font=f, thickness=2)
-            (tw, th), base = cv2.getTextSize(text, f, scale, 2)
-            return max(1, tw), max(1, th)
-
-        meas = _measure_pil if use_pil else _measure_cv
-
-        # 计算列宽/行高
-        col_widths = [0] * max_cols
-        row_heights = [0] * len(rows)
-        for i, r in enumerate(rows):
-            max_h = 0
-            for j, cell in enumerate(r):
-                tw, th = meas(cell)
-                col_widths[j] = max(col_widths[j], tw + 2 * cell_pad_x)
-                max_h = max(max_h, th + 2 * cell_pad_y)
-            row_heights[i] = max(1, max_h)
-
-        grid_w = sum(col_widths) + (1 if show_grid else 0)
-        grid_h = sum(row_heights) + (1 if show_grid else 0)
-
-        # 用 PIL 绘制（文本更清晰），再转 BGR
-        panel_img = Image.new("RGB", (grid_w, grid_h), "white")
-        draw = ImageDraw.Draw(panel_img)
-
-        # 表头背景
-        header_rows = 1 if has_header and len(rows) >= 1 else 0
-        if header_rows == 1:
-            y_top = 0
-            hdr_h = row_heights[0]
-            draw.rectangle([(0, y_top), (grid_w - 1, y_top + hdr_h - 1)], fill=(240, 240, 240))
-
-        # 网格线
-        if show_grid:
-            # 横线
-            y = 0
-            draw.line([(0, y), (grid_w - 1, y)], fill=(0, 0, 0), width=1)
-            for h in row_heights:
-                y += h
-                draw.line([(0, y), (grid_w - 1, y)], fill=(0, 0, 0), width=1)
-            # 竖线
-            x = 0
-            draw.line([(x, 0), (x, grid_h - 1)], fill=(0, 0, 0), width=1)
-            for w in col_widths:
-                x += w
-                draw.line([(x, 0), (x, grid_h - 1)], fill=(0, 0, 0), width=1)
-
-        # 文本对齐
-        def _x_for_cell(text_w: int, col_left: int, col_w: int):
-            if align == "left":
-                return col_left + cell_pad_x
-            elif align == "right":
-                return col_left + max(0, col_w - text_w - cell_pad_x)
-            else:
-                return col_left + max(0, (col_w - text_w) // 2)
-
-        # 绘制文本
-        y_cursor = 0
-        for i, r in enumerate(rows):
-            x_cursor = 0
-            for j, cell in enumerate(r):
-                col_w = col_widths[j]
-                if use_pil:
-                    tw, th = _measure_pil(cell)
-                    tx = _x_for_cell(tw, x_cursor, col_w)
-                    ty = y_cursor + max(0, (row_heights[i] - th) // 2)
-                    if has_header and i == 0:
-                        draw.text((tx, ty), cell or " ", fill=(0, 0, 0), font=font, stroke_width=1, stroke_fill=(0, 0, 0))
+            def _meas_pil(text: str):
+                t = text if text else " "
+                bb = drw.textbbox((0, 0), t, font=font)
+                return max(1, bb[2] - bb[0]), max(1, bb[3] - bb[1])
+            y_cursor = 0
+            for i, r in enumerate(rows):
+                x_cursor = 0
+                for j, cell in enumerate(r):
+                    tw, th = _meas_pil(cell)
+                    tx = _x_for_cell(tw, x_cursor, col_w[j])
+                    ty = y_cursor + max(0, (row_h[i] - th) // 2)
+                    if header_rows and i == 0:
+                        draw.text((tx, ty), cell or " ", fill=(0, 0, 0), font=font,
+                                stroke_width=1, stroke_fill=(0, 0, 0))
                     else:
                         draw.text((tx, ty), cell or " ", fill=(0, 0, 0), font=font)
-                else:
-                    import numpy as np
-                    cv = cv2.cvtColor(np.array(panel_img), cv2.COLOR_RGB2BGR)
-                    f = cv2.FONT_HERSHEY_SIMPLEX
-                    scale = self._font_scale_for_cap_height_px(cap_px, font=f, thickness=2)
-                    (tw, th), base = cv2.getTextSize(cell if cell else " ", f, scale, 2)
-                    tx = _x_for_cell(tw, x_cursor, col_w)
-                    ty = y_cursor + max(0, (row_heights[i] + th) // 2)
+                    x_cursor += col_w[j]
+                y_cursor += row_h[i]
+            panel_bgr = cv2.cvtColor(np.array(panel_img), cv2.COLOR_RGB2BGR)
+        else:
+            font_cv = cv2.FONT_HERSHEY_SIMPLEX
+            scale_cv = ctx
+            panel_bgr = np.full((grid_h, grid_w, 3), 255, dtype=np.uint8)
+            header_rows = 1 if has_header and len(rows) >= 1 else 0
+            if header_rows == 1:
+                y_top = 0
+                hdr_h = row_h[0]
+                cv2.rectangle(panel_bgr, (0, y_top), (grid_w - 1, y_top + hdr_h - 1), (240, 240, 240), thickness=-1)
+            if show_grid:
+                y = 0
+                cv2.line(panel_bgr, (0, y), (grid_w - 1, y), (0, 0, 0), 1)
+                for h in row_h:
+                    y += h
+                    cv2.line(panel_bgr, (0, y), (grid_w - 1, y), (0, 0, 0), 1)
+                x = 0
+                cv2.line(panel_bgr, (x, 0), (x, grid_h - 1), (0, 0, 0), 1)
+                for w in col_w:
+                    x += w
+                    cv2.line(panel_bgr, (x, 0), (x, grid_h - 1), (0, 0, 0), 1)
+            def _x_for_cell_cv(tw: int, col_left: int, col_wid: int):
+                if align == "left":  return col_left + padx_cur
+                if align == "right": return col_left + max(0, col_wid - tw - padx_cur)
+                return col_left + max(0, (col_wid - tw) // 2)
+            y_cursor = 0
+            for i, r in enumerate(rows):
+                x_cursor = 0
+                for j, cell in enumerate(r):
+                    t = cell if cell else " "
+                    (tw, th), base = cv2.getTextSize(t, font_cv, scale_cv, 2)
+                    tx = _x_for_cell_cv(tw, x_cursor, col_w[j])
+                    ty = y_cursor + max(0, (row_h[i] + th) // 2)
                     try:
-                        cv2.putText(cv, cell if cell else " ", (tx, ty), f, scale, line_color, 2, cv2.LINE_AA)
+                        cv2.putText(panel_bgr, t, (tx, ty), font_cv, scale_cv, line_color, 2, cv2.LINE_AA)
                     except Exception:
-                        cv2.putText(cv, "?", (tx, ty), f, scale, line_color, 2, cv2.LINE_AA)
-                    panel_img = Image.fromarray(cv2.cvtColor(cv, cv2.COLOR_BGR2RGB))
-                    draw = ImageDraw.Draw(panel_img)
-                x_cursor += col_w
-            y_cursor += row_heights[i]
+                        cv2.putText(panel_bgr, "?", (tx, ty), font_cv, scale_cv, line_color, 2, cv2.LINE_AA)
+                    x_cursor += col_w[j]
+                y_cursor += row_h[i]
 
-        panel_bgr = cv2.cvtColor(np.array(panel_img), cv2.COLOR_RGB2BGR)
-
-        # === 顶对齐与高度适配 ===
-        # 可用主体高度（胶图及以下）为 body_avail_h；把表格裁切/补白到该高度
+        # ---------- 顶对齐 & 与主图并排 ----------
         Hp, Wp = panel_bgr.shape[:2]
-        body_avail_h = max(0, body_avail_h)
         if Hp < body_avail_h:
             pad = np.full((body_avail_h - Hp, Wp, 3), 255, dtype=np.uint8)
             panel_bgr = np.vstack([panel_bgr, pad])
         elif Hp > body_avail_h:
-            panel_bgr = panel_bgr[:body_avail_h, :, :]
+            panel_bgr = panel_bgr[:body_avail_h, :, :]  # 兜底裁切
 
-        # 顶部补白 = panel_top_h，底部补白 = 0（因为上面已将表格主体适配为 body_avail_h）
-        top_pad = np.full((panel_top_h, Wp, 3), 255, dtype=np.uint8) if panel_top_h > 0 else None
-        column_full = panel_bgr if top_pad is None else np.vstack([top_pad, panel_bgr])
+        top_pad_img = np.full((panel_top_h, Wp, 3), 255, dtype=np.uint8) if panel_top_h > 0 else None
+        column_full = panel_bgr if top_pad_img is None else np.vstack([top_pad_img, panel_bgr])
 
-        # 水平 30px 白色间隙
-        gap_px = max(0, int(gap_px))
         gap = np.full((H_img, max(1, gap_px), 3), 255, dtype=np.uint8)
-
-        # 与主图等高（column_full 当前高度 = panel_top_h + body_avail_h = H_img）
-        # 拼接：主图 | gap | 表格列
         out = np.concatenate([img_bgr, gap, column_full], axis=1)
         return out
-
 
 
     # -------------------- UI：左侧 -------------------- #
@@ -1754,6 +1822,18 @@ class App(tk.Tk):
         ttk.Button(f_action, text="Export annotated image", command=self.export_current).pack(fill=tk.X, padx=6, pady=4)
         ttk.Button(f_action, text="Export intensities (CSV)", command=self.export_arrow_box_metrics)\
             .pack(fill=tk.X, padx=6, pady=4)
+
+
+        # --- Stash / Compose ---
+        f_stash = ttk.LabelFrame(left, text="暂存 / 拼接")
+        f_stash.pack(fill=tk.X, pady=6)
+
+        ttk.Button(f_stash, text="暂存当前截取",
+                command=self.stash_current_gel).pack(fill=tk.X, padx=6, pady=(6, 2))
+        ttk.Button(f_stash, text="清空暂存",
+                command=self.clear_stash).pack(fill=tk.X, padx=6, pady=2)
+        ttk.Button(f_stash, text="拼接已暂存（输入表格与底注）",
+                command=self.compose_stash).pack(fill=tk.X, padx=6, pady=(2, 6))
 
         # ---- Custom labels (column name + per-column MWs) ----
         f_lab = ttk.LabelFrame(left, text="Custom labels")
@@ -1907,6 +1987,570 @@ class App(tk.Tk):
             except Exception:
                 pass
 
+    def _scale_geometry_for_factor(self, bounds, lanes, s: float):
+        """
+        按比例因子 s 缩放 lanes/bounds：
+        - bounds: shape=(Hg, nlanes+1)，仅缩放 X（四舍五入为 int32）
+        - lanes : [(l,r), ...]      ，l/r 同比例缩放为 int
+        返回 (bounds_s, lanes_s)
+        """
+        import numpy as np
+        bounds_s, lanes_s = None, None
+        if isinstance(bounds, np.ndarray) and bounds.ndim == 2:
+            try:
+                x = (bounds.astype(np.float64) * float(s))
+                bounds_s = np.rint(x).astype(np.int32)
+            except Exception:
+                bounds_s = None
+        if isinstance(lanes, list) and lanes:
+            try:
+                lanes_s = [(int(round(l * s)), int(round(r * s))) for (l, r) in lanes]
+            except Exception:
+                lanes_s = None
+        return bounds_s, lanes_s
+    def _attach_fixed_axis_panel(
+        self,
+        gel_bgr: np.ndarray,
+        ladder_peaks_y: list,      # 各刻度对应的 y（相对 gel 顶，单位像素）
+        ladder_labels: list,       # 各刻度的文本（float -> 将转为整数）
+        yaxis_side: str = "left",
+        cap_px: int = None,        # 字高像素，默认 _get_design_params()['axis_cap_px']
+        tick_len: int = 8,
+        pad_left: int = 10,
+        pad_right: int = 10,
+        pad_text_gap: int = 6,
+    ) -> tuple[np.ndarray, int]:
+        """
+        在 gel_bgr 左/右侧追加固定像素字号的白色面板，绘制刻度短线与文本（文本强制整数，无小数）。
+        返回 (合成图, 面板宽 panel_w)。
+        """
+        import numpy as np, cv2
+        if gel_bgr is None or not isinstance(gel_bgr, np.ndarray) or gel_bgr.size == 0:
+            return gel_bgr, 0
+        H, W = gel_bgr.shape[:2]
+        design = self._get_design_params()
+        cap_px = int(cap_px) if isinstance(cap_px, (int, float)) and cap_px else int(design.get("axis_cap_px", 16))
+        # 字体度量
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        thickness = 2
+        scale = self._font_scale_for_cap_height_px(cap_px, font=font, thickness=thickness)
+
+        # 统一转整数文本（去小数）
+        def _fmt_int(v) -> str:
+            try:
+                return str(int(round(float(v))))
+            except Exception:
+                return str(v)
+
+        labels = [_fmt_int(x) for x in (ladder_labels or [])]
+        ys = [int(round(float(y))) for y in (ladder_peaks_y or []) if isinstance(y, (int, float))]
+        if len(labels) != len(ys):
+            n = min(len(labels), len(ys))
+            labels, ys = labels[:n], ys[:n]
+
+        # 计算最大文本宽度
+        max_w = 0
+        sizes = []
+        for t in labels:
+            (tw, th), base = cv2.getTextSize(t if t else " ", font, scale, thickness)
+            sizes.append((tw, th))
+            max_w = max(max_w, tw)
+
+        panel_w = pad_left + tick_len + pad_text_gap + max_w + pad_right
+        panel = np.full((H, panel_w, 3), 255, dtype=np.uint8)
+
+        # 绘制
+        side = str(yaxis_side or "left").lower()
+        for i, t in enumerate(labels):
+            y = int(np.clip(ys[i], 0, H - 1))
+            (tw, th) = sizes[i]
+            if side == "right":
+                x0 = 0
+                x1 = tick_len
+                tx = x1 + pad_text_gap
+            else:
+                x1 = panel_w - 1
+                x0 = x1 - tick_len
+                tx = x0 - pad_text_gap - tw
+                tx = max(0, tx)
+            cv2.line(panel, (x0, y), (x1, y), (0, 0, 0), 1, cv2.LINE_AA)
+            ty = int(np.clip(y + th // 2, th, H - 1))
+            cv2.putText(panel, t if t else " ", (tx, ty), font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
+
+        out = np.concatenate([gel_bgr, panel], axis=1) if side == "right" else np.concatenate([panel, gel_bgr], axis=1)
+        return out, int(panel_w)
+
+
+
+    def stash_current_gel(self):
+        """
+        暂存当前截取的胶图，并保存：
+        - 分子量刻度、标准道索引、分段标定模型
+        - 泳道几何（bounds 或 lanes）
+        - 顶部泳道文本 lane_names、各列分子量 lane_marks
+        - 右侧画布里用户拖动后的箭头“凝胶坐标系位置” arrows_manual
+        - 对齐关键：最高/最低带 y
+        """
+        from tkinter import messagebox
+        import numpy as np
+        rc = getattr(self, "render_cache", None) or {}
+        gel_bgr = rc.get("gel_bgr", None)
+        if gel_bgr is None or not hasattr(gel_bgr, "shape"):
+            messagebox.showwarning("提示", "还未渲染或缺少胶图数据，请先渲染当前截取。")
+            return
+        H, W = gel_bgr.shape[:2]
+        nlanes = int(self.var_nlanes.get())
+        ladder_lane = max(1, min(int(self.var_ladder_lane.get()), nlanes))
+        yaxis_side = str(self.var_axis.get() or "left").lower()
+
+        def _parse_list(s: str):
+            s = (s or "").replace("，", ",")
+            out = []
+            for t in s.split(","):
+                t = t.strip()
+                if not t:
+                    continue
+                try:
+                    out.append(float(t))
+                except:
+                    pass
+            return out
+
+        tick_labels = rc.get("tick_labels", None)
+        if not tick_labels:
+            tick_labels = _parse_list(self.ent_marker.get()) or [180,130,95,65,52,41,31,25,17,10]
+        tick_labels = sorted([float(x) for x in tick_labels if np.isfinite(x) and x>0], reverse=True)
+
+        # — 标定/峰位估计 y_top / y_bot（与原逻辑一致） —
+        y_top, y_bot = None, None
+        calib_model = rc.get("calib_model", None)
+        fit_ok = bool(rc.get("fit_ok", False))
+        bounds = rc.get("bounds", None)
+        lanes = rc.get("lanes", None)
+        try:
+            if fit_ok and calib_model and "xk" in calib_model and "yk" in calib_model and len(tick_labels)>=2:
+                from gel_core import predict_y_from_mw_piecewise
+                ys_pred = predict_y_from_mw_piecewise([tick_labels[0], tick_labels[-1]],
+                                                    np.asarray(calib_model['xk']),
+                                                    np.asarray(calib_model['yk']))
+                y_top = float(min(ys_pred)); y_bot = float(max(ys_pred))
+            else:
+                gray = cv2.cvtColor(gel_bgr, cv2.COLOR_BGR2GRAY)
+                if isinstance(bounds, np.ndarray):
+                    peaks, _ = detect_bands_along_y_slanted(gray, bounds, lane_index=ladder_lane-1,
+                                                            y0=0, y1=None, min_distance=20, min_prominence=10.0)
+                elif isinstance(lanes, list) and lanes:
+                    l, r = lanes[ladder_lane-1]
+                    sub = gray[:, l:r]
+                    peaks, _ = detect_bands_along_y_prominence(sub, y0=0, y1=None,
+                                                            min_distance=20, min_prominence=10.0)
+                else:
+                    peaks = []
+                if peaks:
+                    y_top = float(min(peaks)); y_bot = float(max(peaks))
+        except Exception:
+            pass
+        if y_top is None or y_bot is None or not np.isfinite(y_top) or not np.isfinite(y_bot) or y_bot <= y_top:
+            y_top, y_bot = 0.0, float(H - 1)
+
+        # —— lane_names / lane_marks / 几何 —— #
+        lane_names_snapshot = list(self.lane_names or [])
+        lane_marks_snapshot = [list(x or []) for x in (self.lane_marks or [])]
+
+        bounds_snapshot = None
+        if isinstance(bounds, np.ndarray):
+            try:
+                bounds_snapshot = bounds.astype(np.int32).copy()
+            except Exception:
+                bounds_snapshot = bounds.copy()
+        lanes_snapshot = None
+        if isinstance(lanes, list):
+            try:
+                lanes_snapshot = [(int(l), int(r)) for (l, r) in lanes]
+            except Exception:
+                lanes_snapshot = lanes
+
+        # —— 关键：读取右侧画布的箭头，并转为“凝胶坐标系”存储 —— #
+        arrows_manual = []
+        try:
+            arrows_manual = self._snapshot_arrows_from_canvas()
+        except Exception:
+            arrows_manual = []
+
+        item = {
+            "gel_bgr": gel_bgr.copy(),
+            "meta": {
+                "nlanes": int(nlanes),
+                "ladder_lane": int(ladder_lane),
+                "yaxis_side": yaxis_side,
+                "tick_labels": tick_labels,
+                "calib_model": calib_model,
+                "fit_ok": fit_ok,
+                "mode": ("slanted" if isinstance(bounds, np.ndarray) else ("uniform" if lanes else "unknown")),
+                "bounds": bounds_snapshot,
+                "lanes": lanes_snapshot,
+                "lane_names": lane_names_snapshot,
+                "lane_marks": lane_marks_snapshot,
+                "arrows_manual": arrows_manual,  # ★★★★★ 现在把箭头真实位置存进来了
+            },
+            "align": { "y_top": float(y_top), "y_bot": float(y_bot) }
+        }
+        self.stash.append(item)
+        messagebox.showinfo("完成", f"已暂存 1 张（当前累计 {len(self.stash)} 张）。")
+
+    def clear_stash(self):
+        """清空暂存队列（内存）。"""
+        from tkinter import messagebox
+        self.stash.clear()
+        messagebox.showinfo("完成", "已清空暂存列表。")
+
+    def compose_stash(self):
+        """
+        拼接已暂存：
+        - 仅第一张添加固定整数字号的侧标；
+        - 各图顶部泳道栏加入后再对齐；
+        - 箭头优先按暂存的 arrows_manual 还原（考虑缩放 s、顶部栏高度、对齐补白、X 偏移与面板宽），
+        无 arrows_manual 时再按 calib_model + lane_marks 推算。
+        """
+        from tkinter import messagebox
+        import numpy as np, cv2
+
+        if not getattr(self, "stash", None):
+            messagebox.showwarning("提示", "暂无暂存内容，请先‘暂存当前截取’。")
+            return
+        if len(self.stash) < 1:
+            messagebox.showwarning("提示", "暂存数量不足（至少 1 张）。")
+            return
+
+        items = self.stash
+
+        # 1) 参考跨度（原凝胶尺度）
+        spans = [max(1.0, float(it["align"]["y_bot"]) - float(it["align"]["y_top"])) for it in items]
+        S_ref = float(max(spans))
+
+        # 2) 逐张：缩放 + 侧标（首图）+ 顶部栏（全部），并计算 y_top_total/y_bot_total
+        scaled_blocks, per_item_scale = [], []
+        for idx, it in enumerate(items):
+            gel = it["gel_bgr"]
+            H0, W0 = gel.shape[:2]
+            y_top0 = float(it["align"]["y_top"])
+            y_bot0 = float(it["align"]["y_bot"])
+            s = float(S_ref / max(1.0, y_bot0 - y_top0))
+
+            new_w = max(1, int(round(W0 * s)))
+            new_h = max(1, int(round(H0 * s)))
+            interp = cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
+            gel_scaled = cv2.resize(gel, (new_w, new_h), interpolation=interp)
+            y_top1 = float(y_top0 * s); y_bot1 = float(y_bot0 * s)
+
+            meta = it["meta"]
+            nlanes_i      = int(meta.get("nlanes", 0))
+            ladder_lane_i = int(meta.get("ladder_lane", 1))
+            yaxis_side_i  = str(meta.get("yaxis_side", "left")).lower()
+            bounds_i      = meta.get("bounds", None)
+            lanes_i       = meta.get("lanes", None)
+            lane_names_i  = meta.get("lane_names", []) or []
+            tick_labels_i = meta.get("tick_labels", []) or []
+            calib_model_i = meta.get("calib_model", None)
+
+            # 缩放几何
+            bounds_s, lanes_s = self._scale_geometry_for_factor(bounds_i, lanes_i, s)
+
+            # 首图：固定整数字号侧标
+            img_cur = gel_scaled
+            panel_w_left = 0
+            if idx == 0:
+                try:
+                    from gel_core import predict_y_from_mw_piecewise
+                    if calib_model_i and "xk" in calib_model_i and "yk" in calib_model_i and tick_labels_i:
+                        ys = predict_y_from_mw_piecewise(
+                            tick_labels_i, np.asarray(calib_model_i["xk"]), np.asarray(calib_model_i["yk"])
+                        )
+                        ladder_peaks = [int(round(float(y) * s)) for y in ys]
+                    else:
+                        ladder_peaks = [int(round(y_top1)), int(round(y_bot1))]
+                except Exception:
+                    ladder_peaks = [int(round(y_top1)), int(round(y_bot1))]
+                img_cur, axis_w = self._attach_fixed_axis_panel(
+                    img_cur, ladder_peaks, tick_labels_i, yaxis_side=yaxis_side_i,
+                    cap_px=self._get_design_params().get("axis_cap_px", 16)
+                )
+                panel_w_left = int(axis_w if yaxis_side_i == "left" else 0)
+
+            # 顶部泳道栏（加入后再对齐）
+            panel_top_h = 0
+            try:
+                n_non = max(0, nlanes_i - 1)
+                names_use = (lane_names_i + [""] * n_non)[:n_non]
+                labels_table = [names_use]
+                if any(((t or "").strip() for t in labels_table[0])):
+                    H_before = img_cur.shape[0]
+                    img_cur = self._attach_labels_panel(
+                        img_bgr=img_cur, lanes=lanes_s, bounds=bounds_s,
+                        labels_table=labels_table, gel_bgr=gel_scaled,
+                        ladder_lane=ladder_lane_i, yaxis_side=yaxis_side_i
+                    )
+                    panel_top_h = img_cur.shape[0] - H_before
+            except Exception:
+                panel_top_h = 0
+
+            y_top_total = panel_top_h + y_top1
+            y_bot_total = panel_top_h + y_bot1
+
+            scaled_blocks.append({
+                "img": img_cur,
+                "H": int(img_cur.shape[0]),
+                "W": int(img_cur.shape[1]),
+                "y_top1": y_top1, "y_bot1": y_bot1,
+                "y_top_total": y_top_total, "y_bot_total": y_bot_total,
+                "s": s,
+                "panel_w_left": panel_w_left,
+                "panel_top_h": int(panel_top_h),
+                "bounds_s": bounds_s, "lanes_s": lanes_s,
+                "nlanes": nlanes_i, "ladder_lane": ladder_lane_i,
+                "yaxis_side": yaxis_side_i,
+                "arrows_manual": meta.get("arrows_manual", []) or [],  # ★ 从暂存读出
+                "calib_model": calib_model_i,
+            })
+            per_item_scale.append(s)
+
+        # 3) 跨块对齐（考虑顶部栏）
+        y_tops_total = [b["y_top_total"] for b in scaled_blocks]
+        Y_top_ref_total = float(max(y_tops_total))
+        tails_total = [b["H"] - b["y_bot_total"] for b in scaled_blocks]
+        tail_max_total = float(max(tails_total))
+        H_final = int(round(Y_top_ref_total + S_ref + tail_max_total))
+
+        pad_tops, pad_bots = [], []
+        for b in scaled_blocks:
+            img = b["img"]; H = b["H"]
+            pad_top = int(round(Y_top_ref_total - float(b["y_top_total"])))
+            pad_bot = int(round((Y_top_ref_total + S_ref + tail_max_total) - (pad_top + H)))
+            pad_top = max(0, pad_top); pad_bot = max(0, pad_bot)
+            if pad_top > 0 or pad_bot > 0:
+                img = cv2.copyMakeBorder(img, pad_top, pad_bot, 0, 0, cv2.BORDER_CONSTANT, value=(255,255,255))
+                b["img"] = img
+                b["H"], b["W"] = img.shape[0], img.shape[1]
+            b["pad_top"] = int(pad_top); b["pad_bot"] = int(pad_bot)
+            pad_tops.append(pad_top); pad_bots.append(pad_bot)
+
+        # 4) 横向拼接 & 记录每块 X 偏移
+        gap = 30
+        columns, x_offsets = [], []
+        x_cursor = 0
+        for i, b in enumerate(scaled_blocks):
+            if i > 0:
+                columns.append(np.full((H_final, gap, 3), 255, dtype=np.uint8))
+                x_cursor += gap
+            columns.append(b["img"])
+            x_offsets.append(x_cursor)
+            x_cursor += b["W"]
+        mosaic = np.concatenate(columns, axis=1) if columns else None
+        if mosaic is None:
+            messagebox.showerror("错误", "拼接失败：没有有效图像。")
+            return
+
+        # 5) 右侧表格/底注（略，同你现有逻辑）
+        try: self.open_right_table_editor()
+        except Exception: pass
+        try: self.open_bottom_note_editor()
+        except Exception: pass
+        rtxt = (getattr(self, "right_table_text", "") or "").strip()
+        if rtxt:
+            cfg = (getattr(self, "right_table_opts", None) or {})
+            mosaic = self._attach_right_table_panel(
+                mosaic, rtxt,
+                has_header=bool(cfg.get("has_header", True)),
+                show_grid=bool(cfg.get("grid", True)),
+                align=str(cfg.get("align", "center")),
+                cap_px=int(cfg.get("cap_px", self._get_design_params().get("bottom_cap_px", 28))),
+                panel_top_h=0, gel_height_px=mosaic.shape[0],
+            )
+        note_raw = getattr(self, "bottom_note_text", "") or ""
+        if note_raw.strip():
+            mosaic = self._attach_bottom_note_panel(mosaic, note_raw, allow_expand_width=True)
+
+        # 6) 刷新右侧画布（允许全图拖动；不重置位置）
+        if hasattr(self, "canvas_anno") and self.canvas_anno is not None:
+            try:
+                self.canvas_anno.set_scene(
+                    base_img_bgr=mosaic,
+                    gel_bgr=np.zeros_like(mosaic),     # 拖动边界=整图
+                    bounds=None, lanes=None,
+                    a=0.0, b=0.0, fit_ok=True,
+                    nlanes=0, ladder_lane=1,
+                    yaxis_side="left",
+                    lane_marks=[],                     # 不通过默认生成
+                    panel_top_h=0, panel_w=0,
+                    calib_model=None,
+                    reset_positions=False              # 保留后续拖动
+                )
+            except Exception:
+                pass
+
+        # 7) 复原箭头：优先 arrows_manual；无则回退模型计算
+        try:
+            from gel_core import predict_y_from_mw_piecewise
+        except Exception:
+            predict_y_from_mw_piecewise = None
+
+        if hasattr(self, "canvas_anno") and self.canvas_anno is not None:
+            can = self.canvas_anno
+            Hm, Wm = mosaic.shape[:2]
+
+            for i, it in enumerate(items):
+                b = scaled_blocks[i]
+                s         = float(b["s"])
+                x_left    = int(x_offsets[i])
+                pad_top   = int(b.get("pad_top", 0))
+                panel_top = int(b.get("panel_top_h", 0))
+                panel_w_l = int(b.get("panel_w_left", 0))
+                bounds_s  = b["bounds_s"]; lanes_s = b["lanes_s"]
+                nlanes_i  = int(b["nlanes"]); ladder_lane_i = int(b["ladder_lane"])
+
+                # 真实泳道数（用于回退估算）
+                if isinstance(bounds_s, np.ndarray):
+                    real_n = max(0, bounds_s.shape[1] - 1)
+                elif isinstance(lanes_s, list) and lanes_s:
+                    real_n = len(lanes_s)
+                else:
+                    real_n = nlanes_i
+
+                # --- 7.a 有 arrows_manual：直接按缓存位置还原 ---
+                manual = it["meta"].get("arrows_manual", []) or b.get("arrows_manual", []) or []
+                if manual:
+                    for ar in manual:
+                        try:
+                            li = int(ar.get("lane_idx", -1))
+                            mw = float(ar.get("mw", float("nan")))
+                            x_gel = float(ar.get("x_gel", float("nan")))
+                            y_gel = float(ar.get("y_gel", float("nan")))
+                            if li < 0 or not (np.isfinite(mw) and mw > 0): 
+                                continue
+                            if not (np.isfinite(x_gel) and np.isfinite(y_gel)):
+                                continue
+                            x_img = float(x_left + panel_w_l + x_gel)           # 面板在左时要加 panel_w_left
+                            y_img = float(pad_top + panel_top + y_gel * s)      # 注意缩放 + 顶部栏 + 对齐补白
+                            # 限幅到拼接图范围
+                            x_img = float(np.clip(x_img, 0, Wm-1))
+                            y_img = float(np.clip(y_img, 0, Hm-1))
+                            can._add_arrow(x_img, y_img, lane_idx=li, mw=mw, moved=True)  # 标记 moved=True 便于后续复原
+                        except Exception:
+                            continue
+                    continue  # 本块已还原，无需回退
+
+                # --- 7.b 无 arrows_manual：回退按模型 + lane_marks 推算（保持你原有逻辑） ---
+                lane_marks_i = it["meta"].get("lane_marks", []) or []
+                if predict_y_from_mw_piecewise and it["meta"].get("calib_model", None):
+                    cm = it["meta"]["calib_model"]
+                else:
+                    cm = None
+
+                skip_idx = max(0, ladder_lane_i - 1)
+                nonladder_idx = [li for li in range(real_n) if li != skip_idx]
+                use_k = min(len(nonladder_idx), len(lane_marks_i))
+                for k in range(use_k):
+                    li = nonladder_idx[k]
+                    for mw in (lane_marks_i[k] or []):
+                        try:
+                            v = float(mw)
+                            if not (np.isfinite(v) and v > 0):
+                                continue
+                            if cm and "xk" in cm and "yk" in cm and predict_y_from_mw_piecewise:
+                                y_gel = float(predict_y_from_mw_piecewise([v],
+                                        np.asarray(cm["xk"]), np.asarray(cm["yk"]))[0])
+                            else:
+                                continue  # 无模型就不强行推
+                            y_img = float(pad_top + panel_top + (y_gel * s))
+                            # x 取左界（斜界或等宽或等分估）
+                            if isinstance(bounds_s, np.ndarray) and bounds_s.ndim == 2 and bounds_s.shape[0] > 0:
+                                y_row = int(np.clip(round(y_gel * s), 0, bounds_s.shape[0]-1))
+                                xl = int(bounds_s[y_row, li])
+                            elif isinstance(lanes_s, list) and lanes_s and 0 <= li < len(lanes_s):
+                                xl = int(lanes_s[li][0])
+                            else:
+                                Wg = int(round(gel.shape[1] * s))
+                                step = Wg / max(1, real_n)
+                                xl = int(round(li * step))
+                            x_img = float(x_left + panel_w_l + xl)
+                            x_img = float(np.clip(x_img, 0, Wm-1))
+                            y_img = float(np.clip(y_img, 0, Hm-1))
+                            can._add_arrow(x_img, y_img, lane_idx=li, mw=v, moved=True)
+                        except Exception:
+                            continue
+
+            # 抬升/重绘 & 方框（若开启）
+            try: can._redraw_arrows()
+            except Exception: pass
+            try:
+                if bool(self.var_show_boxes.get()):
+                    can.set_boxes_enabled(True)
+            except Exception:
+                pass
+
+        # 8) 更新 compose_meta（保留）
+        compose_items = []
+        for i, it in enumerate(items):
+            compose_items.append({
+                "meta": dict(it.get("meta", {})),
+                "align": dict(it.get("align", {})),
+                "scale_s": float(per_item_scale[i]),
+                "pad_top": int(pad_tops[i]),
+                "pad_bottom": int(pad_bots[i])
+            })
+        if not hasattr(self, "render_cache") or self.render_cache is None:
+            self.render_cache = {}
+        self.render_cache["compose_meta"] = {
+            "version": 3,
+            "single_axis_on": True,
+            "ref_axis_from_index": 0,
+            "S_ref": float(S_ref),
+            "Y_top_ref_total": float(max(y_tops_total)),
+            "items": compose_items
+        }
+        messagebox.showinfo("完成", f"已拼接 {len(self.stash)} 张（箭头已按暂存位置复原，支持继续拖动与导出）。")
+
+
+    def _snapshot_arrows_from_canvas(self) -> list[dict]:
+        """
+        从右侧交互画布（RightAnnoCanvas）读取所有箭头，转换为“凝胶坐标系”的绝对位置，返回列表：
+        [
+            { "lane_idx": int, "mw": float, "x_gel": float, "y_gel": float, "moved": bool },
+            ...
+        ]
+        说明：
+        - x_gel = x_img - canvas.x_offset
+        - y_gel = y_img - canvas.panel_top_h
+        """
+        import numpy as np
+        out = []
+        can = getattr(self, "canvas_anno", None)
+        if not can or not getattr(can, "arrows", None):
+            return out
+        x_off = float(getattr(can, "x_offset", 0.0))
+        y_off = float(getattr(can, "panel_top_h", 0.0))
+        for a in can.arrows:
+            try:
+                li = int(a.get("lane_idx", -1))
+                mw = float(a.get("mw", float("nan")))
+                x_img = float(a.get("x_img", float("nan")))
+                y_img = float(a.get("y_img", float("nan")))
+                if li < 0 or not (np.isfinite(mw) and mw > 0): 
+                    continue
+                if not (np.isfinite(x_img) and np.isfinite(y_img)):
+                    continue
+                x_gel = float(x_img - x_off)
+                y_gel = float(y_img - y_off)
+                out.append({
+                    "lane_idx": li,
+                    "mw": float(mw),
+                    "x_gel": float(x_gel),
+                    "y_gel": float(y_gel),
+                    "moved": bool(a.get("moved", True))  # 没标记也当成 moved=True，确保被保留
+                })
+            except Exception:
+                continue
+        return out
 
     # -------------------- 自适应显示：注册 / 刷新 -------------------- #
     def _bind_autofit(self, widget: tk.Label):
@@ -2962,8 +3606,7 @@ class App(tk.Tk):
         yaxis_side: str
     ) -> np.ndarray:
         """
-        在 img_bgr 上方追加“白底黑字”的标签面板（竖排+列中心水平居中，纵向向下对齐）。
-        本版修复：字符被裁半的问题——包含 baseline、高度/边距放宽，并为旋转后位图添加安全留白。
+        顶部白底竖排泳道标注：随“胶区高度 Hg”按 1000px 基准缩放。
         """
         import numpy as np, cv2
         if img_bgr is None or img_bgr.size == 0:
@@ -2972,9 +3615,11 @@ class App(tk.Tk):
         H, W_total = img_bgr.shape[:2]
         Hg, Wg = gel_bgr.shape[:2]
 
-        panel_w = max(0, W_total - Wg)
-        x_offset = panel_w if (str(yaxis_side).lower() == "left") else 0
+        # === 基于胶区高度的缩放因子 ===
+        s = max(0.35, float(Hg) / 1000.0)
 
+        panel_w  = max(0, W_total - Wg)
+        x_offset = panel_w if (str(yaxis_side).lower() == "left") else 0
         rows = len(labels_table)
         if rows == 0:
             return img_bgr
@@ -2982,13 +3627,13 @@ class App(tk.Tk):
         if cols_use == 0:
             return img_bgr
 
-        # 真实泳道数
+        # 真实道数与中点
         if bounds is not None and isinstance(bounds, np.ndarray):
             real_nlanes = max(0, bounds.shape[1] - 1)
         elif lanes is not None:
             real_nlanes = len(lanes)
         else:
-            real_nlanes = cols_use + 1  # 至少比使用列多1（含标准道）
+            real_nlanes = cols_use + 1
 
         centers_mid_all, widths_all, lefts_all, rights_all = [], [], [], []
         if (bounds is not None and isinstance(bounds, np.ndarray)
@@ -3015,93 +3660,72 @@ class App(tk.Tk):
                 widths_all.append(max(1, R - L))
 
         centers_mid_all = [int(x_offset + np.clip(c, 0, Wg - 1)) for c in centers_mid_all]
-        lefts_all = [int(x_offset + max(0, L)) for L in lefts_all]
+        lefts_all  = [int(x_offset + max(0, L)) for L in lefts_all]
         rights_all = [int(x_offset + min(Wg, R)) for R in rights_all]
         widths_all = [max(1, r - l) for l, r in zip(lefts_all, rights_all)]
 
         skip_idx = max(0, int(ladder_lane) - 1)  # 标准道（0-based）
         target_lane_idx = [i for i in range(real_nlanes) if i != skip_idx]
 
-        # 字体参数（字号更大 + 加粗）
-        design = self._get_design_params()
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        thick = 2  # 加粗
-        cap_px = int(design["top_cap_px"])
-        base_scale = self._font_scale_for_cap_height_px(cap_px, font=font, thickness=thick)
-        min_scale = 0.35
-
-        # 版面参数（适度放宽）
-        h_margin = 8                      # 列内安全边距
-        top_pad, bot_pad = 8, 10
-        row_gap = 6
-        text_bottom_margin = 0            # 原先为 2，容易顶到行边导致视觉裁切，这里置 0
+        # === 文本与版式（统一按 s 缩放）===
+        font      = cv2.FONT_HERSHEY_SIMPLEX
+        thick     = max(1, int(round(2 * s)))
+        cap_px    = max(10, int(round(26 * s)))      # 原基准=26px -> 随 s
+        h_margin  = max(4,  int(round(8  * s)))
+        top_pad   = max(4,  int(round(8  * s)))
+        bot_pad   = max(4,  int(round(10 * s)))
+        row_gap   = max(2,  int(round(6  * s)))
+        txt_pad   = max(1,  int(round(3  * s)))
         _ROT_FLAG = cv2.ROTATE_90_COUNTERCLOCKWISE
 
+        base_scale = self._font_scale_for_cap_height_px(cap_px, font=font, thickness=thick)
+
         def render_rotated_text_img(text: str, lane_idx: int):
-            """
-            生成整段文本的水平位图 -> 旋转 90° -> 紧致裁剪(保留安全边距)
-            关键：在水平位图阶段把 baseline 计入高度，避免 descender 被裁掉。
-            """
             text = (text or "").strip()
             if not text:
                 return None, 0, 0, 0.0
-
             lane_w = max(1, widths_all[lane_idx] - 2 * h_margin)
 
-            # 先用目标字高对应的 scale
             scale = base_scale
             (tw, th), baseline = cv2.getTextSize(text, font, scale, thick)
-            # 如果旋转后高度(≈ 水平th)会超出列宽，则按比例收缩
+            # 旋转后高度≈th，若超过列宽则等比缩小
             if th > lane_w:
-                scale = max(min_scale, scale * (lane_w / (th + 1e-6)))
+                scale = max(0.35, scale * (lane_w / (th + 1e-6)))
                 (tw, th), baseline = cv2.getTextSize(text, font, scale, thick)
 
-            # --- 关键修复点：高度包含 baseline，并增加内边距 ---
-            txt_pad = 3
             w_horiz = max(1, tw + 2 * txt_pad)
             h_horiz = max(1, th + baseline + 2 * txt_pad)
-
             img = np.full((h_horiz, w_horiz, 3), 255, dtype=np.uint8)
-            # 基线位置：左下基线
             org = (txt_pad, txt_pad + th)
             cv2.putText(img, text, org, font, scale, (0, 0, 0), thick, cv2.LINE_AA)
 
-            # 旋转 90° 得到竖排
             rot = cv2.rotate(img, _ROT_FLAG)
-
-            # 紧致裁剪但留安全边界，避免把抗锯齿边缘吃掉
             rot_gray = cv2.cvtColor(rot, cv2.COLOR_BGR2GRAY)
-            nz = np.where(rot_gray < 252)  # 适当放宽阈值
+            nz = np.where(rot_gray < 252)
             if nz[0].size > 0:
                 y_min, y_max = int(nz[0].min()), int(nz[0].max())
                 x_min, x_max = int(nz[1].min()), int(nz[1].max())
-                # 安全扩展 1px
                 y_min = max(0, y_min - 1); y_max = min(rot.shape[0] - 1, y_max + 1)
                 x_min = max(0, x_min - 1); x_max = min(rot.shape[1] - 1, x_max + 1)
                 rot = rot[y_min:y_max + 1, x_min:x_max + 1]
-
-            # 再加一圈 1px 白边，避免贴边观感
             rot = cv2.copyMakeBorder(rot, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-
             h_rot, w_rot = rot.shape[:2]
             return rot, w_rot, h_rot, float(scale)
 
         # 行测量与缓存
         rows_used_idx, row_heights = [], []
         cell_cache: dict[tuple[int, int], tuple[np.ndarray | None, int, int, float]] = {}
-        STD_TEXT = "Marker"
 
+        STD_TEXT = "Marker"
         for r in range(rows):
-            row_has_nonstd = any((labels_table[r][c] or "").strip() for c in range(cols_use))
-            if not row_has_nonstd:
+            row_has_text = any((labels_table[r][c] or "").strip() for c in range(cols_use))
+            if not row_has_text:
                 row_heights.append(0)
                 continue
-
             max_h_rot = 0
-            # 非标准道
             for c in range(min(cols_use, len(target_lane_idx))):
                 text = str(labels_table[r][c] or "").strip()
-                if not text:
+                if not text: 
                     continue
                 li = target_lane_idx[c]
                 cell = render_rotated_text_img(text, li)
@@ -3109,14 +3733,12 @@ class App(tk.Tk):
                 _, w_rot, h_rot, _ = cell
                 max_h_rot = max(max_h_rot, h_rot)
 
-            # 标准道（仅在该行存在任何文本时绘制“Standard”）
             if 0 <= skip_idx < real_nlanes:
                 cell_std = render_rotated_text_img(STD_TEXT, skip_idx)
                 cell_cache[(r, skip_idx)] = cell_std
                 _, w_rot_s, h_rot_s, _ = cell_std
                 max_h_rot = max(max_h_rot, h_rot_s)
 
-            # 再加 2px 行安全高度，避免顶/底贴边
             row_heights.append(max_h_rot + 2)
             rows_used_idx.append(r)
 
@@ -3132,29 +3754,25 @@ class App(tk.Tk):
             if r not in rows_used_idx:
                 continue
             rh = row_heights[r]
-
             # 非标准道
             for c in range(min(cols_use, len(target_lane_idx))):
                 text = str(labels_table[r][c] or "").strip()
-                if not text:
+                if not text: 
                     continue
                 li = target_lane_idx[c]
                 rot_img, w_rot, h_rot, _ = cell_cache.get((r, li), (None, 0, 0, 0.0))
                 if rot_img is None or w_rot <= 0 or h_rot <= 0:
                     continue
-
                 lane_center = centers_mid_all[li]
                 x_left = int(np.clip(lane_center - w_rot // 2, 2, W_total - w_rot - 2))
-                # 纵向：行内向下对齐；取消上抬 margin，避免顶边裁切
                 y_top = int(y_cursor + (rh - h_rot))
-
                 y1 = max(0, y_top); y2 = min(panel_h, y_top + h_rot)
                 x1 = max(0, x_left); x2 = min(W_total, x_left + w_rot)
                 if y2 > y1 and x2 > x1:
                     sub_h, sub_w = y2 - y1, x2 - x1
                     panel[y1:y2, x1:x2] = rot_img[0:sub_h, 0:sub_w]
 
-            # 标准道（条件绘制）
+            # 标准道
             if 0 <= skip_idx < real_nlanes and any((labels_table[r][c] or "").strip() for c in range(cols_use)):
                 rot_img_s, w_rot_s, h_rot_s, _ = cell_cache.get((r, skip_idx), (None, 0, 0, 0.0))
                 if rot_img_s is not None and w_rot_s > 0 and h_rot_s > 0:
@@ -3170,7 +3788,6 @@ class App(tk.Tk):
             y_cursor += rh + row_gap
 
         return np.vstack([panel, img_bgr])
-
 
     def _expand_tabs_for_cv2(self, text: str, tab_size: int = 4) -> str:
             """
@@ -3208,39 +3825,60 @@ class App(tk.Tk):
         allow_expand_width: bool = True
     ) -> np.ndarray:
         """
-        追加底部白底备注，多行左对齐。优先使用支持 CJK 的 TTF/TTC。
-        找不到字体时回退到 OpenCV（仅英文可靠），但不会抛异常。
-        —— 本版改动：
-        1) 读取设计参数 bottom_cap_px（默认 28）作为“目标字高/字号”；
-        2) Pillow 分支用 bottom_cap_px 作为像素字号；
-        3) OpenCV 分支用 bottom_cap_px 计算 fontScale；
-        4) 两分支统一 thickness=2，缩放后更清晰。
+        底部白底备注：随“当前图像高度 H_img”按 1000px 基准缩放。
+        （若你更希望跟随胶区高度，可在此改为用缓存中的胶高。）
         """
         import numpy as np, cv2
         from PIL import Image, ImageDraw, ImageFont
-
         if img_bgr is None or not isinstance(img_bgr, np.ndarray) or img_bgr.size == 0:
             return img_bgr
 
         raw = (note_text or "")
         lines_raw = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
-        # 展开 \t 以便对齐
-        tab_size = 4
-        lines = [self._expand_tabs_for_cv2(ln, tab_size=tab_size) for ln in lines_raw]
+        def _expand_tabs_for_cv2(text: str, tab_size: int = 4) -> str:
+            if not text:
+                return ""
+            out, col = [], 0
+            for ch in text:
+                if ch == '\t':
+                    spaces = tab_size - (col % tab_size)
+                    out.append(' ' * spaces)
+                    col += spaces
+                else:
+                    out.append(ch)
+                    if ch in ('\n', '\r'):
+                        col = 0
+                    else:
+                        col += 1
+            return ''.join(out)
+
+        lines = [_expand_tabs_for_cv2(ln, tab_size=4) for ln in lines_raw]
         if not any((ln.strip() for ln in lines)):
             return img_bgr
 
-        H, W = img_bgr.shape[:2]
+        H_img, W_img = img_bgr.shape[:2]
+
+        # === 基于当前图像高度的缩放（H_img/1000）===
+        s = max(0.35, float(H_img) / 1000.0)
+
+        # 统一缩放基础设计参数
         design = self._get_design_params()
-        cap_px = int(design.get("bottom_cap_px", 28))  # ★ 统一字号
+        base_cap = int(design.get("bottom_cap_px", 28))
+        cap_px   = max(10, int(round(base_cap * s)))          # 字高
+        top_pad  = max(4,  int(round(10 * s)))
+        bot_pad  = max(4,  int(round(10 * s)))
+        left_pad = max(6,  int(round(12 * s)))
+        right_pad= max(6,  int(round(12 * s)))
+        line_gap = max(2,  int(round(6 * s)))
+        thickness= 2
 
         font_path = self._find_font_ttf()
 
-        # —— 首选：Pillow + 可用 TTF（支持中文）
+        # Pillow 首选（支持中英混排），失败则回退 OpenCV
         if font_path:
             try:
-                size_px = max(12, cap_px)  # 直接作为像素字号
+                size_px = max(12, cap_px)
                 font = ImageFont.truetype(font_path, size=size_px)
 
                 # 逐行测量
@@ -3250,7 +3888,7 @@ class App(tk.Tk):
                 for ln in lines:
                     text = ln if ln else " "
                     bbox = drw.textbbox((0, 0), text, font=font)
-                    tw, th = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
+                    tw, th = (bbox[2] - bbox[0], bbox[3] - bbox[1])
                     line_heights.append(max(1, th))
                     line_widths.append(max(1, tw))
 
@@ -3260,11 +3898,9 @@ class App(tk.Tk):
                     panel_h += sum(line_heights) + max(0, (len(line_heights) - 1) * line_gap)
 
                 needed_w = left_pad + max_line_w + right_pad
-                new_W = max(W, needed_w) if allow_expand_width else W
-
-                # 宽度不足则右侧扩白
-                if new_W > W:
-                    pad = np.full((H, new_W - W, 3), 255, dtype=np.uint8)
+                new_W = max(W_img, needed_w) if allow_expand_width else W_img
+                if new_W > W_img:
+                    pad = np.full((H_img, new_W - W_img, 3), 255, dtype=np.uint8)
                     img_main = np.concatenate([img_bgr, pad], axis=1)
                 else:
                     img_main = img_bgr
@@ -3276,7 +3912,6 @@ class App(tk.Tk):
                 for i, ln in enumerate(lines):
                     text = ln if ln else " "
                     x = left_pad
-                    # 用描边模拟 thickness=2 的对比度（可选）
                     drw.text((x, y), text, fill=(0, 0, 0), font=font)
                     y += line_heights[i] + line_gap
 
@@ -3285,16 +3920,13 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        # —— 回退：OpenCV Hershey
+        # 回退：OpenCV
         font = cv2.FONT_HERSHEY_SIMPLEX
-        # 用 bottom_cap_px 推算 fontScale
-        scale = self._font_scale_for_cap_height_px(cap_px, font=font, thickness=2)
-        thickness = 2  # ★ 与顶端面板统一
+        scale = self._font_scale_for_cap_height_px(cap_px, font=font, thickness=thickness)
 
-        # 估算行高与最大宽
         line_sizes = [cv2.getTextSize(ln if ln else " ", font, scale, thickness)[0] for ln in lines]
         line_heights = [sz[1] for sz in line_sizes]
-        line_widths = [sz[0] for sz in line_sizes]
+        line_widths  = [sz[0] for sz in line_sizes]
         max_line_w = max(line_widths) if line_widths else 0
 
         panel_h = top_pad + bot_pad
@@ -3302,22 +3934,20 @@ class App(tk.Tk):
             panel_h += sum(line_heights) + max(0, (len(line_heights) - 1) * line_gap)
 
         needed_w = left_pad + max_line_w + right_pad
-        new_W = max(W, needed_w) if allow_expand_width else W
-
-        if new_W > W:
-            pad = np.full((H, new_W - W, 3), 255, dtype=np.uint8)
+        new_W = max(W_img, needed_w) if allow_expand_width else W_img
+        if new_W > W_img:
+            pad = np.full((H_img, new_W - W_img, 3), 255, dtype=np.uint8)
             img_main = np.concatenate([img_bgr, pad], axis=1)
         else:
             img_main = img_bgr
 
         panel = np.full((panel_h, new_W, 3), 255, dtype=np.uint8)
-
         y = top_pad
         for i, ln in enumerate(lines):
             text = ln if ln else " "
             (tw, th), base = cv2.getTextSize(text, font, scale, thickness)
             x = left_pad
-            y_baseline = y + th  # 基线
+            y_baseline = y + th
             try:
                 cv2.putText(panel, text, (x, y_baseline), font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
             except Exception:
@@ -3325,6 +3955,8 @@ class App(tk.Tk):
             y += line_heights[i] + line_gap
 
         return np.vstack([img_main, panel])
+
+    
     # -------------------- 其他 -------------------- #
     def export_current(self):
         """

@@ -170,45 +170,44 @@ def render_annotation(gel_bgr: np.ndarray,
                       tick_labels: List[float],
                       yaxis_side: str = 'left') -> np.ndarray:
     """
-    渲染说明：
-    - 左侧白色标签栏（不覆盖原图），把分子量标注画在白色栏上。
-    - 标注位置来自“检测到的峰真实 y (ladder_peaks_y)”，文本来自“输入 ladder_labels”，
-      两者通过“自顶向下 (y 小 -> 大) ↔ 大->小 (kDa)”一一配对（取两者长度较小部分）。
-    - 文字仅显示“数字”（不带单位），并右对齐到一条“短横线”的左边；
-      短横线仅在白色标签栏内，不延伸到原图。
+    在左侧添加白色标记栏（仅数字+短横线），并把分子量标注在白板上。
+    本版调整：所有尺寸随高度按 1000px 基准等比缩放（s=H/1000）。
     """
+    import numpy as np, cv2
     H, W, _ = gel_bgr.shape
-    label_panel_w = 80
+
+    # === 基于高度的缩放因子（1000px为基准）===
+    s = max(0.35, float(H) / 1000.0)  # 设下限防止过小
+    label_panel_w = max(48, int(round(80 * s)))    # 左白板宽度
+    tick_len      = max(8,  int(round(12 * s)))    # 短横线长度
+    tick_gap      = max(2,  int(round(3  * s)))    # 数字与短线间距
+    margin_right  = max(2,  int(round(2  * s)))    # 白板右侧留白
+    font          = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale    = max(0.35, 0.50 * s)            # 原基准0.5，随s缩放，设下限
+    thickness     = max(1, int(round(1 * s)))      # 线宽与文字粗细
+    # 画布：左侧白板 + 右侧原图
     canvas = np.full((H, W + label_panel_w, 3), 255, dtype=np.uint8)
     canvas[:, label_panel_w:label_panel_w + W] = gel_bgr
 
-    # 泳道（绿色）
-    #if lanes is not None:
-    #    for (l, r) in lanes:
-    #        cv2.rectangle(canvas, (label_panel_w + int(l), 0),
-    #                      (label_panel_w + int(r), H - 1),
-    #                      (0, 255, 0), 1)
-
-    # 分子量标注（仅数字 + 短横线）
+    # 分子量标注（仅数字+短横线）
     if ladder_peaks_y and ladder_labels:
-        ys = sorted([int(round(float(y))) for y in ladder_peaks_y])
+        ys  = sorted([int(round(float(y))) for y in ladder_peaks_y])
         lbs = sorted([float(x) for x in ladder_labels], reverse=True)
-        K = min(len(ys), len(lbs))
+        K   = min(len(ys), len(lbs))
 
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale, thickness = 0.5, 1
-        color_text, color_tick = (0, 0, 0), (0, 0, 0)
-        margin_right, tick_len, tick_gap = 2, 12, 3
+        color_text = (0, 0, 0)
+        color_tick = (0, 0, 0)
         x2 = label_panel_w - 1 - margin_right
         x1 = max(2, x2 - tick_len + 1)
 
         for y, mw in zip(ys[:K], lbs[:K]):
             if 0 <= y < H:
                 y_draw = int(np.clip(y, 12, H - 5))
-                cv2.line(canvas, (x1, y_draw), (x2, y_draw), color_tick, 1, cv2.LINE_AA)
+                cv2.line(canvas, (x1, y_draw), (x2, y_draw), color_tick, max(1, thickness), cv2.LINE_AA)
                 text = f"{mw:g}"
                 (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
                 x_text = max(2, x1 - tick_gap - tw)
+                # 基线微调：让文本垂直居中于短横线附近
                 cv2.putText(canvas, text, (x_text, y_draw + th // 2 - 1),
                             font, font_scale, color_text, thickness, cv2.LINE_AA)
 
@@ -1088,40 +1087,40 @@ def render_annotation_slanted(gel_bgr: np.ndarray,
                               tick_labels: List[float],
                               yaxis_side: str = 'left') -> np.ndarray:
     """
-    渲染说明：
-    - 左侧白色标签栏（不覆盖原图），把分子量标注画在白色栏上。
-    - 标注位置来自“检测到的峰真实 y (ladder_peaks_y)”，文本来自“输入 ladder_labels”，
-      两者通过“自顶向下 ↔ 大->小”的顺序一一配对（取两者长度较小部分）。
-    - 文字仅显示“数字”，并右对齐到一条“短横线”的左边；短横线仅在白色标签栏内。
+    斜线分道版本的左侧白板分子量标注（仅数字+短横线）。
+    本版调整：所有尺寸随高度按 1000px 基准等比缩放（s=H/1000）。
     """
+    import numpy as np, cv2
     H, W, _ = gel_bgr.shape
-    label_panel_w = 80
+
+    # 缩放因子
+    s = max(0.35, float(H) / 1000.0)
+    label_panel_w = max(48, int(round(80 * s)))
+    tick_len      = max(8,  int(round(12 * s)))
+    tick_gap      = max(2,  int(round(3  * s)))
+    margin_right  = max(2,  int(round(2  * s)))
+    font          = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale    = max(0.45, 0.80 * s)     # 原基准0.8
+    thickness     = max(1, int(round(2 * s)))
+
     canvas = np.full((H, W + label_panel_w, 3), 255, dtype=np.uint8)
     canvas[:, label_panel_w:label_panel_w + W] = gel_bgr
 
-    # 绿色边界折线
-    #if bounds is not None and bounds.ndim == 2 and bounds.shape[0] == H:
-    #    for i in range(1, bounds.shape[1] - 1):
-    #        pts = np.stack([bounds[:, i] + label_panel_w, np.arange(H)], axis=1).astype(np.int32)
-    #        cv2.polylines(canvas, [pts], isClosed=False, color=(0, 255, 0), thickness=1)
-
-    # 分子量标注（仅数字 + 短横线）
+    #（可选）绿色边界线如需显示，仍由上层 App 控制；此处不画绿线
     if ladder_peaks_y and ladder_labels:
-        ys = sorted([int(round(float(y))) for y in ladder_peaks_y])
+        ys  = sorted([int(round(float(y))) for y in ladder_peaks_y])
         lbs = sorted([float(x) for x in ladder_labels], reverse=True)
-        K = min(len(ys), len(lbs))
+        K   = min(len(ys), len(lbs))
 
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale, thickness = 0.8, 2
-        color_text, color_tick = (0, 0, 0), (0, 0, 0)
-        margin_right, tick_len, tick_gap = 2, 12, 3
+        color_text = (0, 0, 0)
+        color_tick = (0, 0, 0)
         x2 = label_panel_w - 1 - margin_right
         x1 = max(2, x2 - tick_len + 1)
 
         for y, mw in zip(ys[:K], lbs[:K]):
             if 0 <= y < H:
                 y_draw = int(np.clip(y, 12, H - 5))
-                cv2.line(canvas, (x1, y_draw), (x2, y_draw), color_tick, 1, cv2.LINE_AA)
+                cv2.line(canvas, (x1, y_draw), (x2, y_draw), color_tick, max(1, thickness), cv2.LINE_AA)
                 text = f"{mw:g}"
                 (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
                 x_text = max(2, x1 - tick_gap - tw)
