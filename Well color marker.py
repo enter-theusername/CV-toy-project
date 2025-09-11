@@ -1,4 +1,5 @@
-import os
+import sys, os
+import ctypes  # Windows AppID 用
 import math
 import csv
 import tkinter as tk
@@ -22,6 +23,9 @@ class PlateColorAnalyzerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Plate Color Analyzer (Tk)")
+        self._ensure_win_appid("JunYe.WellColorMarker.1")  # Windows: 任务栏分组与图标一致
+        self._load_app_icon()                               # 统一加载图标
+
         self.geometry("1000x600")
         self.minsize(800, 400)
 
@@ -104,6 +108,34 @@ class PlateColorAnalyzerApp(tk.Tk):
         self.canvas.bind("<B2-Motion>", self.on_pan_move)
         self.canvas.bind("<ButtonPress-3>", self.on_pan_start)
         self.canvas.bind("<B3-Motion>", self.on_pan_move)
+    def _ensure_win_appid(self, appid: str):
+        """Windows: 设置 AppUserModelID，保证任务栏分组与图标一致（需尽早调用）。"""
+        try:
+            if os.name == "nt":
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
+        except Exception:
+            pass
+
+    def _load_app_icon(self):
+        """
+        统一加载应用图标：
+        - Windows：优先用 wellmarker.ico（影响窗口左上角图标，也会影响任务栏显示）
+        - 其他平台：退回用 PNG 通过 iconphoto 设置
+        同时兼容 PyInstaller 打包路径（sys._MEIPASS）
+        """
+        try:
+            base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+            ico = os.path.join(base_dir, "Wel.ico")
+            png = os.path.join(base_dir, "wellmarker.png")
+
+            if os.name == "nt" and os.path.exists(ico):
+                # 标准方式：标题栏 + 任务栏均使用 ICO
+                self.iconbitmap(ico)
+            elif os.path.exists(png):
+                from PIL import Image, ImageTk
+                self.iconphoto(True, ImageTk.PhotoImage(Image.open(png)))
+        except Exception:
+            pass
 
     # -------------------- UI --------------------
     def _build_ui(self):

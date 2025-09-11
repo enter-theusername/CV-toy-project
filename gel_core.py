@@ -363,12 +363,53 @@ def _bands_from_profile_sliding(
 
     return centers, scores
 
+# 放在 gel_core.py 内，位置不拘（建议与其它工具函数放一起）
+from typing import List, Tuple
+
+def _select_topk_sorted_by_score(
+    peaks: List[float], scores: List[float], k: int
+) -> Tuple[List[float], List[float]]:
+    """
+    从 (peaks, scores) 中选出显著性最高的前 k 个峰，
+    然后按“高度（y, 从小到大=从上到下）”排序并返回 (peaks_k, scores_k)。
+    - k<=0 或数据不足时，返回原始序列；
+    - 自动处理长度不一致或 NaN 的情况。
+    """
+    try:
+        import numpy as np
+        if peaks is None or scores is None:
+            return peaks, scores
+        y = np.asarray(peaks, dtype=np.float64)
+        s = np.asarray(scores, dtype=np.float64)
+        if y.size == 0 or s.size == 0 or k is None or int(k) <= 0:
+            return list(y.astype(float)), list(s.astype(float))
+        k = int(k)
+        n = min(len(y), len(s))
+        if n <= k:
+            # 不足 k，不裁剪，仅按 y 升序
+            order_y = np.argsort(y)
+            return list(y[order_y].astype(float)), list(s[order_y].astype(float))
+        # 按显著性降序取前 k
+        order_by_score = np.argsort(-s)[:k]
+        y_sel = y[order_by_score]
+        s_sel = s[order_by_score]
+        # 再按 y 升序整理
+        order_y = np.argsort(y_sel)
+        y_out = y_sel[order_y]
+        s_out = s_sel[order_y]
+        return list(y_out.astype(float)), list(s_out.astype(float))
+    except Exception:
+        # 异常时不改变原逻辑
+        return peaks, scores
+
+
 
 # ====== 替换：直立/等宽泳道的标准带检测（滑动窗口版） ======
 def detect_bands_along_y_prominence(
     gray_lane: np.ndarray, y0: int = 0, y1: int = None,
-    min_distance: int = 10,      # ← 重新解释为“最小条带高度 px”
-    min_prominence: float = 5.0  # ← 重新解释为“条带-上下背景最小对比度”
+    min_distance: int = 10,     # 重新解释为“最小条带高度 px”
+    min_prominence: float = 5.0,# 重新解释为“条带-上下背景最小对比度”
+    target_count: int = None    # ★ 新增：若给定，则返回“显著性最高的前 K 个”，并按高度排序
 ) -> Tuple[List[float], List[float]]:
     H, W = gray_lane.shape
     if y1 is None: y1 = H
@@ -378,11 +419,11 @@ def detect_bands_along_y_prominence(
     inv_mean = (255 - gray_lane[y0:y1, :]).mean(axis=1).astype(np.float32)
 
     # 参数（与 GUI 传入保持兼容）
-    win_h   = max(7, min_distance // 2 * 2 + 1)    # 以 min_distance 推一个条带窗口，保证 odd
-    ctx_h   = max(9, int(0.8 * win_h))             # 背景窗口不小于条带窗口的 0.8
-    gap     = max(2, int(round(0.15 * win_h)))     # 条带与背景的间隙
-    diff_thr = float(min_prominence)               # 与上下背景的最小对比度
-    min_h   = max(min_distance, win_h)             # 最小条带高度
+    win_h = max(7, min_distance // 2 * 2 + 1)     # odd
+    ctx_h = max(9, int(0.8 * win_h))
+    gap   = max(2, int(round(0.15 * win_h)))
+    diff_thr = float(min_prominence)
+    min_h = max(min_distance, win_h)
 
     peaks_local, scores = _bands_from_profile_sliding(
         inv_mean, win_h=win_h, ctx_h=ctx_h, gap=gap,
@@ -390,15 +431,20 @@ def detect_bands_along_y_prominence(
     )
     # 回到全局 y
     peaks = [float(p) + y0 for p in peaks_local]
-    return peaks, scores
 
+    # ★ 若 target_count 指定：做“Top-K(按显著性) + 按高度排序”
+    if target_count is not None and int(target_count) > 0:
+        peaks, scores = _select_topk_sorted_by_score(peaks, scores, int(target_count))
+
+    return peaks, scores
 
 # ====== 替换：斜线泳道（按 bounds 切列后做滑动窗口） ======
 def detect_bands_along_y_slanted(
     gray: np.ndarray, bounds: np.ndarray, lane_index: int,
     y0: int = 0, y1: int = None,
-    min_distance: int = 10,      # ← 重新解释为“最小条带高度 px”
-    min_prominence: float = 5.0  # ← 重新解释为“条带-上下背景最小对比度”
+    min_distance: int = 10,     # 重新解释为“最小条带高度 px”
+    min_prominence: float = 5.0,# 重新解释为“条带-上下背景最小对比度”
+    target_count: int = None    # ★ 新增：若给定，则返回“显著性最高的前 K 个”，并按高度排序
 ) -> Tuple[List[float], List[float]]:
     H, W = gray.shape
     if y1 is None: y1 = H
@@ -408,22 +454,30 @@ def detect_bands_along_y_slanted(
     inv = 255 - gray
     L = bounds[y0:y1, lane_index]
     R = bounds[y0:y1, lane_index + 1]
-    prof = np.array([inv[y0 + i, L[i]:max(L[i] + 1, R[i])].mean()
-                     for i in range(y1 - y0)], dtype=np.float32)
+    prof = np.array([
+        inv[y0 + i, L[i]:max(L[i] + 1, R[i])].mean()
+        for i in range(y1 - y0)
+    ], dtype=np.float32)
 
     # 参数（与 GUI 传入保持兼容）
-    win_h   = max(7, min_distance // 2 * 2 + 1)
-    ctx_h   = max(9, int(0.8 * win_h))
-    gap     = max(2, int(round(0.15 * win_h)))
+    win_h = max(7, min_distance // 2 * 2 + 1)
+    ctx_h = max(9, int(0.8 * win_h))
+    gap   = max(2, int(round(0.15 * win_h)))
     diff_thr = float(min_prominence)
-    min_h   = max(min_distance, win_h)
+    min_h = max(min_distance, win_h)
 
     peaks_local, scores = _bands_from_profile_sliding(
         prof, win_h=win_h, ctx_h=ctx_h, gap=gap,
         diff_thr=diff_thr, min_height=min_h, merge_gap=0
     )
     peaks = [float(p) + y0 for p in peaks_local]
+
+    # ★ 若 target_count 指定：做“Top-K(按显著性) + 按高度排序”
+    if target_count is not None and int(target_count) > 0:
+        peaks, scores = _select_topk_sorted_by_score(peaks, scores, int(target_count))
+
     return peaks, scores
+
 # === [替换] 3) 基于RANSAC+顺序约束的鲁棒匹配（保留原函数名/签名） ===
 # gel_core.py
 from typing import List, Tuple
@@ -438,43 +492,62 @@ def match_ladder_best(
     """
     单调配对（上->下 对 应 大->小）+ 相对位置最小代价，支持峰权重微调。
     返回：
-      - sel_peak_idx: 选中的“峰索引”（相对原 peaks_y 的索引）
-      - sel_label_idx: 选中的“标签索引”（相对‘降序后的 ladder_labels’的索引）
+    - sel_peak_idx: 选中的“峰索引”（相对原 peaks_y 的索引）
+    - sel_label_idx: 选中的“标签索引”（相对‘降序后的 ladder_labels’的索引）
     """
+    import numpy as np
     if not peaks_y or not ladder_labels:
         return [], []
 
+    # 按 MW 大->小整理标签
+    L_sorted = sorted([float(v) for v in ladder_labels if np.isfinite(v) and v > 0.0], reverse=True)
+    M = len(L_sorted)
     y = np.asarray(peaks_y, dtype=np.float64)
-    order_y = np.argsort(y)                  # 上->下
-    y_sorted = y[order_y]
-    # 归一化 [0,1]
+    order_y_all = np.argsort(y)  # 上->下
+    y_sorted_all = y[order_y_all]
+
+    # ★ 若提供了权重且峰数>标签数：先按显著性Top-K，再按高度排序（保险）
+    if peak_weights is not None and len(peaks_y) > M:
+        w_raw = np.asarray(peak_weights, dtype=np.float64)
+        # 对应到 y_sorted_all 顺序
+        w_sorted_all = w_raw[order_y_all] if w_raw.shape == y.shape else None
+        if w_sorted_all is not None and w_sorted_all.size == y_sorted_all.size:
+            top_idx_by_w = np.argsort(-w_sorted_all)[:M]
+            y_sorted = y_sorted_all[top_idx_by_w]
+            w_sorted = w_sorted_all[top_idx_by_w]
+            # 再按 y 升序
+            oy = np.argsort(y_sorted)
+            y_sorted = y_sorted[oy]
+            w_sorted = w_sorted[oy]
+            # 同步 peaks 的“原索引”映射
+            order_y = order_y_all[top_idx_by_w][oy]
+        else:
+            # 无法对齐权重时退化为全部
+            y_sorted = y_sorted_all
+            order_y = order_y_all
+            w_sorted = None
+    else:
+        y_sorted = y_sorted_all
+        order_y = order_y_all
+        if peak_weights is None:
+            w_sorted = np.ones_like(y_sorted, dtype=np.float64)
+        else:
+            w_raw = np.asarray(peak_weights, dtype=np.float64)
+            w_sorted = w_raw[order_y] if w_raw.shape == y.shape else np.ones_like(y_sorted, dtype=np.float64)
+
+    # 归一化到 [0,1]
     y_min, y_max = float(y_sorted.min()), float(y_sorted.max())
     y_norm = (y_sorted - y_min) / (y_max - y_min + 1e-12)
 
-    # 标签按 kDa 大->小
-    L_sorted = sorted([float(v) for v in ladder_labels if np.isfinite(v) and v > 0.0], reverse=True)
-    M = len(L_sorted)
-    if M == 0:
-        return [], []
-
     # 目标相对位置（头=0, 底=1）
     t = np.array([0.5], dtype=np.float64) if M == 1 else np.linspace(0.0, 1.0, M, dtype=np.float64)
-
-    # 峰权重归一化（可选）
-    if peak_weights is None or len(peak_weights) != len(peaks_y):
-        w_sorted = np.ones_like(y_sorted, dtype=np.float64)
-    else:
-        w_raw = np.asarray(peak_weights, dtype=np.float64)[order_y]
-        w_raw = np.clip(w_raw, 1e-9, np.nanmax(w_raw) if np.nanmax(w_raw) > 0 else 1.0)
-        w_sorted = (w_raw - np.nanmin(w_raw)) / (np.nanmax(w_raw) - np.nanmin(w_raw) + 1e-12)
-        w_sorted = np.nan_to_num(w_sorted, nan=0.0, posinf=1.0, neginf=0.0)
 
     # 代价矩阵：|y_norm - t| - β*w（β>0 偏好强峰）
     beta = 0.15
     N = len(y_sorted)
     C = np.abs(y_norm[None, :] - t[:, None]) - beta * w_sorted[None, :]
 
-    # DP：i=标签(0..M-1), j=峰(0..N-1)，保持递增
+    # DP：保持递增
     INF = 1e9
     dp = np.full((M, N), INF, dtype=np.float64)
     pre = np.full((M, N), -1, dtype=np.int32)
@@ -505,15 +578,17 @@ def match_ladder_best(
     path_j = path_j[::-1]
     used_len = min(len(path_j), M)
     path_j = path_j[:used_len]
+
     sel_peak_idx = [int(order_y[j]) for j in path_j]
     sel_label_idx = list(range(used_len))
 
     # 兜底：不足 min_pairs 时退回“顺序前K”
     if len(sel_peak_idx) < max(1, int(min_pairs)):
         K = min(len(peaks_y), len(L_sorted))
-        sel_peak_idx = [int(order_y[i]) for i in range(K)]
+        sel_peak_idx = [int(order_y_all[i]) for i in range(K)]
         sel_label_idx = list(range(K))
     return sel_peak_idx, sel_label_idx
+
 
 # === 新增：分段线性（相邻两点线性，端点外延） ===
 from typing import Dict, List, Tuple
