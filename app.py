@@ -1146,7 +1146,7 @@ class App(tk.Tk):
         self.geometry("1000x720")
         
         self._ensure_win_appid("JunYe.GelAnnotator.1")
-        self._load_app_ico
+        self._load_app_icon()
 
         # 数据
         self.orig_bgr: np.ndarray | None = None
