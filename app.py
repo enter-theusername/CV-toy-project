@@ -1870,6 +1870,9 @@ class App(tk.Tk):
         ttk.Button(f_stash, text="Clear stash", command=self.clear_stash).pack(fill=tk.X, padx=6, pady=2)
         ttk.Button(f_stash, text="Compose stashed (with table & footnote)", command=self.compose_stash)\
             .pack(fill=tk.X, padx=6, pady=(2, 6))
+        
+        ttk.Button(f_stash, text="Manage stash...", command=self.open_stash_manager)\
+            .pack(fill=tk.X, padx=6, pady=(0, 8))
 
         # ---- Custom labels ----
         f_lab = ttk.LabelFrame(left, text="Custom labels")
@@ -2134,6 +2137,555 @@ class App(tk.Tk):
         except Exception:
             pass
 
+
+    def open_stash_manager(self):
+        """
+        打开“暂存管理器”窗口（右侧仅一个输入框，格式与外部编辑器一致）：
+        - 左侧：已暂存条目列表（索引、尺寸、可对齐状态、泳道数）
+        - 右侧：预览 + 信息条 + 单框定义输入区(自适应) + 底部按钮
+        - 保存时：使用与 open_labels_editor 相同的解析规则（不改算法）
+        """
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+
+        # 若窗口已存在，则置顶
+        if hasattr(self, "_stash_mgr_win") and self._stash_mgr_win and tk.Toplevel.winfo_exists(self._stash_mgr_win):
+            try:
+                self._stash_mgr_win.lift(); self._stash_mgr_win.focus_force()
+            except Exception:
+                pass
+            return
+
+        win = tk.Toplevel(self)
+        self._stash_mgr_win = win
+        win.title("Stash Manager")
+        win.transient(self); win.grab_set()
+        win.resizable(True, True)
+
+        # 统一存放控件引用
+        self._stash_mgr = {
+            "tree": None, "preview": None, "txt_block": None,
+            "sel_index": None, "tkimg": None, "info": None
+        }
+
+        # 主分栏
+        main = ttk.Panedwindow(win, orient=tk.HORIZONTAL)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        # 左：列表
+        left = ttk.Frame(main); main.add(left, weight=1)
+        cols = ("index", "size", "align", "lanes")
+        tree = ttk.Treeview(left, columns=cols, show="headings", height=16)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8,0), pady=8)
+        for c, w, t in [
+            ("index", 60, "Index"),
+            ("size",  120, "Size(HxW)"),
+            ("align", 80,  "Match"),
+            ("lanes", 80,  "Lanes"),
+        ]:
+            tree.heading(c, text=t)
+            tree.column(c, width=w, anchor="center")
+        vbar = ttk.Scrollbar(left, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vbar.set)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 右：预览 + 信息 + 单框输入区 + 按钮（自适应）
+        right = ttk.Frame(main); main.add(right, weight=2)
+
+        frm_prev = ttk.LabelFrame(right, text="Preview")
+        frm_prev.pack(fill=tk.BOTH, expand=False, padx=8, pady=(8, 4))
+        lbl_prev = tk.Label(frm_prev, bg="#222")
+        lbl_prev.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        info = ttk.Label(right, text="", foreground="#666")
+        info.pack(fill=tk.X, padx=10)
+
+        # —— 编辑区：用 grid 实现“文本块自适应 & 底部按钮固定” ——
+        frm_edit = ttk.LabelFrame(right, text="Edit lane names & MWs (single block)")
+        frm_edit.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
+        frm_edit.columnconfigure(0, weight=1)
+        frm_edit.rowconfigure(1, weight=1)  # 文本区所在行可扩展
+
+        # 说明
+        hint = (
+            "Example:\n"
+            "Lane 1: 70,55,40\n"
+            "Sample A\u2003100 70 35\n"
+            "B; 60;30;10\n"
+            " (*First item = column name; empty line = no label; the rest are molecular weights in kDa)"
+        )
+        lbl_hint = ttk.Label(frm_edit, text=hint, justify="left")
+        lbl_hint.grid(row=0, column=0, sticky="w", padx=8, pady=(6, 4))
+
+        # 文本 + 滚动条 容器
+        wrap = ttk.Frame(frm_edit)
+        wrap.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 4))
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+
+        # 单个文本框 + 垂直滚动条
+        txt_block = tk.Text(wrap, height=12, wrap="none")
+        txt_block.grid(row=0, column=0, sticky="nsew")
+        yscroll = ttk.Scrollbar(wrap, orient="vertical", command=txt_block.yview)
+        yscroll.grid(row=0, column=1, sticky="ns")
+        txt_block.configure(yscrollcommand=yscroll.set)
+
+        # 底部按钮行（固定在 frm_edit 的最后一行）
+        btns = ttk.Frame(frm_edit)
+        btns.grid(row=2, column=0, sticky="ew", padx=8, pady=(2, 6))
+        btns.columnconfigure(0, weight=0)
+        btns.columnconfigure(1, weight=0)
+        btns.columnconfigure(2, weight=0)
+        btns.columnconfigure(3, weight=1)  # 让右侧“Close”贴边
+
+        ttk.Button(btns, text="Save definition (to selected)", command=self._stash_mgr_apply_definitions)\
+            .grid(row=0, column=0, padx=(0,8))
+        ttk.Button(btns, text="Delete selected", command=self._stash_mgr_delete_selected)\
+            .grid(row=0, column=1, padx=(0,8))
+        ttk.Button(btns, text="Delete all", command=self._stash_mgr_delete_all)\
+            .grid(row=0, column=2, padx=(0,8))
+        ttk.Button(btns, text="Close", command=win.destroy)\
+            .grid(row=0, column=3, sticky="e")
+
+        # 绑定与保存引用
+        self._stash_mgr["tree"] = tree
+        self._stash_mgr["preview"] = lbl_prev
+        self._stash_mgr["txt_block"] = txt_block
+        self._stash_mgr["info"] = info
+
+        def _on_tree_sel(_evt=None):
+            self._stash_mgr_on_select()
+        tree.bind("<<TreeviewSelect>>", _on_tree_sel)
+
+        # 初始刷新
+        self._stash_mgr_refresh_list(select_first=True)
+
+
+    def _stash_mgr_refresh_list(self, select_first: bool = False):
+        """刷新暂存列表树形控件。"""
+        tree = self._stash_mgr.get("tree")
+        if tree is None: return
+
+        for iid in tree.get_children(): tree.delete(iid)
+
+        items = getattr(self, "stash", []) or []
+        if not items:
+            self._stash_mgr["sel_index"] = None
+            self._stash_mgr_show_preview(None)
+            blk = self._stash_mgr.get("txt_block")
+            if blk: blk.delete("1.0", "end")
+            info = self._stash_mgr.get("info")
+            if info: info.configure(text="No item in stash.")
+            return
+
+        import numpy as np
+        for i, it in enumerate(items):
+            H, W = it["gel_bgr"].shape[:2]
+            a = it.get("align", {}) or {}
+            ok = bool(a.get("valid", False))
+            meta = it.get("meta", {}) or {}
+            bounds = meta.get("bounds", None)
+            lanes  = meta.get("lanes",  None)
+            if isinstance(bounds, np.ndarray):
+                real_n = max(0, bounds.shape[1] - 1)
+            elif isinstance(lanes, list) and lanes:
+                real_n = len(lanes)
+            else:
+                real_n = int(meta.get("nlanes", 0))
+            tree.insert("", "end", iid=str(i),
+                        values=(str(i+1), f"{H}x{W}", ("Yes" if ok else "No"), str(real_n)))
+
+        if select_first and items:
+            try:
+                tree.selection_set("0"); tree.focus("0")
+                self._stash_mgr_on_select()
+            except Exception:
+                pass
+
+
+    def _stash_mgr_on_select(self):
+        """列表选择变化：更新预览、信息条与右侧单框内容（与外部编辑器一致的回显格式）。"""
+        tree = self._stash_mgr.get("tree")
+        if tree is None: return
+        sel = tree.selection()
+        if not sel:
+            self._stash_mgr["sel_index"] = None
+            self._stash_mgr_show_preview(None)
+            blk = self._stash_mgr.get("txt_block")
+            if blk: blk.delete("1.0", "end")
+            return
+        try:
+            idx = int(sel[0])
+        except Exception:
+            idx = None
+        self._stash_mgr["sel_index"] = idx
+
+        items = getattr(self, "stash", []) or []
+        info = self._stash_mgr.get("info")
+        blk  = self._stash_mgr.get("txt_block")
+
+        if idx is None or idx < 0 or idx >= len(items):
+            if info: info.configure(text="")
+            if blk: blk.delete("1.0", "end")
+            self._stash_mgr_show_preview(None)
+            return
+
+        it = items[idx]
+        a = it.get("align", {}) or {}
+        ok = a.get("valid", False)
+        H, W = it["gel_bgr"].shape[:2]
+        meta = it.get("meta", {}) or {}
+        ladder = meta.get("ladder_lane", 1)
+        if info:
+            info.configure(text=f"Index #{idx+1} | size={H}x{W} | align={'Yes' if ok else 'No'} | ladder_lane={ladder}")
+
+        # —— 单框回显，与 open_labels_editor 一致 ——
+        lane_names = meta.get("lane_names", []) or []
+        lane_marks = meta.get("lane_marks", []) or []
+
+        def _fmt_num(x: float) -> str:
+            return f"{x:g}"
+
+        if blk is not None:
+            blk.delete("1.0", "end")
+            pre_lines = []
+            N = max(len(lane_names), len(lane_marks))
+            for i in range(N):
+                name = (lane_names[i] if i < len(lane_names) else "").strip()
+                marks = lane_marks[i] if i < len(lane_marks) else []
+                ms = ", ".join(_fmt_num(v) for v in (marks or []))
+                line = (name + (": " + ms if ms else "")).strip()
+                pre_lines.append(line)
+            if pre_lines:
+                blk.insert("1.0", "\n".join(pre_lines))
+
+        # —— 预览：带 lane names 顶栏 + 箭头标注 ——
+        self._stash_mgr_show_preview(idx)
+
+
+    def _stash_mgr_show_preview(self, idx: int | None):
+        """右侧预览；若 idx 无效则清空；有效则生成带 lane names 顶栏 + 箭头的预览。"""
+        lbl = self._stash_mgr.get("preview")
+        if lbl is None: return
+
+        if idx is None:
+            lbl.configure(image="", text="No preview")
+            lbl.image = None
+            self._stash_mgr["tkimg"] = None
+            return
+
+        items = getattr(self, "stash", []) or []
+        if idx < 0 or idx >= len(items):
+            lbl.configure(image="", text="No preview")
+            lbl.image = None
+            self._stash_mgr["tkimg"] = None
+            return
+
+        it = items[idx]
+        try:
+            bgr = self._stash_mgr_build_preview_image(it)  # << 新增：构建带顶栏与箭头的预览
+        except Exception:
+            bgr = it["gel_bgr"]
+
+        # 适配标签大小（宽≤640，高≤480）
+        H, W = bgr.shape[:2]
+        maxW, maxH = 640, 480
+        scale = min(maxW / max(1,W), maxH / max(1,H), 1.0)
+        if abs(scale - 1.0) < 1e-3:
+            show = bgr.copy()
+        else:
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            show = cv2.resize(bgr, (max(1,int(round(W*scale))), max(1,int(round(H*scale)))), interpolation=interp)
+
+        tkimg = self._bgr_to_tkimg(show)
+        lbl.configure(image=tkimg, text="")
+        lbl.image = tkimg
+        self._stash_mgr["tkimg"] = tkimg
+
+
+    def _stash_mgr_build_preview_image(self, item: dict) -> np.ndarray:
+        """
+        基于 stash 条目构建“可视预览”（含顶栏 lane names + 箭头）：
+        - 顶栏：竖排 lane names，必要时收缩以适配每列宽度（风格与单图/拼接一致）；
+        - 箭头：若存在 calib_model 与 lane_marks，则按模型将 kDa -> y_gel，并在该 y 的“左分界线”处画红色三角头。
+        说明：
+        - 分界优先使用 meta.bounds（斜界）；其次 meta.lanes（等宽竖界）；都没有时按 nlanes 等分估计；
+        - 无 calib_model 时不绘制箭头（避免错误 y 位置）。
+        """
+        import numpy as np, cv2
+        from gel_core import predict_y_from_mw_piecewise
+
+        gel = item["gel_bgr"]
+        meta = item.get("meta", {}) or {}
+        H, W = gel.shape[:2]
+
+        # --------- 1) 取几何/字串数据 ---------
+        bounds = meta.get("bounds", None)
+        lanes  = meta.get("lanes",  None)
+        nlanes = int(meta.get("nlanes", 0)) or (bounds.shape[1]-1 if isinstance(bounds, np.ndarray) else (len(lanes) if isinstance(lanes, list) else 0))
+        ladder_lane = max(1, int(meta.get("ladder_lane", 1)))
+        skip_idx = ladder_lane - 1
+        lane_names = meta.get("lane_names", []) or []
+        lane_marks = meta.get("lane_marks", []) or []
+        calib_model = meta.get("calib_model", None)
+
+        # 真实泳道数 & 中线/宽度（用于顶栏排布与箭头 X）
+        centers_mid, widths, left_edges = [], [], []
+        if isinstance(bounds, np.ndarray) and bounds.ndim == 2 and bounds.shape[0] == H:
+            yc = min(H-1, max(0, H//2))
+            real_n = max(0, bounds.shape[1]-1)
+            for i in range(real_n):
+                L = int(bounds[yc, i]); R = int(bounds[yc, i+1])
+                centers_mid.append(int(round((L+R)/2.0)))
+                widths.append(max(1, R-L))
+                left_edges.append(L)
+            real_nlanes = real_n
+        elif isinstance(lanes, list) and lanes:
+            for (L, R) in lanes:
+                L, R = int(L), int(R)
+                centers_mid.append(int(round((L+R)/2.0)))
+                widths.append(max(1, R-L))
+                left_edges.append(L)
+            real_nlanes = len(lanes)
+        else:
+            real_nlanes = nlanes if nlanes > 0 else 1
+            step = max(1.0, W / real_nlanes)
+            for i in range(real_nlanes):
+                L = int(round(i*step)); R = int(round((i+1)*step))
+                centers_mid.append(int(round((L+R)/2.0)))
+                widths.append(max(1, R-L))
+                left_edges.append(L)
+
+        # --------- 2) 构建顶栏（竖排 lane names） ----------
+        # s 与字号规则参照 _attach_lane_labels_global
+        s = max(0.35, float(H) / 1000.0)
+        thick = max(1, int(round(2 * s)))
+        cap_px = max(10, int(round(26 * s)))
+        txt_pad = 3
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        # 复用已有工具计算对应 fontScale
+        scale = self._font_scale_for_cap_height_px(cap_px, font=font, thickness=thick)
+
+        # 非标准道索引序列（与 lane_names 对齐）
+        nonladder_idx = [i for i in range(real_nlanes) if i != skip_idx]
+        use_k = min(len(nonladder_idx), len(lane_names))
+
+        # 逐列生成“旋转文本小图”，若旋转后宽度(≈横排高度)超过道宽则缩小 scale
+        rot_items = []  # (x_center, rot_img, w_rot, h_rot)
+        max_h_rot = 0
+        for k in range(use_k):
+            li = nonladder_idx[k]
+            name = str(lane_names[k] or "").strip()
+            if not name:
+                continue
+            # 先测横排尺寸
+            (tw, th), base = cv2.getTextSize(name, font, scale, thick)
+            lane_w = max(1, widths[li] - 2*txt_pad)
+            scale_fit = float(scale)
+            if th > lane_w:
+                scale_fit = max(0.35, scale * (lane_w / (th + 1e-6)))
+                (tw, th), base = cv2.getTextSize(name, font, scale_fit, thick)
+
+            w_horiz = max(1, tw + 2*txt_pad)
+            h_horiz = max(1, th + base + 2*txt_pad)
+            img = np.full((h_horiz, w_horiz, 3), 255, dtype=np.uint8)
+            org = (txt_pad, txt_pad + th)
+            try:
+                cv2.putText(img, name, org, font, scale_fit, (0,0,0), thick, cv2.LINE_AA)
+            except Exception:
+                cv2.putText(img, "?", org, font, scale_fit, (0,0,0), thick, cv2.LINE_AA)
+            rot = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            # 轻裁边
+            gray = cv2.cvtColor(rot, cv2.COLOR_BGR2GRAY)
+            ys, xs = np.where(gray < 252)
+            if ys.size > 0:
+                y1 = max(0, ys.min()-1); y2 = min(rot.shape[0]-1, ys.max()+1)
+                x1 = max(0, xs.min()-1); x2 = min(rot.shape[1]-1, xs.max()+1)
+                rot = rot[y1:y2+1, x1:x2+1]
+            h_rot, w_rot = rot.shape[:2]
+            rot_items.append((int(centers_mid[li]), rot, w_rot, h_rot))
+            max_h_rot = max(max_h_rot, h_rot)
+
+        # 若无任何文本，顶栏高度为 0
+        top_panel_h = 0 if not rot_items else int(max_h_rot + max(8, int(round(8*s))) + max(8, int(round(10*s))))
+        if top_panel_h > 0:
+            panel = np.full((top_panel_h, W, 3), 255, dtype=np.uint8)
+            baseline_y = max_h_rot  # 统一基线：所有标签的底沿对齐
+            for x_center, rot_img, w_rot, h_rot in rot_items:
+                x_left = int(np.clip(x_center - w_rot//2, 2, W - w_rot - 2))
+                y_top  = int(np.clip(baseline_y - h_rot, 0, top_panel_h - h_rot))
+                sub_h = min(h_rot, panel.shape[0] - y_top)
+                sub_w = min(w_rot, panel.shape[1] - x_left)
+                if sub_h > 0 and sub_w > 0:
+                    panel[y_top:y_top+sub_h, x_left:x_left+sub_w] = rot_img[:sub_h, :sub_w, :]
+            out = np.vstack([panel, gel])
+        else:
+            out = gel.copy()
+
+        # --------- 3) 画箭头（需要 calib_model 与 lane_marks） ----------
+        if calib_model and lane_marks:
+            try:
+                xk = np.asarray(calib_model.get("xk", []), dtype=np.float64)
+                yk = np.asarray(calib_model.get("yk", []), dtype=np.float64)
+                if xk.size >= 2 and yk.size >= 2 and xk.size == yk.size:
+                    # 遍历非标准道
+                    use_k = min(len(nonladder_idx), len(lane_marks))
+                    # 箭头几何
+                    head_len = 15.0
+                    head_half = 3.0
+                    # y 偏移：顶栏高度
+                    y_off = top_panel_h
+                    for k in range(use_k):
+                        li = nonladder_idx[k]
+                        marks_k = lane_marks[k] or []
+                        for mw in marks_k:
+                            try:
+                                v = float(mw)
+                                if not (np.isfinite(v) and v > 0): 
+                                    continue
+                            except Exception:
+                                continue
+                            y_gel = float(predict_y_from_mw_piecewise([v], xk, yk)[0])
+                            y_img = int(np.clip(y_off + y_gel, 0, out.shape[0]-1))
+                            # 左分界线 x
+                            if isinstance(bounds, np.ndarray) and bounds.ndim == 2 and bounds.shape[0] == H:
+                                row = int(np.clip(round(y_gel), 0, H-1))
+                                xl = int(bounds[row, li])
+                            elif isinstance(lanes, list) and lanes:
+                                xl = int(lanes[li][0])
+                            else:
+                                xl = int(np.clip(left_edges[li], 0, W-1))
+                            x_img = int(np.clip(xl, 0, W-1))
+                            # 画到 out（注意顶栏后 x 不变，y 加 top_panel_h）
+                            tip = (x_img, y_img)
+                            p1 = (int(tip[0] - head_len*0.5), int(tip[1] + head_half))
+                            p2 = (int(tip[0] - head_len*0.5), int(tip[1] - head_half))
+                            pts = np.array([p1, p2, tip], dtype=np.int32)
+                            cv2.fillPoly(out, [pts], (0, 0, 255))
+                            cv2.polylines(out, [pts], isClosed=True, color=(0,0,255), thickness=1, lineType=cv2.LINE_AA)
+            except Exception:
+                pass
+
+        return out
+
+
+    def _stash_mgr_delete_selected(self):
+        """删除选中条目。"""
+        from tkinter import messagebox
+        idx = self._stash_mgr.get("sel_index")
+        items = getattr(self, "stash", []) or []
+        if idx is None or not (0 <= idx < len(items)):
+            messagebox.showwarning("Notice", "No item selected.")
+            return
+        if not messagebox.askyesno("Confirm", f"Delete item #{idx+1}?"):
+            return
+        try:
+            del items[idx]
+            self.stash = items
+        except Exception:
+            pass
+        self._stash_mgr_refresh_list(select_first=True)
+
+
+    def _stash_mgr_delete_all(self):
+        """清空所有暂存（复用已有 clear_stash）。"""
+        from tkinter import messagebox
+        if not getattr(self, "stash", None):
+            messagebox.showinfo("Notice", "Stash is already empty.")
+            return
+        if not messagebox.askyesno("Confirm", "Delete ALL items in stash?"):
+            return
+        # 复用已有逻辑（含提示）
+        try:
+            self.clear_stash()
+        except Exception:
+            # 若要避免弹窗，可直接手动清空：
+            # self.stash = []; messagebox.showinfo("Complete", "Cleared the stash.")
+            pass
+        # 刷新管理器
+        try:
+            self._stash_mgr_refresh_list(select_first=True)
+        except Exception:
+            pass
+
+
+    def _stash_mgr_apply_definitions(self):
+        """
+        从右侧“单个输入框”读取文本，按与 open_labels_editor 完全相同的规则解析为
+        (lane_names, lane_marks)，保存回当前选中条目的 meta（不更改算法/规则）。
+        """
+        from tkinter import messagebox
+        idx = self._stash_mgr.get("sel_index")
+        items = getattr(self, "stash", []) or []
+        if idx is None or not (0 <= idx < len(items)):
+            messagebox.showwarning("Notice", "No item selected.")
+            return
+
+        blk = self._stash_mgr.get("txt_block")
+        if blk is None:
+            return
+        raw = blk.get("1.0", "end")
+
+        # —— 解析：严格复用 open_labels_editor 中的 parse_lane_meta 实现 ——  
+        def parse_lane_meta(raw_text: str):
+            lines = (raw_text or "").splitlines()  # 不丢弃空行
+            names: list[str] = []
+            marks: list[list[float]] = []
+            def _split_tokens(s: str) -> list[str]:
+                s = (s.replace("，", ",").replace("；", ";")
+                    .replace("、", ",").replace("\t", ",")
+                    .replace(":", ",").replace("：", ","))
+                s = s.replace(";", ",")
+                toks = [t.strip() for t in s.split(",")]
+                return [t for t in toks if t]
+            for ln in lines:
+                if not ln.strip():               # 空行 ⇒ 不标注列
+                    names.append("")
+                    marks.append([])
+                    continue
+                toks = _split_tokens(ln)
+                if not toks:
+                    names.append("")
+                    marks.append([])
+                    continue
+                name = toks[0]
+                nums: list[float] = []
+                for t in toks[1:]:
+                    try:
+                        v = float(t)
+                        if np.isfinite(v) and v > 0:
+                            nums.append(v)
+                    except Exception:
+                        pass
+                names.append(name)
+                marks.append(nums)
+            return names, marks
+
+        try:
+            names, marks = parse_lane_meta(raw)
+            items[idx].setdefault("meta", {})
+            items[idx]["meta"]["lane_names"] = names
+            items[idx]["meta"]["lane_marks"] = marks
+            self.stash = items
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save definition: {e}")
+            return
+        messagebox.showinfo("Complete", "Saved lane names & marks for the selected item.")
+        try:
+            self._stash_mgr_on_select()
+        except Exception:
+            pass
+
+    def _bgr_to_tkimg(self, bgr):
+        """将 BGR (np.ndarray) 转为 Tk PhotoImage。"""
+        from PIL import Image, ImageTk
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        return ImageTk.PhotoImage(pil)
+
+
+
     def _unset_composed_preview(self):
         """
         退出“拼接整体预览”模式。
@@ -2252,13 +2804,13 @@ class App(tk.Tk):
             if isinstance(bounds, np.ndarray):
                 peaks, prom = detect_bands_along_y_slanted(
                     gray, bounds, lane_index=ladder_lane-1,
-                    y0=0, y1=None, min_distance=30, min_prominence=0,
+                    y0=0, y1=None, min_distance=30, min_prominence=1,
                 )
             elif isinstance(lanes, list) and lanes:
                 l, r = lanes[ladder_lane-1]
                 sub = gray[:, l:r]
                 peaks, prom = detect_bands_along_y_prominence(
-                    sub, y0=0, y1=None, min_distance=30, min_prominence=0
+                    sub, y0=0, y1=None, min_distance=30, min_prominence=1
                 )
             else:
                 peaks, prom = [], []
@@ -2341,20 +2893,28 @@ class App(tk.Tk):
 
     def compose_stash(self):
         """
-        拼接已暂存（严格“数量相等”触发对齐）：
-        —— 绝对像素附加 + 全局竖排顶栏（与单图一致） + 自动刷新配套 ——
-        1) 仅用 align.valid=True 的「可对齐」子集先确定统一参考（上沿、体高、下沿），把这些块对齐；
-        2) 对「保底」子集（align.valid=False）：整块等比缩放到最终高度 H_final（不补白），不影响参考；
-        3) 横向拼接为整图；
-        4) 在整图最左侧追加“侧边标注（Y 轴）”——绝对像素；
-        5) 追加“全局顶栏泳道标注（竖排）”——与单图风格一致；
-        6) 右侧表格 & 底部备注：按“绝对像素”方式附加（不 shrink），并**将表格顶部对齐到“顶栏下沿”**；
-        7) 恢复箭头（考虑：全局左轴宽度 + 全局顶栏高度 + 保底 s_post）。
+        拼接已暂存（新的“基准锚定”策略）：
+
+        规则（满足你的新要求）：
+        1) 选定一张“基准图”（ref）：优先选择“检测数量==标准数量（且标准≥2）”的第一张；
+        若没有可对齐的，则用暂存队列中的第 1 张作为基准。
+        2) 基准图 **不缩放**（s_ref = 1.0），整体拼接高度 H_final = 基准图原始高度 H0_ref。
+        3) 对“可对齐”的其他图片 i：
+        - 计算其标准道峰值跨度 span_i 与基准的 span_ref；
+        - 等比缩放因子 s_i = span_ref / span_i；
+        - 缩放后按“上沿峰值 y_top”与基准“上沿峰值 y_top_ref”对齐（仅上下补白，不再改变尺寸）；
+        - 最终上下补白/裁剪，使整块高度 = H0_ref。
+        4) 对“不可对齐”的图片（invalid）：
+        - 不做峰值对齐，直接等比缩放到高度 H0_ref（宽度按比例变化），顶对齐（不额外补白）。
+        5) 横向拼接时，左侧统一追加“侧边轴面板”（取基准图来源），顶部统一追加“全局顶栏泳道标注”；
+        右侧表格/底部备注为“绝对像素叠加”，并将表格顶部对齐到“顶栏下沿”。
+
+        好处：
+        - 不再出现“整体高度被少数图块拉大很多”的情况，最终高度稳定 = 基准图高度；
+        - ROI 很窄时，若仍检测到完整峰值，仍可按基准图准确对齐（缩放因子来自基准跨度）。
         """
         from tkinter import messagebox
         import numpy as np, cv2
-        from typing import Optional
-
 
         if not getattr(self, "stash", None):
             messagebox.showwarning("Notice", "Nothing stashed yet. Please 'Stash current crop' first.")
@@ -2363,11 +2923,10 @@ class App(tk.Tk):
             messagebox.showwarning("Notice", "Not enough items in stash (at least 1 required).")
             return
 
-
         items = self.stash
 
-        # 0) 有效性与原始尺寸
-        H0_list, valid_mask, spans, ytop, ybot = [], [], [], [], []
+        # --- 0) 收集原始高度/对齐信息 ---
+        H0_list, spans, ytop, ybot, valid_mask = [], [], [], [], []
         for it in items:
             H0, W0 = it["gel_bgr"].shape[:2]
             H0_list.append((H0, W0))
@@ -2386,120 +2945,93 @@ class App(tk.Tk):
                 ybot.append(None)
 
         valid_indices = [i for i, ok in enumerate(valid_mask) if ok]
-        S_ref = max(spans[i] for i in valid_indices) if valid_indices else None
 
-        # 基准块（用于轴标定来源）
-        if valid_indices and (S_ref is not None):
-            cand = [i for i in valid_indices if abs(spans[i] - S_ref) <= 1e-6]
-            ref_idx = cand[0] if cand else valid_indices[0]
+        # --- 1) 选择“基准图 ref_idx” ---
+        if valid_indices:
+            ref_idx = valid_indices[0]  # 第一张可对齐的，作为基准
         else:
-            ref_idx = 0
+            ref_idx = 0  # 没有可对齐的则用第一张
+        ref_item = items[ref_idx]
+        H0_ref, W0_ref = H0_list[ref_idx]
+        # 基准图不缩放
+        s_ref = 1.0
+        # 基准图的“峰值对齐参数”（若不可对齐则用整幅）
+        if valid_mask[ref_idx]:
+            span_ref = float(spans[ref_idx])
+            ytop_ref = float(ytop[ref_idx])
+            ybot_ref = float(ybot[ref_idx])
+        else:
+            span_ref = float(H0_ref - 1)
+            ytop_ref = 0.0
+            ybot_ref = float(H0_ref - 1)
 
-        # 1) 初次等比缩放因子 s_i
-        s = [None] * len(items)
-        if valid_indices and S_ref and S_ref > 1e-6:
-            for i in valid_indices:
-                s[i] = float(S_ref / max(1e-6, spans[i]))
-
-        target_heights_known = {i: (H0_list[i][0] * s[i]) for i in range(len(items)) if s[i] is not None}
-
-        def _nearest_valid_target_h(idx: int) -> Optional[float]:
-            if not target_heights_known:
-                return None
-            dmin, best = 10**9, None
-            for j in target_heights_known.keys():
-                d = abs(j - idx)
-                if d < dmin:
-                    dmin, best = d, j
-            return float(target_heights_known[best]) if best is not None else None
-
-        import numpy as np
-        median_H0 = float(np.median([h for (h, w) in H0_list])) if H0_list else None
-        for i in range(len(items)):
-            if s[i] is not None:
-                continue
-            H0, _ = H0_list[i]
-            th = _nearest_valid_target_h(i)
-            if th is None:
-                th = median_H0 if (median_H0 is not None and median_H0 > 0) else float(H0)
-            s[i] = max(1e-6, float(th / max(1e-6, H0)))
-            target_heights_known[i] = float(H0 * s[i])
-
-        # 2) 第一轮缩放（不在单块添加轴/顶栏）
+        # --- 2) 第一轮：各块主缩放 ---
         scaled_blocks, per_item_scale = [], []
         for idx, it in enumerate(items):
             gel = it["gel_bgr"]
             H0, W0 = H0_list[idx]
-            si = float(s[idx])
 
-            new_w = max(1, int(round(W0 * si)))
-            new_h = max(1, int(round(H0 * si)))
-            import cv2
-            interp = cv2.INTER_AREA if si < 1.0 else cv2.INTER_LINEAR
-            gel_scaled = cv2.resize(gel, (new_w, new_h), interpolation=interp)
-
-            # y_top1 / y_bot1（度量）
-            a = it.get("align", {}) or {}
-            if valid_mask[idx]:
-                y_top1 = float(a["y_top"]) * si
-                y_bot1 = float(a["y_bot"]) * si
+            if idx == ref_idx:
+                # 基准图不缩放
+                img_scaled = gel
+                si = 1.0
+                # 兼容：若基准图可对齐，记录对齐后的“在自身坐标系”的 y_top1/y_bot1
+                if valid_mask[idx]:
+                    y_top1 = ytop[idx] * si
+                    y_bot1 = ybot[idx] * si
+                else:
+                    y_top1 = 0.0
+                    y_bot1 = float(H0 - 1)
             else:
-                y_top1 = 0.0
-                y_bot1 = float(new_h - 1)
-
-            meta = it["meta"]
-            nlanes_i = int(meta.get("nlanes", 0))
-            ladder_lane_i = int(meta.get("ladder_lane", 1))
-            yaxis_side_i = str(meta.get("yaxis_side", "left")).lower()
-            bounds_i = meta.get("bounds", None)
-            lanes_i = meta.get("lanes", None)
-            lane_names_i = meta.get("lane_names", []) or []
-            calib_model_i = meta.get("calib_model", None)
-
-            # 几何缩放
-            bounds_s, lanes_s = self._scale_geometry_for_factor(bounds_i, lanes_i, si)
-
-            img_cur = gel_scaled
-            panel_top_h = 0  # 不再单块画顶栏
-            y_top_total = panel_top_h + y_top1
-            y_bot_total = panel_top_h + y_bot1
+                if valid_mask[idx] and span_ref > 1e-6 and spans[idx] and spans[idx] > 1e-6:
+                    # 可对齐：按“基准跨度”缩放
+                    si = float(span_ref / float(spans[idx]))
+                    new_w = max(1, int(round(W0 * si)))
+                    new_h = max(1, int(round(H0 * si)))
+                    interp = cv2.INTER_AREA if si < 1.0 else cv2.INTER_LINEAR
+                    img_scaled = cv2.resize(gel, (new_w, new_h), interpolation=interp)
+                    # 映射后的峰值位置（用于之后与基准的上沿对齐）
+                    y_top1 = float(ytop[idx]) * si
+                    y_bot1 = float(ybot[idx]) * si
+                else:
+                    # 不可对齐：直接把整块高度缩放到与基准高度一致（不做峰值对齐）
+                    si = float(H0_ref) / max(1e-6, float(H0))
+                    new_w = max(1, int(round(W0 * si)))
+                    new_h = H0_ref  # 直接等于基准高度
+                    interp = cv2.INTER_AREA if si < 1.0 else cv2.INTER_LINEAR
+                    img_scaled = cv2.resize(gel, (new_w, new_h), interpolation=interp)
+                    y_top1 = 0.0
+                    y_bot1 = float(new_h - 1)
 
             scaled_blocks.append({
-                "img": img_cur,
-                "H": int(img_cur.shape[0]),
-                "W": int(img_cur.shape[1]),
-                "body_h": int(new_h),
-                "y_top1": y_top1, "y_bot1": y_bot1,
-                "y_top_total": y_top_total, "y_bot_total": y_bot_total,
-                "s": si,
-                "s_post": 1.0,
-                "pad_top": 0, "pad_bot": 0,
-                "panel_top_h": int(panel_top_h),
-                "bounds_s": bounds_s, "lanes_s": lanes_s,
-                "nlanes": nlanes_i, "ladder_lane": ladder_lane_i,
-                "yaxis_side": yaxis_side_i,
-                "lane_names": lane_names_i,
-                "arrows_manual": meta.get("arrows_manual", []) or [],
-                "calib_model": calib_model_i,
-                "tick_labels": meta.get("tick_labels", []) or []
+                "img": img_scaled,
+                "H": int(img_scaled.shape[0]),
+                "W": int(img_scaled.shape[1]),
+                "s": float(si),
+                "y_top1": float(y_top1),
+                "y_bot1": float(y_bot1),
+                # 下游用到的元数据
+                "panel_top_h": 0,  # 单块不再加顶栏
+                "nlanes": int(it["meta"].get("nlanes", 0)),
+                "ladder_lane": int(it["meta"].get("ladder_lane", 1)),
+                "yaxis_side": str(it["meta"].get("yaxis_side", "left")).lower(),
+                "lane_names": it["meta"].get("lane_names", []) or [],
+                "arrows_manual": it["meta"].get("arrows_manual", []) or [],
+                "calib_model": it["meta"].get("calib_model", None),
+                "tick_labels": it["meta"].get("tick_labels", []) or [],
             })
-            per_item_scale.append(si)
+            # 缩放 lanes/bounds（供箭头/顶栏使用）
+            bounds_i = it["meta"].get("bounds", None)
+            lanes_i  = it["meta"].get("lanes",  None)
+            bounds_s, lanes_s = self._scale_geometry_for_factor(bounds_i, lanes_i, scaled_blocks[-1]["s"])
+            scaled_blocks[-1]["bounds_s"] = bounds_s
+            scaled_blocks[-1]["lanes_s"]  = lanes_s
 
-        # 3) 统一参考（只看可对齐子集）
-        if valid_indices:
-            Y_top_ref_total = float(max(scaled_blocks[i]["y_top_total"] for i in valid_indices))
-            tail_max_total  = float(max(scaled_blocks[i]["H"] - scaled_blocks[i]["y_bot_total"] for i in valid_indices))
-            body_h_ref = float(S_ref)
-            H_final = int(round(Y_top_ref_total + body_h_ref + tail_max_total))
-            H_final = max(1, H_final)
-        else:
-            body_h_ref = float(np.median([b["body_h"] for b in scaled_blocks])) if scaled_blocks else 0.0
-            H_final = int(round(max(1.0, body_h_ref)))
-            Y_top_ref_total = 0.0
-            tail_max_total  = 0.0
+            per_item_scale.append(float(si))
 
-        # 工具
-        def _fit_height_pad(img, target_h: int):
+        # --- 3) 第二轮：按基准“上沿 y_top_ref”对齐，并统一高度为 H0_ref ---
+        def _fit_to_height(img, target_h):
+            """底/裁，确保高度=target_h（白色补底）"""
             if img is None or img.size == 0:
                 return img
             h, w = img.shape[:2]
@@ -2507,44 +3039,60 @@ class App(tk.Tk):
                 return img
             if h < target_h:
                 pad = target_h - h
-                return cv2.copyMakeBorder(img, 0, pad, 0, 0, cv2.BORDER_CONSTANT, value=(255,255,255))
+                return cv2.copyMakeBorder(img, 0, pad, 0, 0, cv2.BORDER_CONSTANT, value=(255, 255, 255))
             return img[:target_h, :, :]
 
-        def _scale_to_height(img, target_h: int):
-            if img is None or img.size == 0:
-                return img, 1.0
-            h, w = img.shape[:2]
-            if h == target_h or h <= 0:
-                return img, 1.0
-            s_post = float(target_h) / float(h)
-            new_w = max(1, int(round(w * s_post)))
-            interp = cv2.INTER_AREA if s_post < 1.0 else cv2.INTER_LINEAR
-            out = cv2.resize(img, (new_w, target_h), interpolation=interp)
-            return out, s_post
+        # 基准图的对齐参数
+        y_top_ref_total = float(ytop[ref_idx] * s_ref) if valid_mask[ref_idx] else 0.0
 
-        # 3') 逐块落位
-        pad_tops, pad_bots = [], []
         for i, b in enumerate(scaled_blocks):
-            img = b["img"]; H = b["H"]
-            if valid_mask[i] and valid_indices:
-                pad_top = int(np.ceil(Y_top_ref_total - float(b["y_top_total"])))
-                pad_bot = int(np.ceil((Y_top_ref_total + body_h_ref + tail_max_total) - (pad_top + H)))
-                pad_top = max(0, pad_top); pad_bot = max(0, pad_bot)
-                if pad_top > 0 or pad_bot > 0:
-                    img = cv2.copyMakeBorder(img, pad_top, pad_bot, 0, 0, cv2.BORDER_CONSTANT, value=(255,255,255))
-                img = _fit_height_pad(img, H_final)
-                b.update({"img": img, "H": img.shape[0], "W": img.shape[1], "pad_top": int(pad_top), "pad_bot": int(pad_bot), "s_post": 1.0})
-            else:
-                img2, s_post = _scale_to_height(img, H_final)
-                b.update({"img": img2, "H": img2.shape[0], "W": img2.shape[1], "pad_top": 0, "pad_bot": 0, "s_post": float(s_post)})
-            pad_tops.append(b["pad_top"]); pad_bots.append(b["pad_bot"])
+            img = b["img"]
+            H = b["H"]
 
-        # 4) 横向拼接
+            if i == ref_idx:
+                # 基准图：无需额外 pad，最终高度就是 H0_ref
+                img2 = _fit_to_height(img, H0_ref)
+                pad_top = 0
+                pad_bot = max(0, H0_ref - img2.shape[0])
+                s_post = 1.0
+            else:
+                if valid_mask[i] and valid_mask[ref_idx]:
+                    # 有效对齐：按上沿对齐（只做上下补白，不改变内容尺寸）
+                    # 我们希望：pad_top + y_top1 == y_top_ref_total
+                    pad_top = int(np.ceil(y_top_ref_total - b["y_top1"]))
+                    pad_top = max(0, pad_top)
+                    # 临时补白到 >= y_top_ref_total 的顶部对齐高度，再在底部补白/裁切到 H0_ref
+                    if pad_top > 0:
+                        img = cv2.copyMakeBorder(img, pad_top, 0, 0, 0, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+                    # 统一目标高度
+                    img2 = _fit_to_height(img, H0_ref)
+                    pad_bot = max(0, H0_ref - img2.shape[0])
+                    s_post = 1.0
+                else:
+                    # 不可对齐：第一轮已等比缩放到 H0_ref，这里只保证高度=H0_ref
+                    img2 = _fit_to_height(img, H0_ref)
+                    pad_top = 0
+                    pad_bot = max(0, H0_ref - img2.shape[0])
+                    s_post = 1.0
+
+            b.update({
+                "img": img2,
+                "H": int(img2.shape[0]),
+                "W": int(img2.shape[1]),
+                "pad_top": int(pad_top),
+                "pad_bot": int(pad_bot),
+                "s_post": float(s_post),
+                # 便于箭头恢复
+                "y_top_total": float(b["y_top1"] + pad_top),
+                "y_bot_total": float(b["y_bot1"] + pad_top),
+            })
+
+        # --- 4) 横向拼接（统一高度 = H0_ref） ---
         gap = 30
         columns, x_offsets, x_cursor = [], [], 0
         for i, b in enumerate(scaled_blocks):
             if i > 0:
-                columns.append(np.full((H_final, gap, 3), 255, dtype=np.uint8))
+                columns.append(np.full((H0_ref, gap, 3), 255, dtype=np.uint8))
                 x_cursor += gap
             columns.append(b["img"])
             x_offsets.append(x_cursor)
@@ -2554,24 +3102,24 @@ class App(tk.Tk):
         if mosaic_base is None:
             messagebox.showerror("Error", "Compose failed: no valid image.")
             return
-        # 4.5) 左侧轴面板（绝对像素）
+
+        # --- 5) 左侧轴面板（取基准图来源，绝对像素） ---
         axis_w_global = 0
         try:
-            b_ref = scaled_blocks[ref_idx]
-            si_ref = float(b_ref["s"])
-            s_post_ref = float(b_ref.get("s_post", 1.0))
+            b_ref       = scaled_blocks[ref_idx]
+            si_ref      = float(b_ref["s"])
+            s_post_ref  = float(b_ref.get("s_post", 1.0))
             pad_top_ref = int(b_ref.get("pad_top", 0))
-            panel_top_ref= int(b_ref.get("panel_top_h", 0))
+            panel_top_ref = int(b_ref.get("panel_top_h", 0))
             tick_labels_ref = items[ref_idx]["meta"].get("tick_labels", []) or b_ref.get("tick_labels", []) or []
 
+            # 若有基准的 piecewise 模型且有 tick_labels，用模型定位刻度；否则退化为用上下沿两点
             try:
                 from gel_core import predict_y_from_mw_piecewise
             except Exception:
                 predict_y_from_mw_piecewise = None
 
-            ladder_peaks_mosaic = []
-            ladder_labels_use   = []
-
+            ladder_peaks_mosaic, ladder_labels_use = [], []
             if items[ref_idx]["meta"].get("calib_model", None) and tick_labels_ref and predict_y_from_mw_piecewise:
                 cm = items[ref_idx]["meta"]["calib_model"]
                 xk = np.asarray(cm["xk"]); yk = np.asarray(cm["yk"])
@@ -2581,8 +3129,13 @@ class App(tk.Tk):
                     ladder_peaks_mosaic.append(int(round(y_img)))
                     ladder_labels_use.append(lab)
             else:
-                y_top_img = (pad_top_ref + panel_top_ref + float(b_ref["y_top1"])) * s_post_ref
-                y_bot_img = (pad_top_ref + panel_top_ref + float(b_ref["y_bot1"])) * s_post_ref
+                # 退化：用上沿与下沿两个刻度（若基准不可对齐，则用 0 与 H0_ref-1，并给空标签）
+                if valid_mask[ref_idx]:
+                    y_top_img = (pad_top_ref + panel_top_ref + float(ytop[ref_idx]) * si_ref) * s_post_ref
+                    y_bot_img = (pad_top_ref + panel_top_ref + float(ybot[ref_idx]) * si_ref) * s_post_ref
+                else:
+                    y_top_img = 0.0
+                    y_bot_img = float(H0_ref - 1)
                 ladder_peaks_mosaic = [int(round(y_top_img)), int(round(y_bot_img))]
                 if tick_labels_ref and len(tick_labels_ref) >= 2:
                     ladder_labels_use = [tick_labels_ref[0], tick_labels_ref[-1]]
@@ -2601,7 +3154,7 @@ class App(tk.Tk):
         except Exception:
             axis_w_global = 0
 
-        # 4.6) 全局竖排顶栏（与单图一致）
+        # --- 6) 全局顶栏（与单图一致，绝对像素） ---
         top_panel_h_global = 0
         try:
             mosaic_base, top_panel_h_global = self._attach_lane_labels_global(
@@ -2614,14 +3167,14 @@ class App(tk.Tk):
         except Exception:
             top_panel_h_global = 0
 
-        # ====== ★ 关键修正：右表与底注的叠加 —— 把“顶栏高度”明确传入，确保表格顶部对齐到“顶栏下沿” ======
+        # --- 7) 右表/底注叠加（绝对像素；表格顶部对齐到“顶栏下沿”） ---
         mosaic_display = self._apply_mosaic_annotations(
             mosaic_base,
             absolute_pixels=True,
-            panel_top_h_override=int(top_panel_h_global)  # ★ 用于右侧表格的纵向对齐
+            panel_top_h_override=int(top_panel_h_global)
         )
 
-        # 6) 刷新右侧画布（不重置箭头）
+        # --- 8) 刷新右侧画布（不重置箭头），并恢复箭头 ---
         if hasattr(self, "canvas_anno") and self.canvas_anno is not None:
             try:
                 self.canvas_anno.set_scene(
@@ -2639,7 +3192,7 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        # 7) 恢复箭头（考虑左轴宽度 + 顶栏高度 + s_post）
+        # 恢复箭头（考虑左轴宽度 + 顶栏高度；每块缩放 s 和 s_post）
         try:
             from gel_core import predict_y_from_mw_piecewise
         except Exception:
@@ -2650,10 +3203,10 @@ class App(tk.Tk):
             Hm, Wm = mosaic_display.shape[:2]
 
             for i, it in enumerate(items):
-                b = scaled_blocks[i]
-                si = float(b["s"])
-                s_post = float(b.get("s_post", 1.0))
-                x_left = int(x_offsets[i])
+                b       = scaled_blocks[i]
+                si      = float(b["s"])
+                s_post  = float(b.get("s_post", 1.0))
+                x_left  = int(x_offsets[i])
                 pad_top = int(b.get("pad_top", 0))
                 panel_top = int(b.get("panel_top_h", 0))
                 bounds_s = b["bounds_s"]; lanes_s = b["lanes_s"]
@@ -2667,6 +3220,7 @@ class App(tk.Tk):
                 else:
                     real_n = nlanes_i
 
+                # 1) 有手工箭头 snapshot 则优先恢复（绝对位置）
                 manual = it["meta"].get("arrows_manual", []) or b.get("arrows_manual", []) or []
                 if manual:
                     for ar in manual:
@@ -2675,7 +3229,7 @@ class App(tk.Tk):
                             mw = float(ar.get("mw", float("nan")))
                             x_gel = float(ar.get("x_gel", float("nan")))
                             y_gel = float(ar.get("y_gel", float("nan")))
-                            if li < 0 or not (np.isfinite(mw) and mw > 0): 
+                            if li < 0 or not (np.isfinite(mw) and mw > 0):
                                 continue
                             if not (np.isfinite(x_gel) and np.isfinite(y_gel)):
                                 continue
@@ -2686,8 +3240,9 @@ class App(tk.Tk):
                             can._add_arrow(x_img, y_img, lane_idx=li, mw=mw, moved=True)
                         except Exception:
                             continue
-                    continue
-                # 模型初位
+                    continue  # 下一块
+
+                # 2) 否则按模型初位（若有）
                 lane_marks_i = it["meta"].get("lane_marks", []) or []
                 cm = it["meta"].get("calib_model", None) if predict_y_from_mw_piecewise else None
                 skip_idx = max(0, ladder_lane_i - 1)
@@ -2718,52 +3273,51 @@ class App(tk.Tk):
                                 Wg_si = int(round(it["gel_bgr"].shape[1] * si))
                                 step = Wg_si / max(1, real_n)
                                 xl = int(round(li * step))
-
                             x_img = float(axis_w_global + x_left + (xl * s_post))
                             x_img = float(np.clip(x_img, 0, Wm - 1))
                             y_img = float(np.clip(y_img, 0, Hm - 1))
                             can._add_arrow(x_img, y_img, lane_idx=li, mw=v, moved=True)
                         except Exception:
                             continue
-            try: can._redraw_arrows()
-            except Exception: pass
+
+            try:
+                can._redraw_arrows()
+            except Exception:
+                pass
             try:
                 if bool(self.var_show_boxes.get()):
                     can.set_boxes_enabled(True)
             except Exception:
                 pass
 
-        # 8) 记录 meta + 缓存“基图 & 顶栏高度”（供‘填写自动刷新’使用）
+        # --- 9) 缓存“用于注解的基图”和“顶栏高度”（供轻量刷新使用） ---
         compose_items = []
         for i, it in enumerate(items):
             compose_items.append({
                 "meta": dict(it.get("meta", {})),
                 "align": dict(it.get("align", {})),
                 "scale_s": float(per_item_scale[i]),
-                "pad_top": int(pad_tops[i] if i < len(pad_tops) else 0),
-                "pad_bottom": int(pad_bots[i] if i < len(pad_bots) else 0)
+                "pad_top": int(scaled_blocks[i].get("pad_top", 0)),
+                "pad_bottom": int(scaled_blocks[i].get("pad_bot", 0)),
             })
 
         if not hasattr(self, "render_cache") or self.render_cache is None:
             self.render_cache = {}
-        # ★ 缓存“用于注解的基图”和“顶栏高度”
+
         self.mosaic_base_last = mosaic_base.copy()
         self.mosaic_top_panel_h_last = int(top_panel_h_global)
-
         self.render_cache["compose_meta"] = {
-            "version": 13,  # 修正：右表与胶对齐 & 自动刷新支持
-            "single_axis_on": True,
-            "ref_axis_from_index": int(ref_idx),
+            "version": 14,  # 版本+1：锚定基准图策略
+            "anchor_policy": "fixed_baseline",  # 记录策略
+            "ref_index": int(ref_idx),
             "left_axis_w": int(axis_w_global),
             "top_panel_h": int(top_panel_h_global),
-            "S_ref": float(S_ref) if S_ref is not None else None,
-            "Y_top_ref_total": (float(max([scaled_blocks[i]["y_top_total"] for i in valid_indices])) if valid_indices else 0.0),
-            "body_h_ref": float(body_h_ref),
-            "items": compose_items
+            "H_final": int(H0_ref),
+            "items": compose_items,
         }
-        self._set_composed_preview(base_img=mosaic_base, display_img=mosaic_display)
 
-    
+        self._set_composed_preview(base_img=mosaic_base, display_img=mosaic_display)
+        
     
     
     def _attach_lane_labels_global(
@@ -4436,7 +4990,7 @@ class App(tk.Tk):
             # 斜率泳道：传入 target_count=标准序列长度
             peaks, prom = detect_bands_along_y_slanted(
                 gel_gray, bounds, lane_index=ladder_lane-1,
-                y0=y0_roi, y1=y1_roi, min_distance=30, min_prominence=0,
+                y0=y0_roi, y1=y1_roi, min_distance=30, min_prominence=1,
                 target_count=K_target  # ★ 新增
             )
         else:
@@ -4444,7 +4998,7 @@ class App(tk.Tk):
             lx, rx = lanes[ladder_lane-1]
             sub = gel_gray[:, lx:rx]
             peaks, prom = detect_bands_along_y_prominence(
-                sub, y0=y0_roi, y1=y1_roi, min_distance=30, min_prominence=0,
+                sub, y0=y0_roi, y1=y1_roi, min_distance=30, min_prominence=1,
                 target_count=K_target  # ★ 新增
             )
 
