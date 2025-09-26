@@ -1602,15 +1602,16 @@ class App(tk.Tk):
                 v = 1
             if v != 0:
                 # 重置 0 模式状态
-                for attr in ('_zero_ladder_choice_done','_zero_ladder_mode','manual_ladder_peaks','manual_ladder_labels'):
+                for attr in ('_zero_ladder_mode','manual_ladder_peaks','manual_ladder_labels','_in_zero_mode_prompt'):
                     if hasattr(self, attr):
                         try: delattr(self, attr)
                         except Exception: pass
             else:
                 # 设为 0 再次渲染时会触发弹窗
-                if hasattr(self, '_zero_ladder_choice_done'):
-                    try: delattr(self, '_zero_ladder_choice_done')
-                    except Exception: pass
+                for _z in ('_zero_ladder_choice_done', '_in_zero_mode_prompt'):
+                    if hasattr(self, _z):
+                        try: delattr(self, _z)
+                        except Exception: pass
             try:
                 self._update_zero_mode_widgets()
             except Exception:
@@ -2252,11 +2253,74 @@ class App(tk.Tk):
 
         valid_indices = [i for i, ok in enumerate(valid_mask) if ok]
 
-        # --- 1) 选择“基准图 ref_idx” ---
-        if valid_indices:
-            ref_idx = valid_indices[0]  # 第一张可对齐的，作为基准
+    # --- 1) 选择“基准图 ref_idx” ---
+    # 新定义的“完整”含义：
+    #   - ladder_lane != 0  (排除 zero-mode auto/manual)
+    #   - 对齐 valid (数量匹配且 >=2)
+    #   - tick_labels 非空，且 len(tick_labels) == align.expected_count == align.detected_count
+    #   - 排除只有 2 条（疑似上/下沿或极简）的情况：即要求 expected_count >= 3
+    #   - 在所有满足上面条件的图中，选择 expected_count 最大的第一张（从左到右顺序）
+        # 备选：如果没有“完整”图，则退化为第一张 valid；再无则 index=0。
+        candidate_ref_idx = None
+        max_expect = -1
+        for i, it in enumerate(items):
+            if not valid_mask[i]:
+                continue
+            meta_i = it.get("meta", {}) or {}
+            align_i = it.get("align", {}) or {}
+            ladder_lane_i = int(meta_i.get("ladder_lane", 1))
+            if ladder_lane_i == 0:
+                continue  # 零模式不视为“完整”
+            tick_i = meta_i.get("tick_labels", []) or []
+            exp_i = int(align_i.get("expected_count", 0))
+            det_i = int(align_i.get("detected_count", 0))
+            # 完整判定：exp>=3 且 exp==det 且 len(tick_i)==exp （严格相等，排除只有上下沿）
+            if exp_i >= 3 and det_i == exp_i and len(tick_i) == exp_i:
+                if exp_i > max_expect:
+                    max_expect = exp_i
+                    candidate_ref_idx = i
+        if candidate_ref_idx is not None:
+            ref_idx = candidate_ref_idx
+        elif valid_indices:
+            ref_idx = valid_indices[0]
         else:
-            ref_idx = 0  # 没有可对齐的则用第一张
+            ref_idx = 0
+
+        # 单独选择“侧轴刻度来源” axis_idx：
+        #   优先：完整非零模式 (exp>=3 full match)；否则：任意非零模式 exp>=3 且 valid；否则：ref_idx
+        axis_idx = None
+        best_expect_axis = -1
+        for i, it in enumerate(items):
+            meta_i = it.get("meta", {}) or {}
+            align_i = it.get("align", {}) or {}
+            ladder_lane_i = int(meta_i.get("ladder_lane", 1))
+            if ladder_lane_i == 0:
+                continue
+            if not valid_mask[i]:
+                continue
+            tick_i = meta_i.get("tick_labels", []) or []
+            exp_i = int(align_i.get("expected_count", 0))
+            det_i = int(align_i.get("detected_count", 0))
+            full_ok = (exp_i >= 3 and det_i == exp_i and len(tick_i) == exp_i)
+            if full_ok:
+                if exp_i > best_expect_axis:
+                    best_expect_axis = exp_i
+                    axis_idx = i
+        if axis_idx is None:
+            # 次优：找任意 non-zero valid exp>=3 （即便 tick 不完全匹配长度也接受）
+            for i, it in enumerate(items):
+                meta_i = it.get("meta", {}) or {}
+                align_i = it.get("align", {}) or {}
+                ladder_lane_i = int(meta_i.get("ladder_lane", 1))
+                if ladder_lane_i == 0 or not valid_mask[i]:
+                    continue
+                exp_i = int(align_i.get("expected_count", 0))
+                det_i = int(align_i.get("detected_count", 0))
+                if exp_i >= 3 and det_i == exp_i:
+                    axis_idx = i
+                    break
+        if axis_idx is None:
+            axis_idx = ref_idx
         ref_item = items[ref_idx]
         H0_ref, W0_ref = H0_list[ref_idx]
         # 基准图不缩放
@@ -2408,15 +2472,15 @@ class App(tk.Tk):
             messagebox.showerror("Error", "Compose failed: no valid image.")
             return
 
-        # --- 5) 左侧轴面板（取基准图来源，绝对像素） ---
+        # --- 5) 左侧轴面板（axis_idx 可能不同于 ref_idx） ---
         axis_w_global = 0
         try:
-            b_ref       = scaled_blocks[ref_idx]
+            b_ref       = scaled_blocks[axis_idx]
             si_ref      = float(b_ref["s"])
             s_post_ref  = float(b_ref.get("s_post", 1.0))
             pad_top_ref = int(b_ref.get("pad_top", 0))
             panel_top_ref = int(b_ref.get("panel_top_h", 0))
-            tick_labels_ref = items[ref_idx]["meta"].get("tick_labels", []) or b_ref.get("tick_labels", []) or []
+            tick_labels_ref = items[axis_idx]["meta"].get("tick_labels", []) or b_ref.get("tick_labels", []) or []
 
             # 若有基准的 piecewise 模型且有 tick_labels，用模型定位刻度；否则退化为用上下沿两点
             try:
@@ -2425,27 +2489,88 @@ class App(tk.Tk):
                 predict_y_from_mw_piecewise = None
 
             ladder_peaks_mosaic, ladder_labels_use = [], []
-            if items[ref_idx]["meta"].get("calib_model", None) and tick_labels_ref and predict_y_from_mw_piecewise:
-                cm = items[ref_idx]["meta"]["calib_model"]
-                xk = np.asarray(cm["xk"]); yk = np.asarray(cm["yk"])
-                ys_gel = predict_y_from_mw_piecewise(tick_labels_ref, xk, yk)
-                for y_gel, lab in zip(ys_gel, tick_labels_ref):
-                    y_img = (pad_top_ref + panel_top_ref + float(y_gel) * si_ref) * s_post_ref
-                    ladder_peaks_mosaic.append(int(round(y_img)))
-                    ladder_labels_use.append(lab)
-            else:
-                # 退化：用上沿与下沿两个刻度（若基准不可对齐，则用 0 与 H0_ref-1，并给空标签）
-                if valid_mask[ref_idx]:
-                    y_top_img = (pad_top_ref + panel_top_ref + float(ytop[ref_idx]) * si_ref) * s_post_ref
-                    y_bot_img = (pad_top_ref + panel_top_ref + float(ybot[ref_idx]) * si_ref) * s_post_ref
+            ref_meta = items[axis_idx]["meta"]
+            ladder_lane_ref = int(ref_meta.get("ladder_lane", 1))
+            zero_mode_manual = bool(ladder_lane_ref == 0 and ref_meta.get("zero_mode", "") == "manual")
+            zero_mode_auto   = bool(ladder_lane_ref == 0 and ref_meta.get("zero_mode", "") == "auto")
+
+            # 优先：完整非零模式（直接使用对齐检测到的全部峰与 tick_labels 一一对应显示）
+            align_ref = items[axis_idx].get("align", {})
+            peaks_y_ref = align_ref.get("peaks_y", []) or []
+            exp_ref = int(align_ref.get("expected_count", 0))
+            det_ref = int(align_ref.get("detected_count", 0))
+            # 完整条件：非零模式 + exp>=3 + exp==det==len(tick_labels_ref)==len(peaks_y_ref)
+            if (ladder_lane_ref != 0 and exp_ref >= 3 and det_ref == exp_ref and
+                len(tick_labels_ref) == exp_ref and len(peaks_y_ref) == exp_ref):
+                try:
+                    for p, lab in zip(peaks_y_ref, tick_labels_ref):
+                        y_img = (pad_top_ref + panel_top_ref + float(p) * si_ref) * s_post_ref
+                        ladder_peaks_mosaic.append(int(round(y_img)))
+                        ladder_labels_use.append(lab)
+                except Exception:
+                    ladder_peaks_mosaic, ladder_labels_use = [], []
+                    # 若失败则继续后续分支
+                if ladder_peaks_mosaic and ladder_labels_use:
+                    pass  # 已填充，跳过后续分支
                 else:
-                    y_top_img = 0.0
-                    y_bot_img = float(H0_ref - 1)
-                ladder_peaks_mosaic = [int(round(y_top_img)), int(round(y_bot_img))]
-                if tick_labels_ref and len(tick_labels_ref) >= 2:
-                    ladder_labels_use = [tick_labels_ref[0], tick_labels_ref[-1]]
+                    ladder_peaks_mosaic, ladder_labels_use = [], []  # 继续后续判断
+            if not ladder_peaks_mosaic:  # 仅在未填充时进入后续分支
+                if ladder_lane_ref == 0:
+                    # 零模式：使用存储的 zero_mode_peaks & labels（若 manual 并包含 label 列表）
+                    z_peaks = ref_meta.get("zero_mode_peaks", []) or []
+                    z_labels = ref_meta.get("zero_mode_labels", None)
+                    if not z_labels:
+                        try:
+                            raw_seq = self.ent_marker.get().strip()
+                            vals = []
+                            for t in raw_seq.replace("，", ",").split(","):
+                                t = t.strip()
+                                if not t:
+                                    continue
+                                try:
+                                    v = float(t)
+                                    if np.isfinite(v) and v > 0:
+                                        vals.append(v)
+                                except:
+                                    pass
+                            if len(vals) >= 2:
+                                hi = max(vals); lo = min(vals)
+                                if len(z_peaks) == 2:
+                                    z_labels = [hi, lo]
+                                else:
+                                    vals_sorted = sorted(vals, reverse=True)
+                                    z_labels = vals_sorted[:len(z_peaks)]
+                            else:
+                                z_labels = ["" for _ in z_peaks]
+                        except Exception:
+                            z_labels = ["" for _ in z_peaks]
+                    for p, lab in zip(z_peaks, z_labels):
+                        try:
+                            y_img = (pad_top_ref + panel_top_ref + float(p) * si_ref) * s_post_ref
+                            ladder_peaks_mosaic.append(int(round(y_img)))
+                            ladder_labels_use.append(lab)
+                        except Exception:
+                            continue
+                elif ref_meta.get("calib_model", None) and tick_labels_ref and predict_y_from_mw_piecewise:
+                    cm = ref_meta["calib_model"]
+                    xk = np.asarray(cm["xk"]); yk = np.asarray(cm["yk"])
+                    ys_gel = predict_y_from_mw_piecewise(tick_labels_ref, xk, yk)
+                    for y_gel, lab in zip(ys_gel, tick_labels_ref):
+                        y_img = (pad_top_ref + panel_top_ref + float(y_gel) * si_ref) * s_post_ref
+                        ladder_peaks_mosaic.append(int(round(y_img)))
+                        ladder_labels_use.append(lab)
                 else:
-                    ladder_labels_use = ["", ""]
+                    if valid_mask[axis_idx]:
+                        y_top_img = (pad_top_ref + panel_top_ref + float(ytop[axis_idx]) * si_ref) * s_post_ref
+                        y_bot_img = (pad_top_ref + panel_top_ref + float(ybot[axis_idx]) * si_ref) * s_post_ref
+                    else:
+                        y_top_img = 0.0
+                        y_bot_img = float(H0_ref - 1)
+                    ladder_peaks_mosaic = [int(round(y_top_img)), int(round(y_bot_img))]
+                    if tick_labels_ref and len(tick_labels_ref) >= 2:
+                        ladder_labels_use = [tick_labels_ref[0], tick_labels_ref[-1]]
+                    else:
+                        ladder_labels_use = ["", ""]
 
             mosaic_with_axis, axis_w = self._attach_fixed_axis_panel(
                 gel_bgr=mosaic_base,
@@ -2615,6 +2740,7 @@ class App(tk.Tk):
             "version": 14,  # 版本+1：锚定基准图策略
             "anchor_policy": "fixed_baseline",  # 记录策略
             "ref_index": int(ref_idx),
+            "axis_source_index": int(axis_idx),
             "left_axis_w": int(axis_w_global),
             "top_panel_h": int(top_panel_h_global),
             "H_final": int(H_final),
@@ -3754,11 +3880,15 @@ class App(tk.Tk):
         self.roi_editor.set_image(self.orig_bgr)
 
         # —— 重置 0 模式相关状态（强制重新选择 Manual / Auto）—— #
-        for attr in ('_zero_ladder_choice_done','_zero_ladder_mode','manual_ladder_peaks',
-                     'manual_ladder_labels','manual_ladder_ref_h'):
+        for attr in (
+            '_zero_ladder_mode', 'manual_ladder_peaks', 'manual_ladder_labels', '_in_zero_mode_prompt',
+            'manual_ladder_ref_h'
+        ):
             if hasattr(self, attr):
-                try: delattr(self, attr)
-                except Exception: pass
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    pass
         # 也重置拟合勾选（避免残留）
         if hasattr(self, 'var_zero_manual_fit'):
             try: self.var_zero_manual_fit.set(False)
@@ -4376,9 +4506,8 @@ class App(tk.Tk):
         prom = []
         if ladder_lane == 0:
             H_tmp = gel_gray.shape[0]
-            # 只在首次渲染时弹窗；用户一旦选择，标记 _zero_ladder_choice_done
-            if not getattr(self, '_zero_ladder_choice_done', False):
-                # 弹窗，等待用户选择；当前渲染提前终止，待用户选择后再触发渲染
+            # 始终弹窗要求用户选择（除非当前正处于 prompt 选择流程内部）
+            if not getattr(self, '_in_zero_mode_prompt', False):
                 self._prompt_zero_ladder_choice()
                 return
             mode0 = getattr(self, '_zero_ladder_mode', 'auto')
@@ -5382,25 +5511,35 @@ class App(tk.Tk):
 
         frm_btn = ttk.Frame(win); frm_btn.pack(fill=tk.X, padx=12, pady=(0,12))
 
+        def _enter_prompt_context():
+            self._in_zero_mode_prompt = True
+
+        def _exit_prompt_context():
+            if hasattr(self, '_in_zero_mode_prompt'):
+                try: delattr(self, '_in_zero_mode_prompt')
+                except Exception: pass
+
         def choose_manual():
+            # 清理旧的手动点，重新拾取
+            self.manual_ladder_peaks = []
+            self.manual_ladder_ref_h = None
+            self.manual_ladder_labels = None
             self._zero_ladder_mode = 'manual'
-            self._zero_ladder_choice_done = True
+            _enter_prompt_context()
             try: win.destroy()
             except Exception: pass
-            # 打开手动拾取窗口
-            try: self._update_zero_mode_widgets()
-            except Exception: pass
+            # 打开手动拾取窗口；窗口确认后会调用 render_current 并自动退出 context
             self.after(50, self._open_manual_ladder_picker)
 
         def choose_auto():
             self._zero_ladder_mode = 'auto'
-            self._zero_ladder_choice_done = True
+            self.manual_ladder_peaks = []
+            self.manual_ladder_ref_h = None
+            self.manual_ladder_labels = None
+            _enter_prompt_context()
             try: win.destroy()
             except Exception: pass
-            # 触发一次渲染（此时 render_current 会走 auto 分支）
-            try: self._update_zero_mode_widgets()
-            except Exception: pass
-            self.after(50, self.render_current)
+            self.after(50, lambda: (self.render_current(), _exit_prompt_context()))
 
         ttk.Button(frm_btn, text="Manual", command=choose_manual).pack(side=tk.LEFT, padx=(0,8))
         ttk.Button(frm_btn, text="Auto", command=choose_auto).pack(side=tk.LEFT)
@@ -5501,16 +5640,21 @@ class App(tk.Tk):
         def do_confirm():
             # 保存并重新渲染
             self.manual_ladder_peaks = list(peaks_local)
-            # 记录确认时的原胶图高度用于后续缩放映射
             try:
                 self.manual_ladder_ref_h = int(h)
             except Exception:
                 self.manual_ladder_ref_h = None
-            self.manual_ladder_labels = None  # 先不处理映射，保持原始序列
+            self.manual_ladder_labels = None
             try: win.destroy()
             except Exception: pass
-            # 若用户什么都没选，render_current 会自动 fallback -> auto
-            self.after(50, self.render_current)
+            # 若用户未选任何点，render_current 会自动 fallback 到 auto
+            def _render_and_exit():
+                self.render_current()
+                # 退出 prompt context
+                if hasattr(self, '_in_zero_mode_prompt'):
+                    try: delattr(self, '_in_zero_mode_prompt')
+                    except Exception: pass
+            self.after(50, _render_and_exit)
             try: self._update_zero_mode_widgets()
             except Exception: pass
         def do_cancel():
