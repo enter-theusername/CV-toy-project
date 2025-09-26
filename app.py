@@ -512,8 +512,12 @@ class RightAnnoCanvas(tk.Canvas):
         else:
             real_nlanes = self.nlanes
 
-        skip_idx = max(0, self.ladder_lane - 1)
-        target_lane_idx = [i for i in range(real_nlanes) if i != skip_idx]
+        if self.ladder_lane == 0:
+            # 无标准道：所有泳道都是可生成箭头的目标
+            target_lane_idx = list(range(real_nlanes))
+        else:
+            skip_idx = max(0, self.ladder_lane - 1)
+            target_lane_idx = [i for i in range(real_nlanes) if i != skip_idx]
         use_k = min(len(target_lane_idx), len(lane_marks))
 
         Hg, Wg = self.gel_size
@@ -1106,6 +1110,29 @@ class RightAnnoCanvas(tk.Canvas):
 
 
 class App(tk.Tk):
+    def on_flip_option_changed(self):
+        # 重新渲染图像和ROI
+        self._update_flipped_image_and_roi()
+
+    def _update_flipped_image_and_roi(self):
+        # 翻转原始图像
+        img = self.orig_bgr
+        if img is None:
+            return
+        flip_h = self.var_flip_h.get()
+        flip_v = self.var_flip_v.get()
+        if flip_h and flip_v:
+            img = cv2.flip(img, -1)
+        elif flip_h:
+            img = cv2.flip(img, 1)
+        elif flip_v:
+            img = cv2.flip(img, 0)
+        # 更新ROI编辑器中的图像
+        self.roi_editor.set_image(img)
+        # 重新渲染右侧画布（如有）
+        if hasattr(self, 'right_canvas'):
+            self.right_canvas.base_img_bgr = img
+            self.right_canvas._render_base_image()
 
 
     def _ensure_win_appid(self, appid: str):
@@ -1539,6 +1566,16 @@ class App(tk.Tk):
         ttk.Button(f_file, text="Open image...", command=self.open_image).pack(fill=tk.X, padx=6, pady=6)
         ttk.Button(f_file, text="Reset angle (horizontal)", command=self.reset_angle).pack(fill=tk.X, padx=6, pady=4)
 
+        # ---- Flip options ----
+        f_flip = ttk.Frame(left)
+        f_flip.pack(fill=tk.X, pady=(0, 6))
+        self.var_flip_h = tk.BooleanVar(value=False)
+        self.var_flip_v = tk.BooleanVar(value=False)
+        row_flip = ttk.Frame(f_flip)
+        row_flip.pack(fill=tk.X, padx=6, pady=2)
+        ttk.Checkbutton(row_flip, text="Flip Horizontally", variable=self.var_flip_h, command=self.on_flip_option_changed).pack(side=tk.LEFT, padx=(0,12))
+        ttk.Checkbutton(row_flip, text="Flip Vertically", variable=self.var_flip_v, command=self.on_flip_option_changed).pack(side=tk.LEFT)
+
         # ---- Lane detection ----
         f_lane = ttk.LabelFrame(left, text="Lane detection")
         f_lane.pack(fill=tk.X, pady=6)
@@ -1556,7 +1593,47 @@ class App(tk.Tk):
         f_marker = ttk.LabelFrame(left, text="Ladder / Axis")
         f_marker.pack(fill=tk.X, pady=6)
         self.var_ladder_lane = tk.IntVar(value=1)
-        self._spin(f_marker, "Ladder lane index", self.var_ladder_lane, 1, 40)
+        # 允许输入 0 表示“无标准泳道（手动或自动顶部/底部替代）”
+        self._spin(f_marker, "Ladder lane index", self.var_ladder_lane, 0, 40)
+        def _on_ladder_var_change(*_):
+            try:
+                v = int(self.var_ladder_lane.get())
+            except Exception:
+                v = 1
+            if v != 0:
+                # 重置 0 模式状态
+                for attr in ('_zero_ladder_choice_done','_zero_ladder_mode','manual_ladder_peaks','manual_ladder_labels'):
+                    if hasattr(self, attr):
+                        try: delattr(self, attr)
+                        except Exception: pass
+            else:
+                # 设为 0 再次渲染时会触发弹窗
+                if hasattr(self, '_zero_ladder_choice_done'):
+                    try: delattr(self, '_zero_ladder_choice_done')
+                    except Exception: pass
+            try:
+                self._update_zero_mode_widgets()
+            except Exception:
+                pass
+        self.var_ladder_lane.trace_add('write', _on_ladder_var_change)
+        # 手动 0 模式拟合开关 + 重新打开手动拾取按钮
+        self.var_zero_manual_fit = tk.BooleanVar(value=False)
+        self._chk_zero_manual_fit = ttk.Checkbutton(
+            f_marker,
+            text="Manual 0-mode: enable fitting (>=2 points)",
+            variable=self.var_zero_manual_fit,
+            command=lambda: self.after(50, self.render_current)
+        )
+        self._chk_zero_manual_fit.pack(anchor='w', padx=6, pady=(4,2))
+        self._btn_zero_manual_picker = ttk.Button(
+            f_marker,
+            text="Open manual picker",
+            command=self._open_manual_ladder_picker
+        )
+        self._btn_zero_manual_picker.pack(fill=tk.X, padx=6, pady=(0,4))
+        # 初始禁用（直到用户选择 ladder=0）
+        self._chk_zero_manual_fit.state(["disabled"])  # type: ignore
+        self._btn_zero_manual_picker.state(["disabled"])  # type: ignore
         ttk.Label(f_marker, text="Ladder MW (kDa, high → low):", wraplength=self.LEFT_WIDTH-24, justify="left")\
             .pack(anchor="w", padx=6)
         self.ent_marker = ttk.Entry(f_marker); self.ent_marker.insert(0, "180,130,95,65,52,41,31,25,17,10")
@@ -1951,7 +2028,10 @@ class App(tk.Tk):
 
         H, W = gel_bgr.shape[:2]
         nlanes = int(self.var_nlanes.get())
-        ladder_lane = max(1, min(int(self.var_ladder_lane.get()), nlanes))
+        raw_ll = int(self.var_ladder_lane.get())
+        if raw_ll < 0:
+            raw_ll = 0
+        ladder_lane = min(raw_ll, nlanes)
         yaxis_side = str(self.var_axis.get() or "left").lower()
 
         def _parse_list(s: str):
@@ -1967,12 +2047,37 @@ class App(tk.Tk):
                     pass
             return out
 
-        # 标准序列（仅用于“相等数量判断”与侧标绘制；不用来对齐）
+        # 标准序列（仅用于“相等数量判断”与侧标绘制；不用来对齐）。
+        # 零模式下 tick_labels 被清空（不显示轴），但为了兼容旧逻辑 expected_count 使用“零模式手动/自动峰值数”。
         tick_labels = rc.get("tick_labels", None)
-        if not tick_labels:
-            tick_labels = _parse_list(self.ent_marker.get()) or [180,130,95,65,52,41,31,25,17,10]
-        tick_labels = [float(x) for x in tick_labels if np.isfinite(x) and x > 0]
-        expected_count = len(tick_labels)
+        if ladder_lane == 0:
+            # 获取零模式的峰（manual 或 auto: 顶/底）
+            zero_peaks = []
+            try:
+                mode0 = getattr(self, '_zero_ladder_mode', 'auto')
+                if mode0 == 'manual' and getattr(self, 'manual_ladder_peaks', None):
+                    ref_h = getattr(self, 'manual_ladder_ref_h', None)
+                    H_now = gel_bgr.shape[0]
+                    if ref_h and ref_h > 0 and ref_h != H_now:
+                        scale_h = H_now / float(ref_h)
+                        zero_peaks = [float(p) * scale_h for p in self.manual_ladder_peaks]
+                    else:
+                        zero_peaks = [float(p) for p in self.manual_ladder_peaks]
+                else:
+                    # auto：用上下沿两个伪峰
+                    H_now = gel_bgr.shape[0]
+                    zero_peaks = [0.0, float(H_now - 1)]
+            except Exception:
+                zero_peaks = []
+            zero_peaks = [float(p) for p in zero_peaks if np.isfinite(p)]
+            expected_count = len(zero_peaks)
+            # 兼容下游：仍保留 tick_labels 字段（不用于显示）
+            tick_labels = []
+        else:
+            if not tick_labels:
+                tick_labels = _parse_list(self.ent_marker.get()) or [180,130,95,65,52,41,31,25,17,10]
+            tick_labels = [float(x) for x in tick_labels if np.isfinite(x) and x > 0]
+            expected_count = len(tick_labels)
 
         bounds = rc.get("bounds", None)
         lanes = rc.get("lanes", None)
@@ -1980,29 +2085,46 @@ class App(tk.Tk):
         # === 实际检测条带（仅用检测值；不使用拟合） ===
         y_top, y_bot = None, None
         peaks_list = []
-        try:
-            gray = cv2.cvtColor(gel_bgr, cv2.COLOR_BGR2GRAY)
-            if isinstance(bounds, np.ndarray):
-                peaks, prom = detect_bands_along_y_slanted(
-                    gray, bounds, lane_index=ladder_lane-1,
-                    y0=0, y1=None, min_distance=30, min_prominence=1,
-                )
-            elif isinstance(lanes, list) and lanes:
-                l, r = lanes[ladder_lane-1]
-                sub = gray[:, l:r]
-                peaks, prom = detect_bands_along_y_prominence(
-                    sub, y0=0, y1=None, min_distance=30, min_prominence=1
-                )
-            else:
-                peaks, prom = [], []
-            peaks = [float(p) for p in (peaks or []) if np.isfinite(p) and 0 <= float(p) <= H-1]
-            peaks_list = [int(round(p)) for p in peaks]
-        except Exception:
-            peaks_list = []
+        if ladder_lane == 0:
+            # 直接使用零模式峰（上面已生成）
+            peaks_base = []
+            try:
+                if expected_count > 0:
+                    if 'zero_peaks' in locals():
+                        peaks_base = zero_peaks
+                else:
+                    peaks_base = []
+            except Exception:
+                peaks_base = []
+            peaks_list = [int(round(p)) for p in peaks_base if 0 <= float(p) <= H-1]
+        else:
+            try:
+                gray = cv2.cvtColor(gel_bgr, cv2.COLOR_BGR2GRAY)
+                if isinstance(bounds, np.ndarray):
+                    peaks, prom = detect_bands_along_y_slanted(
+                        gray, bounds, lane_index=ladder_lane-1,
+                        y0=0, y1=None, min_distance=30, min_prominence=1,
+                    )
+                elif isinstance(lanes, list) and lanes and ladder_lane>0 and ladder_lane<=len(lanes):
+                    l, r = lanes[ladder_lane-1]
+                    sub = gray[:, l:r]
+                    peaks, prom = detect_bands_along_y_prominence(
+                        sub, y0=0, y1=None, min_distance=30, min_prominence=1
+                    )
+                else:
+                    peaks, prom = [], []
+                peaks = [float(p) for p in (peaks or []) if np.isfinite(p) and 0 <= float(p) <= H-1]
+                peaks_list = [int(round(p)) for p in peaks]
+            except Exception:
+                peaks_list = []
 
         detected_count = len(peaks_list)
         # —— 仅当“检测数量 == 标准数量（且标准≥2）”才参与对齐 —— #
-        align_valid = (expected_count >= 2) and (detected_count == expected_count)
+        if ladder_lane == 0:
+            # 零模式：只要 >=2 个峰（manual 或 auto）就作为可对齐（允许 2 点）
+            align_valid = (expected_count >= 2 and detected_count == expected_count)
+        else:
+            align_valid = (expected_count >= 2) and (detected_count == expected_count)
         if align_valid:
             y_top = float(min(peaks_list))
             y_bot = float(max(peaks_list))
@@ -2037,7 +2159,10 @@ class App(tk.Tk):
                 "nlanes": int(nlanes),
                 "ladder_lane": int(ladder_lane),
                 "yaxis_side": yaxis_side,
-                "tick_labels": tick_labels,  # 仅用于显示（侧标）；不参与对齐判断
+                "tick_labels": tick_labels,  # 0 模式为空，不参与显示；非 0 模式用于侧标
+                "zero_mode": bool(ladder_lane == 0),
+                "zero_mode_peaks": ([int(round(p)) for p in zero_peaks] if ladder_lane==0 else []),
+                "zero_mode_mode": (getattr(self, '_zero_ladder_mode', 'auto') if ladder_lane==0 else None),
                 "calib_model": rc.get("calib_model", None),  # 保留但不用于对齐
                 "fit_ok": bool(rc.get("fit_ok", False)),
                 "mode": ("slanted" if isinstance(bounds, np.ndarray) else ("uniform" if lanes else "unknown")),
@@ -2210,72 +2335,71 @@ class App(tk.Tk):
 
             per_item_scale.append(float(si))
 
-        # --- 3) 第二轮：按基准“上沿 y_top_ref”对齐，并统一高度为 H0_ref ---
-        def _fit_to_height(img, target_h):
-            """底/裁，确保高度=target_h（白色补底）"""
-            if img is None or img.size == 0:
-                return img
-            h, w = img.shape[:2]
-            if h == target_h:
-                return img
-            if h < target_h:
-                pad = target_h - h
-                return cv2.copyMakeBorder(img, 0, pad, 0, 0, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-            return img[:target_h, :, :]
+        # --- 3) 第二轮：对齐 + 动态扩展整体高度（不再裁剪到基准高度） ---
+        # 目标：所有可对齐块按“上沿峰值”与基准对齐；若任何块在上方/下方溢出，则扩展整体画布保留全部信息。
 
-        # 基准图的对齐参数
+        # 基准图的对齐参数（其自身上沿在缩放后坐标系中的位置）
         y_top_ref_total = float(ytop[ref_idx] * s_ref) if valid_mask[ref_idx] else 0.0
 
+        # 计算每块需要的垂直平移 shift（相对其缩放后图像顶端）
+        shifts = []
         for i, b in enumerate(scaled_blocks):
-            img = b["img"]
-            H = b["H"]
-
             if i == ref_idx:
-                # 基准图：无需额外 pad，最终高度就是 H0_ref
-                img2 = _fit_to_height(img, H0_ref)
-                pad_top = 0
-                pad_bot = max(0, H0_ref - img2.shape[0])
-                s_post = 1.0
+                shift_i = 0.0
             else:
                 if valid_mask[i] and valid_mask[ref_idx]:
-                    # 有效对齐：按上沿对齐（只做上下补白，不改变内容尺寸）
-                    # 我们希望：pad_top + y_top1 == y_top_ref_total
-                    pad_top = int(np.ceil(y_top_ref_total - b["y_top1"]))
-                    pad_top = max(0, pad_top)
-                    # 临时补白到 >= y_top_ref_total 的顶部对齐高度，再在底部补白/裁切到 H0_ref
-                    if pad_top > 0:
-                        img = cv2.copyMakeBorder(img, pad_top, 0, 0, 0, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-                    # 统一目标高度
-                    img2 = _fit_to_height(img, H0_ref)
-                    pad_bot = max(0, H0_ref - img2.shape[0])
-                    s_post = 1.0
+                    shift_i = y_top_ref_total - b["y_top1"]
                 else:
-                    # 不可对齐：第一轮已等比缩放到 H0_ref，这里只保证高度=H0_ref
-                    img2 = _fit_to_height(img, H0_ref)
-                    pad_top = 0
-                    pad_bot = max(0, H0_ref - img2.shape[0])
-                    s_post = 1.0
+                    # 不可对齐：将其自身顶端与基准上沿对齐
+                    shift_i = y_top_ref_total - 0.0
+            shifts.append(float(shift_i))
 
+        # 依据所有 shift 计算全局所需顶部补白和最终高度
+        min_shift = min(shifts) if shifts else 0.0  # 可能为负 => 需要上方扩展
+        lower_bounds = [shifts[i] + scaled_blocks[i]["H"] for i in range(len(scaled_blocks))]
+        max_lower = max(lower_bounds) if lower_bounds else float(H0_ref)
+        global_top_pad = int(max(0.0, -min_shift))
+        H_final = int(np.ceil(global_top_pad + max_lower))
+        if H_final < 1:
+            H_final = max(1, H0_ref)
+
+        # 更新块的 pad / 全局 y_top_total / y_bot_total
+        for i, b in enumerate(scaled_blocks):
+            H_i = b["H"]
+            W_i = b["W"]
+            shift_i = shifts[i]
+            pad_top = int(round(global_top_pad + shift_i))
+            if pad_top < 0:
+                pad_top = 0  # 防御性
+            pad_bot = max(0, H_final - (pad_top + H_i))
             b.update({
-                "img": img2,
-                "H": int(img2.shape[0]),
-                "W": int(img2.shape[1]),
+                # 图像本体不裁剪也不在此处补白；实际放置在横向拼接阶段
                 "pad_top": int(pad_top),
                 "pad_bot": int(pad_bot),
-                "s_post": float(s_post),
-                # 便于箭头恢复
-                "y_top_total": float(b["y_top1"] + pad_top),
-                "y_bot_total": float(b["y_bot1"] + pad_top),
+                "s_post": 1.0,
+                # 全局坐标中该块“峰值对齐区域”的上下沿位置（供箭头恢复/调试）
+                "y_top_total": float(pad_top + b["y_top1"]),
+                "y_bot_total": float(pad_top + b["y_bot1"]),
             })
 
-        # --- 4) 横向拼接（统一高度 = H0_ref） ---
+        # --- 4) 横向拼接（统一高度 = H_final 扩展后高度） ---
         gap = 30
         columns, x_offsets, x_cursor = [], [], 0
         for i, b in enumerate(scaled_blocks):
             if i > 0:
-                columns.append(np.full((H0_ref, gap, 3), 255, dtype=np.uint8))
+                columns.append(np.full((H_final, gap, 3), 255, dtype=np.uint8))
                 x_cursor += gap
-            columns.append(b["img"])
+            col = np.full((H_final, b["W"], 3), 255, dtype=np.uint8)
+            y1 = b["pad_top"]
+            y2 = y1 + b["H"]
+            if 0 <= y1 < H_final and y2 <= H_final:
+                col[y1:y2, :b["W"]] = b["img"]
+            else:
+                # 极端越界（理论不应发生），做裁剪写入
+                y1c = max(0, y1); y2c = min(H_final, y2)
+                if y2c > y1c:
+                    col[y1c:y2c, :b["W"]] = b["img"][0:(y2c - y1c), :b["W"]]
+            columns.append(col)
             x_offsets.append(x_cursor)
             x_cursor += b["W"]
 
@@ -2363,7 +2487,7 @@ class App(tk.Tk):
                     gel_bgr=np.zeros_like(mosaic_display),
                     bounds=None, lanes=None,
                     a=0.0, b=0.0, fit_ok=True,
-                    nlanes=0, ladder_lane=1,
+                    nlanes=0, ladder_lane=0,
                     yaxis_side="left",
                     lane_marks=[],
                     panel_top_h=0, panel_w=0,
@@ -2493,7 +2617,7 @@ class App(tk.Tk):
             "ref_index": int(ref_idx),
             "left_axis_w": int(axis_w_global),
             "top_panel_h": int(top_panel_h_global),
-            "H_final": int(H0_ref),
+            "H_final": int(H_final),
             "items": compose_items,
         }
 
@@ -2588,11 +2712,17 @@ class App(tk.Tk):
             x_left      = int(x_offsets[bi])
             names       = (b.get("lane_names") or [])
             nlanes_i    = int(b["nlanes"])
-            ladder_lane = max(1, int(b["ladder_lane"]))
-            skip_idx    = ladder_lane - 1
-
-            # 非标准道（真实道索引）：names 与非标准道一一对应
-            nonladder_idx = [i for i in range(len(centers_mid)) if i != skip_idx]
+            raw_ladder_lane = int(b.get("ladder_lane", 0))
+            if raw_ladder_lane < 0:
+                raw_ladder_lane = 0
+            ladder_lane = min(raw_ladder_lane, nlanes_i)
+            if ladder_lane == 0:
+                # 0 模式：所有 lanes 都可标注，对应 names 列表
+                skip_idx = None
+                nonladder_idx = list(range(len(centers_mid)))
+            else:
+                skip_idx = ladder_lane - 1
+                nonladder_idx = [i for i in range(len(centers_mid)) if i != skip_idx]
             use_k = min(len(nonladder_idx), len(names))
             any_text = any((str(n or "").strip() for n in names))
 
@@ -2655,8 +2785,8 @@ class App(tk.Tk):
                 max_top_pad_across    = max(max_top_pad_across, top_pad_i)
                 max_bottom_pad_across = max(max_bottom_pad_across, bottom_pad_i)
 
-            # 若该行有任意文本，标准道画“Marker”（黑色）
-            if any_text and 0 <= skip_idx < len(centers_mid):
+            # 若该行有任意文本，且存在标准道（skip_idx 非 None），则画“Marker”
+            if any_text and (skip_idx is not None) and 0 <= skip_idx < len(centers_mid):
                 lane_w_mosaic = int(round(widths_mid[skip_idx] * si_post))
                 rot_img, w_rot, h_rot = render_vertical_text_fitting("Marker", lane_w_mosaic)
                 if rot_img is not None:
@@ -2848,7 +2978,7 @@ class App(tk.Tk):
                             gel_bgr=np.zeros_like(disp),
                             bounds=None, lanes=None,
                             a=0.0, b=0.0, fit_ok=True,
-                            nlanes=0, ladder_lane=1,
+                            nlanes=0, ladder_lane=0,
                             yaxis_side="left",
                             lane_marks=[],
                             panel_top_h=0, panel_w=0,
@@ -3584,6 +3714,11 @@ class App(tk.Tk):
         if bgr is None:
             messagebox.showerror("Error", "Failed to read the image file.")
             return
+        # 打开新图像时重置翻转勾选框
+        if hasattr(self, 'var_flip_h'):
+            self.var_flip_h.set(False)
+        if hasattr(self, 'var_flip_v'):
+            self.var_flip_v.set(False)
         try:
             bgr_comp, est_bytes = self._compress_image_near_size(
                 bgr,
@@ -3597,10 +3732,12 @@ class App(tk.Tk):
             self.orig_bgr = bgr_comp
             self.image_path = path
             self.image_load_est_bytes = int(est_bytes)
+            self._update_flipped_image_and_roi()
         except Exception:
             self.orig_bgr = bgr
             self.image_path = path
             self.image_load_est_bytes = int(getattr(bgr, "nbytes", 0))
+            self._update_flipped_image_and_roi()
 
         # —— 清空（单图）注释 —— #
         try:
@@ -3615,6 +3752,17 @@ class App(tk.Tk):
         self.gi = 1
         self.boxes = []
         self.roi_editor.set_image(self.orig_bgr)
+
+        # —— 重置 0 模式相关状态（强制重新选择 Manual / Auto）—— #
+        for attr in ('_zero_ladder_choice_done','_zero_ladder_mode','manual_ladder_peaks',
+                     'manual_ladder_labels','manual_ladder_ref_h'):
+            if hasattr(self, attr):
+                try: delattr(self, attr)
+                except Exception: pass
+        # 也重置拟合勾选（避免残留）
+        if hasattr(self, 'var_zero_manual_fit'):
+            try: self.var_zero_manual_fit.set(False)
+            except Exception: pass
 
         # —— 清空（单图）右侧表格 —— #
         self.right_table_text = ""
@@ -4135,7 +4283,18 @@ class App(tk.Tk):
             messagebox.showwarning("Notice", "Please adjust or create the ROI frame in the canvas first")
             return
         cx, cy, w, h, angle_ccw = rroi
-        rot_img, M = self._rotate_bound_with_M(self.orig_bgr, -angle_ccw)
+        # 翻转处理
+        img = self.orig_bgr
+        flip_h = self.var_flip_h.get() if hasattr(self, 'var_flip_h') else False
+        flip_v = self.var_flip_v.get() if hasattr(self, 'var_flip_v') else False
+        if img is not None:
+            if flip_h and flip_v:
+                img = cv2.flip(img, -1)
+            elif flip_h:
+                img = cv2.flip(img, 1)
+            elif flip_v:
+                img = cv2.flip(img, 0)
+        rot_img, M = self._rotate_bound_with_M(img, -angle_ccw)
         def _affine_point(M_, x, y):
             return (M_[0,0]*x + M_[0,1]*y + M_[0,2], M_[1,0]*x + M_[1,1]*y + M_[1,2])
         cx2, cy2 = _affine_point(M, cx, cy)
@@ -4158,6 +4317,12 @@ class App(tk.Tk):
             gamma=gamma
         ) if self.var_wb_on.get() else gel
 
+        # 存储最近的 gel 图用于 0 模式手动拾取窗口
+        try:
+            self._latest_zero_mode_gel_bgr = gel_bgr.copy()
+        except Exception:
+            pass
+
         # 2.5) 标准宽度
         design = self._get_design_params()
         gel_bgr = self._standardize_gel_size(gel_bgr, design["design_gel_width_px"])
@@ -4174,7 +4339,7 @@ class App(tk.Tk):
                 except: pass
             return out
         ladder_labels_all = parse_list(self.ent_marker.get()) or [180,130,100,70,55,40,35,25,15,10]
-        tick_labels = ladder_labels_all  # 仅在拟合通过时绘制刻度
+        tick_labels = ladder_labels_all  # 仅在拟合通过时绘制刻度（非零模式）
 
         # 4) 分道
         nlanes = int(self.var_nlanes.get())
@@ -4193,42 +4358,86 @@ class App(tk.Tk):
             )
             lanes = None
 
-# 5) 标准道检测 + 分段线性标定
-        ladder_lane = max(1, min(int(self.var_ladder_lane.get()), nlanes))
-        y0_roi, y1_roi = 0, None
+        # 5) 标准道检测 + 分段线性标定（支持 ladder_lane = 0 特殊模式）
+            raw_ladder_lane_val = int(self.var_ladder_lane.get())
+            if raw_ladder_lane_val < 0:  # 纠正非法输入
+                raw_ladder_lane_val = 0
+            # ladder_lane == 0 : 无标准泳道 -> 后续弹窗提示 Manual / Auto
+            # 不再强制提升为 >=1，允许 0 表示无标准道
+            ladder_lane = min(raw_ladder_lane_val, nlanes)
+            y0_roi, y1_roi = 0, None
 
-        # 解析“标准序列”并确定目标数量 K
-        def parse_list(s: str):
-            s = (s or "").replace("，", ",")
-            out = []
-            for t in s.split(","):
-                t = t.strip()
-                if not t: continue
-                try: out.append(float(t))
-                except: pass
-            return out
+        # 解析“标准序列”并确定目标数量 K（即使 0 模式也先解析，Manual 可复用）
         ladder_labels_all = parse_list(self.ent_marker.get()) or [180,130,100,70,55,40,35,25,15,10]
         K_target = len([x for x in ladder_labels_all if isinstance(x, (int,float)) and x>0])
 
-        if bounds is not None:
-            # 斜率泳道：传入 target_count=标准序列长度
-            peaks, prom = detect_bands_along_y_slanted(
-                gel_gray, bounds, lane_index=ladder_lane-1,
-                y0=y0_roi, y1=y1_roi, min_distance=30, min_prominence=1,
-                target_count=K_target  # ★ 新增
-            )
+        # --- ladder_lane == 0 模式：交互选择 Manual / Auto ---
+        peaks = []
+        prom = []
+        if ladder_lane == 0:
+            H_tmp = gel_gray.shape[0]
+            # 只在首次渲染时弹窗；用户一旦选择，标记 _zero_ladder_choice_done
+            if not getattr(self, '_zero_ladder_choice_done', False):
+                # 弹窗，等待用户选择；当前渲染提前终止，待用户选择后再触发渲染
+                self._prompt_zero_ladder_choice()
+                return
+            mode0 = getattr(self, '_zero_ladder_mode', 'auto')
+            if mode0 == 'manual' and getattr(self, 'manual_ladder_peaks', None):
+                # 使用用户手动点击的峰
+                ref_h = getattr(self, 'manual_ladder_ref_h', None)
+                if ref_h and ref_h > 0 and ref_h != H_tmp:
+                    scale_h = H_tmp / float(ref_h)
+                    peaks = [float(p)*scale_h for p in self.manual_ladder_peaks]
+                else:
+                    peaks = [float(p) for p in self.manual_ladder_peaks]
+                prom  = [1.0]*len(peaks)
+                # 若用户在手动窗口里也给了 labels（数量匹配），覆盖 ladder_labels_all
+                if getattr(self, 'manual_ladder_labels', None) and \
+                   len(self.manual_ladder_labels) == len(peaks):
+                    ladder_labels_all = [float(v) for v in self.manual_ladder_labels]
+            elif mode0 == 'manual' and not getattr(self, 'manual_ladder_peaks', None):
+                # 用户选择 manual 但未确认任何点 -> fallback auto
+                peaks = [0.0, float(H_tmp-1)]
+                prom  = [1.0, 1.0]
+            else:  # auto
+                peaks = [0.0, float(H_tmp-1)]
+                prom  = [1.0, 1.0]
+                # 记录伪峰值（便于导出 / 重渲染回显）
+                self.manual_ladder_peaks = list(peaks)
+                # 以输入序列的最大值和最小值作为上下沿标签（高→低）
+                try:
+                    vals = [float(x) for x in ladder_labels_all if isinstance(x, (int,float))]
+                    if vals:
+                        hi = max(vals); lo = min(vals)
+                        ladder_labels_all = [hi, lo]
+                        self.manual_ladder_labels = ladder_labels_all
+                    else:
+                        self.manual_ladder_labels = None
+                except Exception:
+                    self.manual_ladder_labels = None
+            # 标志：已选择
+            self._zero_ladder_choice_done = True
         else:
-            # 竖直/等宽泳道：传入 target_count=标准序列长度
-            lx, rx = lanes[ladder_lane-1]
-            sub = gel_gray[:, lx:rx]
-            peaks, prom = detect_bands_along_y_prominence(
-                sub, y0=y0_roi, y1=y1_roi, min_distance=30, min_prominence=1,
-                target_count=K_target  # ★ 新增
-            )
+            # 只需单侧窗口即可的正常检测
+            if bounds is not None:
+                peaks, prom = detect_bands_along_y_slanted(
+                    gel_gray, bounds, lane_index=ladder_lane-1,
+                    y0=y0_roi, y1=y1_roi, min_distance=30, min_prominence=1,
+                    target_count=K_target
+                )
+            else:
+                lx, rx = lanes[ladder_lane-1]
+                sub = gel_gray[:, lx:rx]
+                peaks, prom = detect_bands_along_y_prominence(
+                    sub, y0=y0_roi, y1=y1_roi, min_distance=30, min_prominence=1,
+                    target_count=K_target
+                )
 
-        # 用于绘制：与检测结果“等长”的标签，并且 peaks 已按高度排序
+        # 用于绘制（0 模式下也适用）
         ladder_peaks_for_draw  = [int(round(p)) for p in peaks]
         ladder_labels_for_draw = sorted(ladder_labels_all, reverse=True)[:len(ladder_peaks_for_draw)]
+
+        # （已移除零模式黄色线条叠加，避免视觉干扰）
 
         # —— 后续标定流程保持不变（piecewise+质量评估+渲染 …）——
         import numpy as np
@@ -4242,27 +4451,26 @@ class App(tk.Tk):
         else:
             w_used = None
 
-        fit_ok = False
         a, b = 1.0, 0.0
         calib_model = None
+        fit_ok = False
+        # 简化：只要 K>=2 就拟合并接受（包括零模式 auto/manual）
         if K >= 2:
             y_used   = [float(ys_sorted[i]) for i in range(K)]
             lbl_used = [float(lbs_sorted[i]) for i in range(K)]
             model = build_piecewise_log_mw_model(y_used, lbl_used)
             xk = model.get('xk', np.array([], dtype=np.float64))
             yk = model.get('yk', np.array([], dtype=np.float64))
-            H_roi = gel_gray.shape[0]
-            ok, r2, rmse = eval_fit_quality_piecewise(
-                y_used, lbl_used, xk, yk, H=H_roi,
-                r2_min=0.5, rmse_frac_max=0.02, rmse_abs_min_px=80.0
-            )
-            if ok and xk.size >= 2:
+            if xk.size >= 2:
                 calib_model = {'xk': xk, 'yk': yk}
-                fit_ok = True
-                a_fit, b_fit = fit_log_mw_irls(y_used, lbl_used, w_used, iters=6)
-                a, b = a_fit, b_fit
+            a_fit, b_fit = fit_log_mw_irls(y_used, lbl_used, w_used, iters=6)
+            a, b = a_fit, b_fit
+            fit_ok = True
 
         # 6) 核心底图（侧标沿检测真 y；刻度在拟合通过时绘制）
+        # 零模式禁止绘制 marker / 刻度轴：直接清空 tick_labels
+        if ladder_lane == 0:
+            tick_labels = []
         if bounds is not None:
             res = render_annotation_slanted(
                 gel_bgr, bounds, ladder_peaks_for_draw, ladder_labels_for_draw,
@@ -4287,7 +4495,8 @@ class App(tk.Tk):
             "lanes": lanes,
             "a": float(a), "b": float(b),
             "fit_ok": bool(fit_ok),
-            "tick_labels": tick_labels if fit_ok else [],
+            # 0 模式绝对不显示 marker，所以 tick_labels 清空
+            "tick_labels": (tick_labels if (fit_ok and ladder_lane != 0) else []),
             "yaxis_side": self.var_axis.get(),
             "calib_model": calib_model,
             "annotated_base_no_green": None,
@@ -4299,11 +4508,21 @@ class App(tk.Tk):
         panel_top_h = 0
         if self.var_labels_on.get():
             nlanes_val = int(self.var_nlanes.get())
-            ladder_lane_val = max(1, min(int(self.var_ladder_lane.get()), nlanes_val))
-            n_nonladder = max(0, nlanes_val - 1)
-            names_seq = (self.lane_names or [])
-            names_use = (names_seq + [""] * n_nonladder)[:n_nonladder]
-            labels_table = [names_use]
+            raw_ll = int(self.var_ladder_lane.get())
+            # 允许 0 代表无标准道，不再强制提升到 1
+            if raw_ll < 0:
+                raw_ll = 0
+            ladder_lane_val = min(raw_ll, nlanes_val)
+            if ladder_lane_val == 0:
+                # 0 模式：全部列都可显示/编辑
+                names_seq = (self.lane_names or [])
+                names_use = (names_seq + [""] * nlanes_val)[:nlanes_val]
+                labels_table = [names_use]
+            else:
+                n_nonladder = max(0, nlanes_val - 1)
+                names_seq = (self.lane_names or [])
+                names_use = (names_seq + [""] * n_nonladder)[:n_nonladder]
+                labels_table = [names_use]
             if labels_table and any(((t or "").strip() for t in labels_table[0])):
                 H0 = annotated_final_base.shape[0]
                 annotated_final_base = self._attach_labels_panel(
@@ -4367,7 +4586,12 @@ class App(tk.Tk):
 
         # 12) 右侧交互画布 —— 显式传入 calib_model（左板宽 panel_w_val 不受右侧表格影响）
         lane_marks_input = self.lane_marks or []
-        ladder_lane_val = max(1, min(int(self.var_ladder_lane.get()), int(self.var_nlanes.get())))
+        # 传递真实值（0 表示无标准道）
+        ladder_lane_val_raw = int(self.var_ladder_lane.get())
+        if ladder_lane_val_raw < 0:
+            ladder_lane_val_raw = 0
+        # 不再强制 >=1
+        ladder_lane_val = min(ladder_lane_val_raw, int(self.var_nlanes.get()))
         self.canvas_anno.set_scene(
             base_img_bgr=annotated_final_base_with_note,
             gel_bgr=gel_bgr,
@@ -4394,12 +4618,7 @@ class App(tk.Tk):
             "annotated_base_with_green": annotated_final_with_green_with_note,
         })
 
-        if not fit_ok:
-            from tkinter import messagebox
-            messagebox.showinfo(
-                "Notice",
-                "The Y-axis molecular weight scale was not plotted this time (fitting failed quality control), and no draggable arrow is generated on the right side."
-            )
+        # （已移除拟合失败提示：当前策略为 K>=2 一律拟合并接受）
 
     def recompose_using_cache(self):
         
@@ -4430,11 +4649,19 @@ class App(tk.Tk):
         panel_top_h = 0
         if self.var_labels_on.get():
             nlanes_val = int(self.var_nlanes.get())
-            ladder_lane_val = max(1, min(int(self.var_ladder_lane.get()), nlanes_val))
-            n_nonladder = max(0, nlanes_val - 1)
-            names_seq = (self.lane_names or [])
-            names_use = (names_seq + [""] * n_nonladder)[:n_nonladder]
-            labels_table = [names_use]
+            raw_ll = int(self.var_ladder_lane.get())
+            if raw_ll < 0:
+                raw_ll = 0
+            ladder_lane_val = min(raw_ll, nlanes_val)
+            if ladder_lane_val == 0:
+                names_seq = (self.lane_names or [])
+                names_use = (names_seq + [""] * nlanes_val)[:nlanes_val]
+                labels_table = [names_use]
+            else:
+                n_nonladder = max(0, nlanes_val - 1)
+                names_seq = (self.lane_names or [])
+                names_use = (names_seq + [""] * n_nonladder)[:n_nonladder]
+                labels_table = [names_use]
             if labels_table and any(((t or "").strip() for t in labels_table[0])):
                 H0 = base_img.shape[0]
                 base_img = self._attach_labels_panel(
@@ -4455,6 +4682,13 @@ class App(tk.Tk):
 
         # 2) 绿线（仅绿线）
         want_green = bool(self.var_show_green.get())
+        # 零模式：再次拼合时也禁止刻度轴
+        try:
+            cur_ll = int(self.var_ladder_lane.get())
+        except Exception:
+            cur_ll = 0
+        if cur_ll == 0:
+            tick_lbls = []
         if want_green:
             with_green = self._draw_overlays_on_core(
                 img_core=base_img, gel_bgr=gel_bgr,
@@ -4501,7 +4735,10 @@ class App(tk.Tk):
                 )
 
         # 4) 刷新右侧交互画布（panel_w 只给左白板，不含右侧表格宽度）
-        ladder_lane_val = max(1, min(int(self.var_ladder_lane.get()), int(self.var_nlanes.get())))
+        raw_ll2 = int(self.var_ladder_lane.get())
+        if raw_ll2 < 0:
+            raw_ll2 = 0
+        ladder_lane_val = min(raw_ll2, int(self.var_nlanes.get()))
         self.canvas_anno.set_scene(
             base_img_bgr=base_with_note,
             gel_bgr=gel_bgr,
@@ -4599,8 +4836,12 @@ class App(tk.Tk):
         rights_all = [int(x_offset + min(Wg, R)) for R in rights_all]
         widths_all = [max(1, r - l) for l, r in zip(lefts_all, rights_all)]
 
-        skip_idx = max(0, int(ladder_lane) - 1)  # 标准道（0-based）
-        target_lane_idx = [i for i in range(real_nlanes) if i != skip_idx]
+        # 标准道索引：仅当 ladder_lane>0 才存在；为 0/负时表示“无标准道”→ 不画 Marker，全部可编辑
+        if isinstance(ladder_lane, (int, float)) and ladder_lane > 0:
+            skip_idx = int(ladder_lane) - 1
+        else:
+            skip_idx = -1  # 无标准道
+        target_lane_idx = [i for i in range(real_nlanes) if i != skip_idx] if skip_idx >= 0 else list(range(real_nlanes))
 
         # === 文本与版式（统一按 s 缩放）===
         font      = cv2.FONT_HERSHEY_SIMPLEX
@@ -4668,7 +4909,7 @@ class App(tk.Tk):
                 _, w_rot, h_rot, _ = cell
                 max_h_rot = max(max_h_rot, h_rot)
 
-            if 0 <= skip_idx < real_nlanes:
+            if skip_idx >= 0 and skip_idx < real_nlanes:
                 cell_std = render_rotated_text_img(STD_TEXT, skip_idx)
                 cell_cache[(r, skip_idx)] = cell_std
                 _, w_rot_s, h_rot_s, _ = cell_std
@@ -4708,7 +4949,7 @@ class App(tk.Tk):
                     panel[y1:y2, x1:x2] = rot_img[0:sub_h, 0:sub_w]
 
             # 标准道
-            if 0 <= skip_idx < real_nlanes and any((labels_table[r][c] or "").strip() for c in range(cols_use)):
+            if skip_idx >= 0 and skip_idx < real_nlanes and any((labels_table[r][c] or "").strip() for c in range(cols_use)):
                 rot_img_s, w_rot_s, h_rot_s, _ = cell_cache.get((r, skip_idx), (None, 0, 0, 0.0))
                 if rot_img_s is not None and w_rot_s > 0 and h_rot_s > 0:
                     lane_center_s = centers_mid_all[skip_idx]
@@ -5106,6 +5347,215 @@ class App(tk.Tk):
 
         btns = ttk.Frame(frm); btns.pack(fill=tk.X, pady=(10, 0))
         ttk.Button(btns, text="Confirm", command=do_ok).pack(side=tk.RIGHT)
+
+    # -------------------- ladder_lane == 0 模式：弹窗 + 手动拾取 -------------------- #
+    def _prompt_zero_ladder_choice(self):
+        """弹出选择窗口：当用户将标准泳道设为 0 时，提醒选择 Manual / Auto。
+
+        Auto: 使用整幅图顶/底作为仅有的两条“标准带”（用于纵向定位参考，不进行拟合）。
+        Manual: 用户点击添加若干条水平线（≥1），可撤销与确认；确认后重新渲染。
+
+        窗口 UI 使用英文；逻辑说明在英文文本中给出。
+        """
+        # 若已有窗口，避免重复
+        if getattr(self, '_zero_choice_win', None) and tk.Toplevel.winfo_exists(self._zero_choice_win):
+            try:
+                self._zero_choice_win.lift()
+                return
+            except Exception:
+                pass
+
+        win = tk.Toplevel(self)
+        win.title("No Ladder Lane Selected (Index=0)")
+        win.transient(self); win.grab_set()
+        self._zero_choice_win = win
+
+        txt = (
+            "You set Ladder Lane Index = 0 (no dedicated marker lane).\n\n"
+            "Choose how to provide marker band positions:\n\n"
+            "Manual: open an interactive window; click to add band lines (top to bottom).\n"
+            "Auto: use image top and bottom edges as two pseudo marker bands.\n\n"
+            "You can re-open manual picker later by setting ladder=0 again."
+        )
+        msg = ttk.Label(win, text=txt, justify="left", anchor="w")
+        msg.pack(fill=tk.X, padx=12, pady=10)
+
+        frm_btn = ttk.Frame(win); frm_btn.pack(fill=tk.X, padx=12, pady=(0,12))
+
+        def choose_manual():
+            self._zero_ladder_mode = 'manual'
+            self._zero_ladder_choice_done = True
+            try: win.destroy()
+            except Exception: pass
+            # 打开手动拾取窗口
+            try: self._update_zero_mode_widgets()
+            except Exception: pass
+            self.after(50, self._open_manual_ladder_picker)
+
+        def choose_auto():
+            self._zero_ladder_mode = 'auto'
+            self._zero_ladder_choice_done = True
+            try: win.destroy()
+            except Exception: pass
+            # 触发一次渲染（此时 render_current 会走 auto 分支）
+            try: self._update_zero_mode_widgets()
+            except Exception: pass
+            self.after(50, self.render_current)
+
+        ttk.Button(frm_btn, text="Manual", command=choose_manual).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Button(frm_btn, text="Auto", command=choose_auto).pack(side=tk.LEFT)
+
+    def _open_manual_ladder_picker(self):
+        """打开手动拾取窗口：允许用户点击添加标准带水平线。
+
+        交互：
+        - 左键单击：添加一条水平线（以点击的 y 为主，自动吸附整数像素）。
+        - 右键 / Delete 选中：撤销最近一条（或使用 Undo 按钮）。
+        - Clear：清空全部。
+        - Confirm：保存并关闭，触发重新渲染。
+        - Cancel：放弃修改。
+
+        储存：self.manual_ladder_peaks = [y1, y2, ...] （升序）。
+        若用户未添加任何点，保持原状态（render 时会 fallback 到 auto）。
+        """
+        # 准备图像
+        img = getattr(self, '_latest_zero_mode_gel_bgr', None)
+        if img is None:
+            # 若没有缓存，尝试直接渲染一次以获取，再次调用本函数
+            try:
+                self.render_current()
+            except Exception:
+                pass
+            img = getattr(self, '_latest_zero_mode_gel_bgr', None)
+            if img is None:
+                messagebox.showerror("Error", "No gel image available for manual picking.")
+                return
+
+        if getattr(self, '_manual_picker_win', None) and tk.Toplevel.winfo_exists(self._manual_picker_win):
+            try:
+                self._manual_picker_win.lift(); return
+            except Exception:
+                pass
+
+        win = tk.Toplevel(self)
+        win.title("Manual Marker Bands Picker")
+        win.transient(self); win.grab_set()
+        self._manual_picker_win = win
+
+        h, w = img.shape[:2]
+        target_h = 600
+        scale = min(1.0, target_h / h)
+        new_h = int(h * scale)
+        new_w = int(w * scale)
+        if scale != 1.0:
+            disp = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            disp = img.copy()
+        disp_rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+
+        from PIL import Image, ImageTk
+        pil_img = Image.fromarray(disp_rgb)
+        tk_img = ImageTk.PhotoImage(pil_img)
+
+        cv = tk.Canvas(win, width=tk_img.width(), height=tk_img.height(), bg="#000000")
+        cv.pack(padx=8, pady=8)
+        cv.create_image(0,0, anchor='nw', image=tk_img)
+        cv.image = tk_img  # 保持引用
+
+        peaks_local: list[float] = list(getattr(self, 'manual_ladder_peaks', []))
+
+        # 绘制函数
+        def redraw_lines():
+            # 清除旧线（保留背景 image）
+            for item in list(getattr(cv, '_line_items', [])):
+                try: cv.delete(item)
+                except Exception: pass
+            cv._line_items = []
+            for y in peaks_local:
+                y_disp = int(round(y*scale))
+                it = cv.create_line(0, y_disp, tk_img.width(), y_disp, fill='yellow', width=2)
+                cv._line_items.append(it)
+
+        def on_click(ev):
+            y = ev.y / scale
+            y = max(0, min(h-1, y))
+            peaks_local.append(float(y))
+            peaks_local.sort()
+            redraw_lines()
+
+        def on_right(ev):
+            # 撤销最后一条
+            if peaks_local:
+                peaks_local.pop()
+                redraw_lines()
+
+        cv.bind('<Button-1>', on_click)
+        cv.bind('<Button-3>', on_right)
+
+        btnf = ttk.Frame(win); btnf.pack(fill=tk.X, padx=8, pady=(0,8))
+        def do_undo():
+            if peaks_local:
+                peaks_local.pop(); redraw_lines()
+        def do_clear():
+            peaks_local.clear(); redraw_lines()
+        def do_confirm():
+            # 保存并重新渲染
+            self.manual_ladder_peaks = list(peaks_local)
+            # 记录确认时的原胶图高度用于后续缩放映射
+            try:
+                self.manual_ladder_ref_h = int(h)
+            except Exception:
+                self.manual_ladder_ref_h = None
+            self.manual_ladder_labels = None  # 先不处理映射，保持原始序列
+            try: win.destroy()
+            except Exception: pass
+            # 若用户什么都没选，render_current 会自动 fallback -> auto
+            self.after(50, self.render_current)
+            try: self._update_zero_mode_widgets()
+            except Exception: pass
+        def do_cancel():
+            try: win.destroy()
+            except Exception: pass
+            # 取消不改变已有点
+
+        ttk.Button(btnf, text='Undo', command=do_undo).pack(side=tk.LEFT)
+        ttk.Button(btnf, text='Clear', command=do_clear).pack(side=tk.LEFT, padx=(6,0))
+        ttk.Button(btnf, text='Confirm', command=do_confirm).pack(side=tk.RIGHT)
+        ttk.Button(btnf, text='Cancel', command=do_cancel).pack(side=tk.RIGHT, padx=(0,6))
+
+        redraw_lines()
+
+        # 关闭窗口时的清理
+        def on_close():
+            try: win.destroy()
+            except Exception: pass
+        win.protocol('WM_DELETE_WINDOW', on_close)
+
+    def _update_zero_mode_widgets(self):
+        """根据 ladder=0 与选择模式状态更新手动拟合/拾取控件启用状态。"""
+        try:
+            v = int(self.var_ladder_lane.get())
+        except Exception:
+            v = 1
+        is_zero = (v == 0)
+        mode0 = getattr(self, '_zero_ladder_mode', None)
+        # Checkbutton
+        if is_zero and mode0 == 'manual':
+            try: self._chk_zero_manual_fit.state(["!disabled"])  # type: ignore
+            except Exception: pass
+        else:
+            try:
+                self._chk_zero_manual_fit.state(["disabled"])  # type: ignore
+                self.var_zero_manual_fit.set(False)
+            except Exception: pass
+        # Picker button
+        if is_zero:
+            try: self._btn_zero_manual_picker.state(["!disabled"])  # type: ignore
+            except Exception: pass
+        else:
+            try: self._btn_zero_manual_picker.state(["disabled"])  # type: ignore
+            except Exception: pass
+        return
 
 
 # ===== 在 App 类定义结束后新增：全局字体初始化 =====
