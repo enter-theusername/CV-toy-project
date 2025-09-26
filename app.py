@@ -1189,6 +1189,8 @@ class App(tk.Tk):
 
         # 新增：每列（泳道）元信息
         self.lane_names: list[str] = []               # 每列显示的“列名”
+        # 新增：与 lane_names 对应的布局标记："h"=水平(由行首"@:"触发)，"v"=竖排(默认)
+        self.lane_name_layout: list[str] = []
         self.lane_marks: list[list[float]] = []       # 每列要标注的分子量（kDa）
 
         # —— 自适应图片显示注册表（右侧两个预览） —— #
@@ -2811,8 +2813,12 @@ class App(tk.Tk):
             centers_per_block.append(centers_mid)
             widths_per_block.append(widths)
 
-        # === 2) 预渲染：逐块逐道生成“旋转文本小图”，完全复用单图风格的度量与收缩规则 ===
-        # 保存条目：(bi, x_center_mosaic:int, rot_img, w_rot, h_rot, top_pad_i, bottom_pad_i, is_marker:bool)
+    # === 2) 预渲染：逐块逐道生成文本小图 ===
+    # 更新规则：
+    #   - 竖排（layout 'v'）：保持原有“若超过道宽则收缩”的逻辑。
+    #   - 横排（layout 'h'）：不再进行宽度收缩；按原始字号绘制，允许越过该道并相互重叠；放置时以“lane 左边界”作为锚点。
+    # rot_items 结构扩展：
+    #   (bi, x_anchor:int, img, w, h, top_pad_i, bottom_pad_i, is_marker:bool, is_horizontal:bool)
         rot_items = []
         max_h_rot_across = 0
         max_top_pad_across = 0
@@ -2852,43 +2858,62 @@ class App(tk.Tk):
             use_k = min(len(nonladder_idx), len(names))
             any_text = any((str(n or "").strip() for n in names))
 
-            # 工具：生成“竖排小图”（横排绘制→旋转90°→轻裁边），并在“超过列宽”时按单图规则收缩
+            # 工具：生成文本图：
+            #   layout 'v': 横排绘制→旋转90°→轻裁边；若高度>允许宽度则收缩
+            #   layout 'h': 直接横排，不收缩
             def render_vertical_text_fitting(text: str, lane_w_mosaic: int):
                 t = (text or "").strip()
                 if not t:
                     return None, 0, 0
 
-                # 先用“初始 scale_i”度量横排的 tw/th
-                (tw, th), base = cv2.getTextSize(t, font, scale_i, thick_i)
+                layout = 'v'
+                # lane_name_layout 与非标准道顺序对齐（不含 ladder）。通过 names 列 index 推断。
+                # 这里 name 列 index 将在外层调用时根据 k 确定。
+                # 为便于使用，这里读取一个在闭包外设置的 current_layout 变量。
+                try:
+                    if hasattr(self, '_current_lane_label_layout') and self._current_lane_label_layout == 'h':
+                        layout = 'h'
+                except Exception:
+                    layout = 'v'
 
-                # 单图规则：如果“旋转后的宽度≈横排的高度 th” 会超过道宽，则按比例减小 scale
-                # （注意：厚度 thick_i 不随缩放变化 —— 与单图保持一致）
+                (tw, th), base = cv2.getTextSize(t, font, scale_i, thick_i)
                 allow_w = max(1, lane_w_mosaic - 2*txt_pad_px)
                 scale_fit = float(scale_i)
-                if th > allow_w:
-                    scale_fit = max(0.35, scale_i * (allow_w / (th + 1e-6)))
-                    (tw, th), base = cv2.getTextSize(t, font, scale_fit, thick_i)
 
-                # 绘制横排小图（边距 txt_pad_px）
-                w_horiz = max(1, tw + 2*txt_pad_px)
-                h_horiz = max(1, th + base + 2*txt_pad_px)
-                img = np.full((h_horiz, w_horiz, 3), 255, dtype=np.uint8)
-                org = (txt_pad_px, txt_pad_px + th)
-                try:
-                    cv2.putText(img, t, org, font, scale_fit, (0, 0, 0), thick_i, cv2.LINE_AA)
-                except Exception:
-                    cv2.putText(img, "?", org, font, scale_fit, (0, 0, 0), thick_i, cv2.LINE_AA)
-
-                # 逆时针旋转 90°，并轻裁边（与单图一致）
-                rot = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                gray = cv2.cvtColor(rot, cv2.COLOR_BGR2GRAY)
-                ys, xs = np.where(gray < 252)
-                if ys.size > 0:
-                    y1 = max(0, ys.min() - 1); y2 = min(rot.shape[0]-1, ys.max() + 1)
-                    x1 = max(0, xs.min() - 1); x2 = min(rot.shape[1]-1, xs.max() + 1)
-                    rot = rot[y1:y2+1, x1:x2+1]
-                h_rot, w_rot = rot.shape[:2]
-                return rot, w_rot, h_rot
+                if layout == 'h':
+                    # 新规则：横排不做宽度收缩，直接按基准 scale_i 绘制，允许溢出
+                    scale_fit = scale_i  # 强制保持原字号
+                    w_img = max(1, tw + 2 * txt_pad_px)
+                    h_img = max(1, th + base + 2 * txt_pad_px)
+                    img = np.full((h_img, w_img, 3), 255, dtype=np.uint8)
+                    org = (txt_pad_px, txt_pad_px + th)
+                    try:
+                        cv2.putText(img, t, org, font, scale_fit, (0, 0, 0), thick_i, cv2.LINE_AA)
+                    except Exception:
+                        cv2.putText(img, '?', org, font, scale_fit, (0, 0, 0), thick_i, cv2.LINE_AA)
+                    return img, w_img, h_img
+                else:
+                    # 竖排（原逻辑）
+                    if th > allow_w:
+                        scale_fit = max(0.35, scale_i * (allow_w / (th + 1e-6)))
+                        (tw, th), base = cv2.getTextSize(t, font, scale_fit, thick_i)
+                    w_horiz = max(1, tw + 2*txt_pad_px)
+                    h_horiz = max(1, th + base + 2*txt_pad_px)
+                    img = np.full((h_horiz, w_horiz, 3), 255, dtype=np.uint8)
+                    org = (txt_pad_px, txt_pad_px + th)
+                    try:
+                        cv2.putText(img, t, org, font, scale_fit, (0, 0, 0), thick_i, cv2.LINE_AA)
+                    except Exception:
+                        cv2.putText(img, '?', org, font, scale_fit, (0, 0, 0), thick_i, cv2.LINE_AA)
+                    rot = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    gray = cv2.cvtColor(rot, cv2.COLOR_BGR2GRAY)
+                    ys, xs = np.where(gray < 252)
+                    if ys.size > 0:
+                        y1 = max(0, ys.min() - 1); y2 = min(rot.shape[0]-1, ys.max() + 1)
+                        x1 = max(0, xs.min() - 1); x2 = min(rot.shape[1]-1, xs.max() + 1)
+                        rot = rot[y1:y2+1, x1:x2+1]
+                    h_rot, w_rot = rot.shape[:2]
+                    return rot, w_rot, h_rot
 
             # 渲染非标准道标签
             for k in range(use_k):
@@ -2899,14 +2924,30 @@ class App(tk.Tk):
 
                 # 该道的“拼接图中的宽度”：道宽 * s_post
                 lane_w_mosaic = int(round(widths_mid[li] * si_post))
+                # 设置当前列布局标记供内部函数读取
+                try:
+                    if k < len(self.lane_name_layout) and self.lane_name_layout[k] == 'h':
+                        self._current_lane_label_layout = 'h'
+                    else:
+                        self._current_lane_label_layout = 'v'
+                except Exception:
+                    self._current_lane_label_layout = 'v'
                 rot_img, w_rot, h_rot = render_vertical_text_fitting(text, lane_w_mosaic)
                 if rot_img is None:
                     continue
 
-                # 道中心在“拼接图中的X”：左轴偏移 + 块x偏移 + center * s_post
-                x_center_mosaic = int(round(axis_w_left + x_left + centers_mid[li] * si_post))
+                # 计算锚点：竖排用中心，横排用 lane 左边界
+                lane_center = centers_mid[li]
+                lane_w = widths_mid[li]
+                lane_left = lane_center - lane_w / 2.0
+                if getattr(self, '_current_lane_label_layout', 'v') == 'h':
+                    x_anchor = int(round(axis_w_left + x_left + lane_left * si_post))
+                    is_horizontal = True
+                else:
+                    x_anchor = int(round(axis_w_left + x_left + lane_center * si_post))
+                    is_horizontal = False
 
-                rot_items.append((bi, x_center_mosaic, rot_img, w_rot, h_rot, top_pad_i, bottom_pad_i, False))
+                rot_items.append((bi, x_anchor, rot_img, w_rot, h_rot, top_pad_i, bottom_pad_i, False, is_horizontal))
                 max_h_rot_across      = max(max_h_rot_across, h_rot)
                 max_top_pad_across    = max(max_top_pad_across, top_pad_i)
                 max_bottom_pad_across = max(max_bottom_pad_across, bottom_pad_i)
@@ -2914,10 +2955,12 @@ class App(tk.Tk):
             # 若该行有任意文本，且存在标准道（skip_idx 非 None），则画“Marker”
             if any_text and (skip_idx is not None) and 0 <= skip_idx < len(centers_mid):
                 lane_w_mosaic = int(round(widths_mid[skip_idx] * si_post))
+                # Marker 始终竖排
+                self._current_lane_label_layout = 'v'
                 rot_img, w_rot, h_rot = render_vertical_text_fitting("Marker", lane_w_mosaic)
                 if rot_img is not None:
                     x_center_mosaic = int(round(axis_w_left + x_left + centers_mid[skip_idx] * si_post))
-                    rot_items.append((bi, x_center_mosaic, rot_img, w_rot, h_rot, top_pad_i, bottom_pad_i, True))
+                    rot_items.append((bi, x_center_mosaic, rot_img, w_rot, h_rot, top_pad_i, bottom_pad_i, True, False))
                     max_h_rot_across      = max(max_h_rot_across, h_rot)
                     max_top_pad_across    = max(max_top_pad_across, top_pad_i)
                     max_bottom_pad_across = max(max_bottom_pad_across, bottom_pad_i)
@@ -2937,9 +2980,13 @@ class App(tk.Tk):
         # 统一基线：所有标签的底沿都落在 (panel_top_pad + panel_text_h_max) 这一“行基线”
         baseline_y = panel_top_pad + panel_text_h_max
 
-        for (bi, x_center_mosaic, rot_img, w_rot, h_rot, top_pad_i, bottom_pad_i, is_marker) in rot_items:
-            # 横向：以 x_center 居中，防止溢出
-            x_left = int(np.clip(x_center_mosaic - w_rot // 2, 2, W_total - w_rot - 2))
+        for (bi, x_anchor, rot_img, w_rot, h_rot, top_pad_i, bottom_pad_i, is_marker, is_horizontal) in rot_items:
+            if is_horizontal:
+                # 横排：使用左边界锚点，允许文本向右越界（但仍做基本图像范围裁剪）
+                x_left = int(np.clip(x_anchor, 2, W_total - w_rot - 2))
+            else:
+                # 竖排：保持以中心居中
+                x_left = int(np.clip(x_anchor - w_rot // 2, 2, W_total - w_rot - 2))
             # 纵向：底沿对齐到统一基线（而非使用各自 bottom_pad_i），保证一条直线
             y_top = int(np.clip(baseline_y - h_rot, 0, top_panel_h - h_rot))
 
@@ -3872,6 +3919,7 @@ class App(tk.Tk):
             setattr(self, "bottom_note_text", "")
 
         self.lane_names = []
+        self.lane_name_layout = []
         self.lane_marks = []
         self.render_cache = {}
         self._clear_right_canvas()
@@ -4027,6 +4075,7 @@ class App(tk.Tk):
                 setattr(self, "right_table_opts", {})
             # 列名/分子量清空（新图从零开始）
             self.lane_names = []
+            self.lane_name_layout = []
             self.lane_marks = []
             # 也可视化开关归位
             try: self.var_show_boxes.set(False)
@@ -4653,6 +4702,10 @@ class App(tk.Tk):
                 names_use = (names_seq + [""] * n_nonladder)[:n_nonladder]
                 labels_table = [names_use]
             if labels_table and any(((t or "").strip() for t in labels_table[0])):
+                # 对齐布局数组长度（主渲染路径）
+                if len(self.lane_name_layout) != len(labels_table[0]):
+                    base_layout = list(self.lane_name_layout) + ["v"] * len(labels_table[0])
+                    self.lane_name_layout = base_layout[:len(labels_table[0])]
                 H0 = annotated_final_base.shape[0]
                 annotated_final_base = self._attach_labels_panel(
                     img_bgr=annotated_final_base,
@@ -4791,7 +4844,15 @@ class App(tk.Tk):
                 names_seq = (self.lane_names or [])
                 names_use = (names_seq + [""] * n_nonladder)[:n_nonladder]
                 labels_table = [names_use]
+            # 对齐布局数组长度
+            if len(self.lane_name_layout) != len(labels_table[0]):
+                # 仅扩展/截断，不改变已有标记
+                base_layout = list(self.lane_name_layout) + ["v"] * len(labels_table[0])
+                self.lane_name_layout = base_layout[:len(labels_table[0])]
             if labels_table and any(((t or "").strip() for t in labels_table[0])):
+                if len(self.lane_name_layout) != len(labels_table[0]):
+                    base_layout = list(self.lane_name_layout) + ["v"] * len(labels_table[0])
+                    self.lane_name_layout = base_layout[:len(labels_table[0])]
                 H0 = base_img.shape[0]
                 base_img = self._attach_labels_panel(
                     img_bgr=base_img,
@@ -4985,37 +5046,45 @@ class App(tk.Tk):
 
         base_scale = self._font_scale_for_cap_height_px(cap_px, font=font, thickness=thick)
 
-        def render_rotated_text_img(text: str, lane_idx: int):
+        def render_rotated_text_img(text: str, lane_idx: int, layout: str):
             text = (text or "").strip()
             if not text:
                 return None, 0, 0, 0.0
             lane_w = max(1, widths_all[lane_idx] - 2 * h_margin)
-
             scale = base_scale
             (tw, th), baseline = cv2.getTextSize(text, font, scale, thick)
-            # 旋转后高度≈th，若超过列宽则等比缩小
-            if th > lane_w:
-                scale = max(0.35, scale * (lane_w / (th + 1e-6)))
-                (tw, th), baseline = cv2.getTextSize(text, font, scale, thick)
-
-            w_horiz = max(1, tw + 2 * txt_pad)
-            h_horiz = max(1, th + baseline + 2 * txt_pad)
-            img = np.full((h_horiz, w_horiz, 3), 255, dtype=np.uint8)
-            org = (txt_pad, txt_pad + th)
-            cv2.putText(img, text, org, font, scale, (0, 0, 0), thick, cv2.LINE_AA)
-
-            rot = cv2.rotate(img, _ROT_FLAG)
-            rot_gray = cv2.cvtColor(rot, cv2.COLOR_BGR2GRAY)
-            nz = np.where(rot_gray < 252)
-            if nz[0].size > 0:
-                y_min, y_max = int(nz[0].min()), int(nz[0].max())
-                x_min, x_max = int(nz[1].min()), int(nz[1].max())
-                y_min = max(0, y_min - 1); y_max = min(rot.shape[0] - 1, y_max + 1)
-                x_min = max(0, x_min - 1); x_max = min(rot.shape[1] - 1, x_max + 1)
-                rot = rot[y_min:y_max + 1, x_min:x_max + 1]
-            rot = cv2.copyMakeBorder(rot, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-            h_rot, w_rot = rot.shape[:2]
-            return rot, w_rot, h_rot, float(scale)
+            if layout == 'h':
+                # 水平：不缩放，不限制宽度；按原始 scale 绘制（允许溢出/重叠）
+                w_img = max(1, tw + 2 * txt_pad)
+                h_img = max(1, th + baseline + 2 * txt_pad)
+                img = np.full((h_img, w_img, 3), 255, dtype=np.uint8)
+                org = (txt_pad, txt_pad + th)
+                cv2.putText(img, text, org, font, scale, (0, 0, 0), thick, cv2.LINE_AA)
+                img = cv2.copyMakeBorder(img, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=(255,255,255))
+                h_rot, w_rot = img.shape[:2]
+                return img, w_rot, h_rot, float(scale)
+            else:
+                # 竖排：逻辑沿用原实现
+                if th > lane_w:
+                    scale = max(0.35, scale * (lane_w / (th + 1e-6)))
+                    (tw, th), baseline = cv2.getTextSize(text, font, scale, thick)
+                w_horiz = max(1, tw + 2 * txt_pad)
+                h_horiz = max(1, th + baseline + 2 * txt_pad)
+                img = np.full((h_horiz, w_horiz, 3), 255, dtype=np.uint8)
+                org = (txt_pad, txt_pad + th)
+                cv2.putText(img, text, org, font, scale, (0, 0, 0), thick, cv2.LINE_AA)
+                rot = cv2.rotate(img, _ROT_FLAG)
+                rot_gray = cv2.cvtColor(rot, cv2.COLOR_BGR2GRAY)
+                nz = np.where(rot_gray < 252)
+                if nz[0].size > 0:
+                    y_min, y_max = int(nz[0].min()), int(nz[0].max())
+                    x_min, x_max = int(nz[1].min()), int(nz[1].max())
+                    y_min = max(0, y_min - 1); y_max = min(rot.shape[0] - 1, y_max + 1)
+                    x_min = max(0, x_min - 1); x_max = min(rot.shape[1] - 1, x_max + 1)
+                    rot = rot[y_min:y_max + 1, x_min:x_max + 1]
+                rot = cv2.copyMakeBorder(rot, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+                h_rot, w_rot = rot.shape[:2]
+                return rot, w_rot, h_rot, float(scale)
 
         # 行测量与缓存
         rows_used_idx, row_heights = [], []
@@ -5030,16 +5099,22 @@ class App(tk.Tk):
             max_h_rot = 0
             for c in range(min(cols_use, len(target_lane_idx))):
                 text = str(labels_table[r][c] or "").strip()
-                if not text: 
+                if not text:
                     continue
                 li = target_lane_idx[c]
-                cell = render_rotated_text_img(text, li)
+                layout = 'v'
+                try:
+                    if c < len(self.lane_name_layout):
+                        layout = 'h' if self.lane_name_layout[c] == 'h' else 'v'
+                except Exception:
+                    layout = 'v'
+                cell = render_rotated_text_img(text, li, layout)
                 cell_cache[(r, li)] = cell
                 _, w_rot, h_rot, _ = cell
                 max_h_rot = max(max_h_rot, h_rot)
 
             if skip_idx >= 0 and skip_idx < real_nlanes:
-                cell_std = render_rotated_text_img(STD_TEXT, skip_idx)
+                cell_std = render_rotated_text_img(STD_TEXT, skip_idx, 'v')
                 cell_cache[(r, skip_idx)] = cell_std
                 _, w_rot_s, h_rot_s, _ = cell_std
                 max_h_rot = max(max_h_rot, h_rot_s)
@@ -5051,7 +5126,7 @@ class App(tk.Tk):
             return img_bgr
 
         panel_h = top_pad + sum(row_heights[r] for r in rows_used_idx) \
-                + (len(rows_used_idx) - 1) * row_gap + bot_pad
+            + (len(rows_used_idx) - 1) * row_gap + bot_pad
         panel = np.full((panel_h, W_total, 3), 255, dtype=np.uint8)
 
         y_cursor = top_pad
@@ -5062,14 +5137,19 @@ class App(tk.Tk):
             # 非标准道
             for c in range(min(cols_use, len(target_lane_idx))):
                 text = str(labels_table[r][c] or "").strip()
-                if not text: 
+                if not text:
                     continue
                 li = target_lane_idx[c]
                 rot_img, w_rot, h_rot, _ = cell_cache.get((r, li), (None, 0, 0, 0.0))
                 if rot_img is None or w_rot <= 0 or h_rot <= 0:
                     continue
-                lane_center = centers_mid_all[li]
-                x_left = int(np.clip(lane_center - w_rot // 2, 2, W_total - w_rot - 2))
+                if (c < len(self.lane_name_layout) and self.lane_name_layout[c] == 'h'):
+                    # 水平：左边基准 = lane 左边界 (centers - width/2 ≈ left)
+                    lane_left = lefts_all[li]
+                    x_left = int(np.clip(lane_left, 2, max(2, W_total - w_rot - 2)))
+                else:
+                    lane_center = centers_mid_all[li]
+                    x_left = int(np.clip(lane_center - w_rot // 2, 2, W_total - w_rot - 2))
                 y_top = int(y_cursor + (rh - h_rot))
                 y1 = max(0, y_top); y2 = min(panel_h, y_top + h_rot)
                 x1 = max(0, x_left); x2 = min(W_total, x_left + w_rot)
@@ -5423,6 +5503,14 @@ class App(tk.Tk):
             marks = self.lane_marks[i] if i < len(self.lane_marks) else []
             ms = ", ".join(_fmt_num(v) for v in (marks or []))
             line = (name + (": " + ms if ms else "")).strip()
+            # 若该列为横排布局（来自之前输入的 '@:' 前缀），回显时恢复 '@:' 标记
+            try:
+                if i < len(self.lane_name_layout) and self.lane_name_layout[i] == 'h':
+                    # 仅在该行存在内容（名称或数值）时才添加前缀；空行仍保持空以表示“无标签”
+                    if line:
+                        line = "@: " + line
+            except Exception:
+                pass
             pre_lines.append(line)
         if pre_lines:
             txt.insert("1.0", "\n".join(pre_lines))
@@ -5431,6 +5519,7 @@ class App(tk.Tk):
             lines = (raw or "").splitlines()  # 不丢弃空行
             names: list[str] = []
             marks: list[list[float]] = []
+            layouts: list[str] = []  # 与 names 对应："h" 水平; "v" 竖排(默认)
             def _split_tokens(s: str) -> list[str]:
                 s = (s.replace("，", ",").replace("；", ";")
                      .replace("、", ",").replace("\t", ",")
@@ -5442,11 +5531,20 @@ class App(tk.Tk):
                 if not ln.strip():  # 空行 ⇒ 不标注列
                     names.append("")
                     marks.append([])
+                    layouts.append("v")
                     continue
-                toks = _split_tokens(ln)
+                horizontal = False
+                raw_line = ln.lstrip()
+                if raw_line.startswith("@:") or raw_line.startswith("@："):
+                    horizontal = True
+                    ln_proc = raw_line[2:].lstrip()  # 去掉前缀，不计入标题
+                else:
+                    ln_proc = ln
+                toks = _split_tokens(ln_proc)
                 if not toks:
                     names.append("")
                     marks.append([])
+                    layouts.append("v" if not horizontal else "h")
                     continue
                 name = toks[0]
                 nums: list[float] = []
@@ -5459,12 +5557,18 @@ class App(tk.Tk):
                         pass
                 names.append(name)
                 marks.append(nums)
+                layouts.append("h" if horizontal else "v")
+            # 保存布局到实例（长度与 names 对齐）
+            self.lane_name_layout = layouts
             return names, marks
 
         def do_ok():
             raw = txt.get("1.0", "end")
             names, marks = parse_lane_meta(raw)
             self.lane_names = names
+            # 若未同步提供布局数组（旧缓存），补全为竖排
+            if len(getattr(self, 'lane_name_layout', [])) != len(names):
+                self.lane_name_layout = ["v"] * len(names)
             self.lane_marks = marks
             win.destroy()
             try:
