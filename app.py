@@ -1782,32 +1782,49 @@ class App(tk.Tk):
             except Exception:
                 lanes_s = None
         return bounds_s, lanes_s
+    
+
+
     def _attach_fixed_axis_panel(
         self,
         gel_bgr: np.ndarray,
-        ladder_peaks_y: list,      # 各刻度对应的 y（相对 gel 顶，单位像素）
-        ladder_labels: list,       # 各刻度的文本（float -> 将转为整数）
+        ladder_peaks_y: list,  # 各刻度对应的 y（相对 gel 顶，单位像素）
+        ladder_labels: list,   # 各刻度的文本（float -> 将转为整数）
         yaxis_side: str = "left",
-        cap_px: int = None,        # 字高像素，默认 _get_design_params()['axis_cap_px']
+        cap_px: int = None,    # 传入作为“基准字号”，将按图高 H 做比例放大
         tick_len: int = 8,
         pad_left: int = 10,
         pad_right: int = 10,
         pad_text_gap: int = 6,
     ) -> tuple[np.ndarray, int]:
         """
-        在 gel_bgr 左/右侧追加固定像素字号的白色面板，绘制刻度短线与文本（文本强制整数，无小数）。
+        在 gel_bgr 左/右侧追加白色面板，绘制刻度短线与文本（文本强制整数，无小数）。
+        修正点：将传入 cap_px 视为“基准字号”（默认 16），并按输入图像高度 H 做线性放大：
+            cap_px_eff = round(cap_px_base * H / 1000)，并设置下限 8。
         返回 (合成图, 面板宽 panel_w)。
         """
         import numpy as np, cv2
+
         if gel_bgr is None or not isinstance(gel_bgr, np.ndarray) or gel_bgr.size == 0:
             return gel_bgr, 0
+
         H, W = gel_bgr.shape[:2]
+
+        # 基准字号（来自传入或设计参数）
         design = self._get_design_params()
-        cap_px = int(cap_px) if isinstance(cap_px, (int, float)) and cap_px else int(design.get("axis_cap_px", 16))
-        # 字体度量
+        cap_px_base = int(cap_px) if isinstance(cap_px, (int, float)) and cap_px else int(design.get("axis_cap_px", 16))
+
+        # ★ 关键修正：随图像高度线性放大，使拼接时与单图视觉比例一致
+        try:
+            cap_px_eff = int(round(cap_px_base * (H / 1000.0)))
+            cap_px_eff = max(8, cap_px_eff)  # 下限，避免极小图不可读
+        except Exception:
+            cap_px_eff = max(8, cap_px_base)
+
+        # 用像素字高反推 cv2 的 fontScale
         font = cv2.FONT_HERSHEY_SIMPLEX
         thickness = 2
-        scale = self._font_scale_for_cap_height_px(cap_px, font=font, thickness=thickness)
+        scale = self._font_scale_for_cap_height_px(cap_px_eff, font=font, thickness=thickness)
 
         # 统一转整数文本（去小数）
         def _fmt_int(v) -> str:
@@ -1838,6 +1855,7 @@ class App(tk.Tk):
         for i, t in enumerate(labels):
             y = int(np.clip(ys[i], 0, H - 1))
             (tw, th) = sizes[i]
+
             if side == "right":
                 x0 = 0
                 x1 = tick_len
@@ -1847,12 +1865,26 @@ class App(tk.Tk):
                 x0 = x1 - tick_len
                 tx = x0 - pad_text_gap - tw
                 tx = max(0, tx)
+
             cv2.line(panel, (x0, y), (x1, y), (0, 0, 0), 1, cv2.LINE_AA)
             ty = int(np.clip(y + th // 2, th, H - 1))
-            cv2.putText(panel, t if t else " ", (tx, ty), font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
+            cv2.putText(panel, t if t else " ", (int(tx), ty), font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
 
-        out = np.concatenate([gel_bgr, panel], axis=1) if side == "right" else np.concatenate([panel, gel_bgr], axis=1)
+        out = np.concatenate([gel_bgr, panel], axis=1) if side == "right" \
+            else np.concatenate([panel, gel_bgr], axis=1)
+
+        # 记录到缓存（便于调试核对）
+        try:
+            if not hasattr(self, "render_cache") or self.render_cache is None:
+                self.render_cache = {}
+            self.render_cache["mosaic_axis_cap_px_used"] = int(cap_px_eff)
+            self.render_cache["mosaic_axis_cap_base"] = int(cap_px_base)
+            self.render_cache["mosaic_axis_input_height"] = int(H)
+        except Exception:
+            pass
+
         return out, int(panel_w)
+
 
     def _set_composed_preview(self, base_img: np.ndarray, display_img: np.ndarray):
         """
@@ -2850,33 +2882,68 @@ class App(tk.Tk):
         table_text: str,
         has_header: bool = True,
         show_grid: bool = True,
-        align: str = "center",  # "left" / "center" / "right"
-        cap_px: int = None,     # 字高像素
-        cell_pad_x: int = 12,   # 单元内边距 X
-        cell_pad_y: int = 8,    # 单元内边距 Y
-        line_color: tuple = (0, 0, 0),  # BGR
+        align: str = "center",            # "left" / "center" / "right"
+        cap_px: int = None,               # 被忽略（统一用 H_img 计算）
+        cell_pad_x: int = 12,             # 作为“基准值”，按 H_img/1000 比例缩放
+        cell_pad_y: int = 8,              # 作为“基准值”，按 H_img/1000 比例缩放
+        line_color: tuple = (0, 0, 0),    # BGR
         gap_px: int = 30,
         panel_top_h: int = 0,
-        gel_height_px: int = None,      # 自适应模式参考高度
-        cap_policy: str = "max_auto",   # 自适应策略："max_auto" | "auto_only" | "free"
-        absolute_pixels: bool = False   # True=绝对像素（不 shrink）；False=自适应（历史默认）
+        gel_height_px: int = None,        # 保留参数，不影响字号/内边距
+        cap_policy: str = "max_auto",     # 保留参数，不影响字号/内边距
+        absolute_pixels: bool = False     # 保留参数，不影响字号/内边距
     ) -> np.ndarray:
         """
-        右侧白底表格列（支持 Excel 粘贴）。修复点：
-        1）若用户提供 cap_px，则严格使用该像素字高，不再 shrink；
-        2）表格过高时，像底注一样向下延展整图高度，不裁切。
+        右侧白底表格列 —— 保留全部功能，仅将“字号与内边距”统一按图像高度 H_img 比例计算：
+        - 字号 cap_px_final = int(22 * H_img / 1000)
+        - 横向内边距 pad_x_final = int(cell_pad_x * H_img / 1000)
+        - 纵向内边距 pad_y_final = int(cell_pad_y * H_img / 1000)
+
+        其它逻辑（网格/表头灰底/对齐/顶部对齐/超高扩展/右侧拼接）不变。
         """
         import numpy as np, cv2
         from PIL import Image, ImageDraw, ImageFont
 
+        # 基本检查
         if img_bgr is None or not isinstance(img_bgr, np.ndarray) or img_bgr.size == 0:
             return img_bgr
 
         H_img, W_img = img_bgr.shape[:2]
         panel_top_h = max(0, int(panel_top_h))
-        body_avail_h = max(0, H_img - panel_top_h)
+        gap_px = max(1, int(gap_px))
 
-        # ---- 解析粘贴文本 ----
+        # —— 统一字号 & 内边距（随 H_img 线性缩放）——
+        try:
+            cap_px_final = max(1, int(22 * H_img / 1000))
+        except Exception:
+            cap_px_final = 12  # 兜底
+
+        # 允许调用方通过参数改变“基准值”，再按 H_img 比例缩放
+        try:
+            pad_x_base = int(cell_pad_x) if isinstance(cell_pad_x, (int, float)) else 12
+            pad_y_base = int(cell_pad_y) if isinstance(cell_pad_y, (int, float)) else 8
+        except Exception:
+            pad_x_base, pad_y_base = 12, 8
+
+        # 最小值下限，避免极小图导致不可读
+        MIN_PAD_X, MIN_PAD_Y = 4, 3
+        try:
+            pad_x_final = max(MIN_PAD_X, int(pad_x_base * H_img / 1000))
+            pad_y_final = max(MIN_PAD_Y, int(pad_y_base * H_img / 1000))
+        except Exception:
+            pad_x_final, pad_y_final = pad_x_base, pad_y_base
+
+        # 记录到缓存（便于调试核对）
+        try:
+            if not hasattr(self, "render_cache") or self.render_cache is None:
+                self.render_cache = {}
+            self.render_cache["right_table_cap_px_used"] = int(cap_px_final)
+            self.render_cache["right_table_pad_x_used"] = int(pad_x_final)
+            self.render_cache["right_table_pad_y_used"] = int(pad_y_final)
+        except Exception:
+            pass
+
+        # —— 解析粘贴文本（支持 Excel：Tab；兼容 , ; 与中文分隔）——
         raw = (table_text or "").replace("\r\n", "\n").replace("\r", "\n")
         rows_raw = raw.split("\n")
         rows = []
@@ -2890,336 +2957,158 @@ class App(tk.Tk):
                 elif ";" in s2: cells = s2.split(";")
                 else: cells = [s2]
             rows.append([c.strip() for c in cells])
+
         rows = [r for r in rows if any((c.strip() for c in r))]
         if not rows:
-            gap = np.full((H_img, max(1, gap_px), 3), 255, dtype=np.uint8)
+            # 无内容：只拼接空白间隔列
+            gap = np.full((H_img, gap_px, 3), 255, dtype=np.uint8)
             return np.concatenate([img_bgr, gap], axis=1)
 
+        # 对齐列数
         max_cols = max(len(r) for r in rows)
         for r in rows:
             if len(r) < max_cols:
                 r.extend([""] * (max_cols - len(r)))
 
-        # ---- 字体选择 ----
-        font_path = self._find_font_ttf()
+        # —— 字体选择（优先 Pillow TTF，退回 OpenCV）——
+        font_path = self._find_font_ttf() if hasattr(self, "_find_font_ttf") else None
         use_pil = font_path is not None
-
-        # ========= A) 绝对像素模式：严格按 cap_px，已满足 =========
-        if absolute_pixels:
-            cap_px_abs = int(cap_px) if isinstance(cap_px, (int, float)) and cap_px else int(self._get_design_params().get("bottom_cap_px", 28))
-            pad_x_abs = int(cell_pad_x)
-            pad_y_abs = int(cell_pad_y)
-
-            if use_pil:
-                try:
-                    font_pil = ImageFont.truetype(font_path, size=max(12, cap_px_abs))
-                except Exception:
-                    use_pil = False
-
-            def measure_fixed():
-                if use_pil:
-                    tmp = Image.new("RGB", (8, 8), "white")
-                    drw = ImageDraw.Draw(tmp)
-                    def meas(t: str):
-                        s = t if t else " "
-                        bbox = drw.textbbox((0, 0), s, font=font_pil)
-                        return max(1, bbox[2]-bbox[0]), max(1, bbox[3]-bbox[1])
-                else:
-                    font_cv = cv2.FONT_HERSHEY_SIMPLEX
-                    scale_cv = self._font_scale_for_cap_height_px(cap_px_abs, font=font_cv, thickness=2)
-                    def meas(t: str):
-                        s = t if t else " "
-                        (tw, th), _ = cv2.getTextSize(s, font_cv, scale_cv, 2)
-                        return max(1, tw), max(1, th)
-                col_w = [0]*max_cols
-                row_h = [0]*len(rows)
-                for i, r in enumerate(rows):
-                    max_h = 0
-                    for j, cell in enumerate(r):
-                        tw, th = meas(cell)
-                        col_w[j] = max(col_w[j], tw + 2*pad_x_abs)
-                        max_h = max(max_h, th + 2*pad_y_abs)
-                    row_h[i] = max(1, max_h)
-                grid_w = sum(col_w) + (1 if show_grid else 0)
-                grid_h = sum(row_h) + (1 if show_grid else 0)
-                return col_w, row_h, grid_w, grid_h, (font_pil if use_pil else None), (scale_cv if not use_pil else None)
-
-            col_w, row_h, grid_w, grid_h, font_pil, scale_cv = measure_fixed()
-
-            # 绘制（略：与之前一致）—— 省略注释，直接保留你的绘制实现
-            if use_pil:
-                panel_img = Image.new("RGB", (grid_w, grid_h), "white")
-                draw = ImageDraw.Draw(panel_img)
-                header_rows = 1 if has_header and len(rows) >= 1 else 0
-                if header_rows == 1:
-                    hdr_h = row_h[0]
-                    draw.rectangle([(0, 0), (grid_w-1, hdr_h-1)], fill=(240,240,240))
-                if show_grid:
-                    y = 0
-                    draw.line([(0, y), (grid_w-1, y)], fill=(0,0,0), width=1)
-                    for h in row_h:
-                        y += h
-                        draw.line([(0, y), (grid_w-1, y)], fill=(0,0,0), width=1)
-                    x = 0
-                    draw.line([(x, 0), (x, grid_h-1)], fill=(0,0,0), width=1)
-                    for w in col_w:
-                        x += w
-                        draw.line([(x, 0), (x, grid_h-1)], fill=(0,0,0), width=1)
-                tmp = Image.new("RGB", (8,8), "white")
-                drw = ImageDraw.Draw(tmp)
-                def meas_pil(text: str):
-                    t = text if text else " "
-                    bb = drw.textbbox((0,0), t, font=font_pil)
-                    return max(1, bb[2]-bb[0]), max(1, bb[3]-bb[1])
-                def x_for_cell(tw, l, wid):
-                    if align == "left": return l + pad_x_abs
-                    if align == "right": return l + max(0, wid - tw - pad_x_abs)
-                    return l + max(0, (wid - tw)//2)
-                y_cursor = 0
-                for i, r in enumerate(rows):
-                    x_cursor = 0
-                    for j, cell in enumerate(r):
-                        tw, th = meas_pil(cell)
-                        tx = x_for_cell(tw, x_cursor, col_w[j])
-                        ty = y_cursor + max(0, (row_h[i] - th)//2)
-                        if has_header and i == 0:
-                            draw.text((tx, ty), cell or " ", fill=(0,0,0), font=font_pil,
-                                    stroke_width=1, stroke_fill=(0,0,0))
-                        else:
-                            draw.text((tx, ty), cell or " ", fill=(0,0,0), font=font_pil)
-                        x_cursor += col_w[j]
-                    y_cursor += row_h[i]
-                panel_bgr = cv2.cvtColor(np.array(panel_img), cv2.COLOR_RGB2BGR)
-            else:
-                font_cv = cv2.FONT_HERSHEY_SIMPLEX
-                scale_cv = scale_cv or self._font_scale_for_cap_height_px(int(cap_px_abs), font=font_cv, thickness=2)
-                panel_bgr = np.full((grid_h, grid_w, 3), 255, dtype=np.uint8)
-                header_rows = 1 if has_header and len(rows) >= 1 else 0
-                if header_rows == 1:
-                    hdr_h = row_h[0]
-                    cv2.rectangle(panel_bgr, (0,0), (grid_w-1, hdr_h-1), (240,240,240), thickness=-1)
-                if show_grid:
-                    y = 0
-                    cv2.line(panel_bgr, (0,y), (grid_w-1,y), (0,0,0), 1)
-                    for h in row_h:
-                        y += h
-                        cv2.line(panel_bgr, (0,y), (grid_w-1,y), (0,0,0), 1)
-                    x = 0
-                    cv2.line(panel_bgr, (x,0), (x,grid_h-1), (0,0,0), 1)
-                    for w in col_w:
-                        x += w
-                        cv2.line(panel_bgr, (x,0), (x,grid_h-1), (0,0,0), 1)
-                def x_for_cell_cv(tw, l, wid):
-                    if align == "left": return l + pad_x_abs
-                    if align == "right": return l + max(0, wid - tw - pad_x_abs)
-                    return l + max(0, (wid - tw)//2)
-                y_cursor = 0
-                for i, r in enumerate(rows):
-                    x_cursor = 0
-                    for j, cell in enumerate(r):
-                        t = cell if cell else " "
-                        (tw, th), base = cv2.getTextSize(t, font_cv, scale_cv, 2)
-                        tx = x_for_cell_cv(tw, x_cursor, col_w[j])
-                        ty = y_cursor + max(0, (row_h[i] + th)//2)
-                        try:
-                            cv2.putText(panel_bgr, t, (tx, ty), font_cv, scale_cv, line_color, 2, cv2.LINE_AA)
-                        except Exception:
-                            cv2.putText(panel_bgr, "?", (tx, ty), font_cv, scale_cv, line_color, 2, cv2.LINE_AA)
-                        x_cursor += col_w[j]
-                    y_cursor += row_h[i]
-
-            # —— 高度对齐/扩高 ——（与之前实现一致）
-            Hp, Wp = panel_bgr.shape[:2]
-            Hp_total = panel_top_h + Hp
-            H_out = max(H_img, Hp_total)
-            top_pad_img = np.full((panel_top_h, Wp, 3), 255, dtype=np.uint8) if panel_top_h > 0 else None
-            column_full = panel_bgr if top_pad_img is None else np.vstack([top_pad_img, panel_bgr])
-            if column_full.shape[0] < H_out:
-                pad = np.full((H_out - column_full.shape[0], Wp, 3), 255, dtype=np.uint8)
-                column_full = np.vstack([column_full, pad])
-            if H_img < H_out:
-                pad = np.full((H_out - H_img, W_img, 3), 255, dtype=np.uint8)
-                img_bgr = np.vstack([img_bgr, pad])
-            gap = np.full((H_out, max(1, gap_px), 3), 255, dtype=np.uint8)
-            out = np.concatenate([img_bgr, gap, column_full], axis=1)
-            return out
-
-        # ========= B) 单图自适应模式：若 cap_px 提供，则严格尊重，禁用 shrink =========
-        ref_h = int(gel_height_px) if isinstance(gel_height_px, (int, float)) and gel_height_px else int(body_avail_h)
-        ref_h = max(1, ref_h)
-        s_ref = max(0.35, float(ref_h) / 1000.0)
-        design = self._get_design_params()
-        base_cap = int(design.get("bottom_cap_px", 28))
-        auto_cap = max(10, int(round(base_cap * s_ref)))
-
-        respect_user_cap = isinstance(cap_px, (int, float)) and int(cap_px) > 0
-        if respect_user_cap:
-            cap_init = int(cap_px)   # << 关键：用户指定则直接使用
-        else:
-            if str(cap_policy).lower() == "auto_only":
-                cap_init = auto_cap
-            elif str(cap_policy).lower() == "max_auto":
-                user_cap = int(cap_px) if isinstance(cap_px, (int, float)) and cap_px else auto_cap
-                cap_init = min(int(user_cap), int(auto_cap))
-            else:  # "free"
-                cap_init = int(cap_px) if isinstance(cap_px, (int, float)) and cap_px else auto_cap
-
-        pad_x_init = max(6, int(round(cell_pad_x * s_ref)))
-        pad_y_init = max(4, int(round(cell_pad_y * s_ref)))
-        MIN_CAP, MIN_PAD_X, MIN_PAD_Y = 12, 4, 3
-
         if use_pil:
             try:
-                font = ImageFont.truetype(font_path, size=max(12, int(cap_init)))
+                font_pil = ImageFont.truetype(font_path, size=int(cap_px_final))
             except Exception:
                 use_pil = False
 
-        def _measure_table(cap_cur: int, pad_x_cur: int, pad_y_cur: int, want_pil: bool):
-            if want_pil:
-                try:
-                    font_local = ImageFont.truetype(font_path, size=max(12, int(cap_cur)))
-                except Exception:
-                    return _measure_table(cap_cur, pad_x_cur, pad_y_cur, False)
-                tmp = Image.new("RGB", (8, 8), "white")
-                drw = ImageDraw.Draw(tmp)
-                def meas(text: str):
-                    t = text if text else " "
-                    bbox = drw.textbbox((0, 0), t, font=font_local)
-                    return max(1, bbox[2]-bbox[0]), max(1, bbox[3]-bbox[1])
-                col_widths = [0]*max_cols
-                row_heights = [0]*len(rows)
-                for i, r in enumerate(rows):
-                    max_h = 0
-                    for j, cell in enumerate(r):
-                        tw, th = meas(cell)
-                        col_widths[j] = max(col_widths[j], tw + 2*pad_x_cur)
-                        max_h = max(max_h, th + 2*pad_y_cur)
-                    row_heights[i] = max(1, max_h)
-                grid_w = sum(col_widths) + (1 if show_grid else 0)
-                grid_h = sum(row_heights) + (1 if show_grid else 0)
-                return col_widths, row_heights, grid_w, grid_h, "pil", font_local
-            else:
-                font_cv = cv2.FONT_HERSHEY_SIMPLEX
-                scale = self._font_scale_for_cap_height_px(int(cap_cur), font=font_cv, thickness=2)
-                def meas_cv(text: str):
-                    t = text if text else " "
-                    (tw, th), _ = cv2.getTextSize(t, font_cv, scale, 2)
-                    return max(1, tw), max(1, th)
-                col_widths = [0]*max_cols
-                row_heights = [0]*len(rows)
-                for i, r in enumerate(rows):
-                    max_h = 0
-                    for j, cell in enumerate(r):
-                        tw, th = meas_cv(cell)
-                        col_widths[j] = max(col_widths[j], tw + 2*pad_x_cur)
-                        max_h = max(max_h, th + 2*pad_y_cur)
-                    row_heights[i] = max(1, max_h)
-                grid_w = sum(col_widths) + (1 if show_grid else 0)
-                grid_h = sum(row_heights) + (1 if show_grid else 0)
-                return col_widths, row_heights, grid_w, grid_h, "cv", scale
+        # —— 度量（统一使用 cap_px_final 与 pad_x_final/pad_y_final）——
+        def measure_pil():
+            tmp = Image.new("RGB", (8, 8), "white")
+            drw = ImageDraw.Draw(tmp)
+            def meas(t: str):
+                s = t if t else " "
+                bbox = drw.textbbox((0, 0), s, font=font_pil)
+                return max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
+            col_w = [0] * max_cols
+            row_h = [0] * len(rows)
+            for i, r in enumerate(rows):
+                max_h = 0
+                for j, cell in enumerate(r):
+                    tw, th = meas(cell)
+                    col_w[j] = max(col_w[j], tw + 2 * pad_x_final)
+                    max_h = max(max_h, th + 2 * pad_y_final)
+                row_h[i] = max(1, max_h)
+            grid_w = sum(col_w) + (1 if show_grid else 0)
+            grid_h = sum(row_h) + (1 if show_grid else 0)
+            return col_w, row_h, grid_w, grid_h
 
-        cap_cur, padx_cur, pady_cur = int(cap_init), int(pad_x_init), int(pad_y_init)
-        engine = "pil" if use_pil else "cv"
-        ctx = None
+        def measure_cv():
+            font_cv = cv2.FONT_HERSHEY_SIMPLEX
+            scale = self._font_scale_for_cap_height_px(int(cap_px_final), font=font_cv, thickness=2) \
+                    if hasattr(self, "_font_scale_for_cap_height_px") else 1.0
+            def meas_cv(t: str):
+                s = t if t else " "
+                (tw, th), _ = cv2.getTextSize(s, font_cv, scale, 2)
+                return max(1, tw), max(1, th)
+            col_w = [0] * max_cols
+            row_h = [0] * len(rows)
+            for i, r in enumerate(rows):
+                max_h = 0
+                for j, cell in enumerate(r):
+                    tw, th = meas_cv(cell)
+                    col_w[j] = max(col_w[j], tw + 2 * pad_x_final)
+                    max_h = max(max_h, th + 2 * pad_y_final)
+                row_h[i] = max(1, max_h)
+            grid_w = sum(col_w) + (1 if show_grid else 0)
+            grid_h = sum(row_h) + (1 if show_grid else 0)
+            return col_w, row_h, grid_w, grid_h, font_cv, scale
 
-        # —— 这里是关键改变 ——：若用户提供了 cap_px，就**不做 shrink**，保证“设置即所得”
-        if not respect_user_cap:
-            MAX_ITERS = 8
-            for _ in range(MAX_ITERS):
-                col_w, row_h, grid_w, grid_h, engine, ctx = _measure_table(cap_cur, padx_cur, pady_cur, engine == "pil")
-                if grid_h <= body_avail_h:
-                    break
-                f = float(body_avail_h) / float(grid_h)
-                f = max(0.50, min(0.98, f))
-                new_cap  = max(MIN_CAP,   int(round(cap_cur  * f)))
-                new_padx = max(MIN_PAD_X, int(round(padx_cur * f)))
-                new_pady = max(MIN_PAD_Y, int(round(pady_cur * f)))
-                if new_cap == cap_cur and new_padx == padx_cur and new_pady == pady_cur:
-                    if cap_cur  > MIN_CAP:   cap_cur  -= 1; continue
-                    if pady_cur > MIN_PAD_Y: pady_cur -= 1; continue
-                    if padx_cur > MIN_PAD_X: padx_cur -= 1; continue
-                    break
-                cap_cur, padx_cur, pady_cur = new_cap, new_padx, new_pady
+        if use_pil:
+            col_w, row_h, grid_w, grid_h = measure_pil()
+        else:
+            col_w, row_h, grid_w, grid_h, font_cv, scale_cv = measure_cv()
 
-        # 最终度量（若上面跳过 shrink，则直接以用户 cap 测量）
-        col_w, row_h, grid_w, grid_h, engine, ctx = _measure_table(cap_cur, padx_cur, pady_cur, engine == "pil")
-
-        # 绘制表格（与之前相同，略去重复注释）
-        if engine == "pil":
-            font = ctx
+        # —— 绘制表格面板 ——（表头灰底 / 网格线 / 对齐）
+        if use_pil:
             panel_img = Image.new("RGB", (grid_w, grid_h), "white")
             draw = ImageDraw.Draw(panel_img)
+
             header_rows = 1 if has_header and len(rows) >= 1 else 0
             if header_rows == 1:
                 hdr_h = row_h[0]
-                draw.rectangle([(0, 0), (grid_w-1, hdr_h-1)], fill=(240, 240, 240))
+                draw.rectangle([(0, 0), (grid_w - 1, hdr_h - 1)], fill=(240, 240, 240))
+
             if show_grid:
                 y = 0
-                draw.line([(0, y), (grid_w-1, y)], fill=(0,0,0), width=1)
+                draw.line([(0, y), (grid_w - 1, y)], fill=(0, 0, 0), width=1)
                 for h in row_h:
                     y += h
-                    draw.line([(0, y), (grid_w-1, y)], fill=(0,0,0), width=1)
+                    draw.line([(0, y), (grid_w - 1, y)], fill=(0, 0, 0), width=1)
                 x = 0
-                draw.line([(x, 0), (x, grid_h-1)], fill=(0,0,0), width=1)
+                draw.line([(x, 0), (x, grid_h - 1)], fill=(0, 0, 0), width=1)
                 for w in col_w:
                     x += w
-                    draw.line([(x, 0), (x, grid_h-1)], fill=(0,0,0), width=1)
-            tmp = Image.new("RGB", (8,8), "white")
-            drw = ImageDraw.Draw(tmp)
-            def _meas_pil(text: str):
+                    draw.line([(x, 0), (x, grid_h - 1)], fill=(0, 0, 0), width=1)
+
+            tmp = Image.new("RGB", (8, 8), "white")
+            drw2 = ImageDraw.Draw(tmp)
+            def meas_pil(text: str):
                 t = text if text else " "
-                bb = drw.textbbox((0,0), t, font=font)
-                return max(1, bb[2]-bb[0]), max(1, bb[3]-bb[1])
-            def _x_for_cell(tw, l, wid):
-                if align == "left":  return l + padx_cur
-                if align == "right": return l + max(0, wid - tw - padx_cur)
-                return l + max(0, (wid - tw)//2)
+                bb = drw2.textbbox((0, 0), t, font=font_pil)
+                return max(1, bb[2] - bb[0]), max(1, bb[3] - bb[1])
+
+            def x_for_cell(tw, l, wid):
+                if align == "left": return l + pad_x_final
+                if align == "right": return l + max(0, wid - tw - pad_x_final)
+                return l + max(0, (wid - tw) // 2)
+
             y_cursor = 0
             for i, r in enumerate(rows):
                 x_cursor = 0
                 for j, cell in enumerate(r):
-                    tw, th = _meas_pil(cell)
-                    tx = _x_for_cell(tw, x_cursor, col_w[j])
-                    ty = y_cursor + max(0, (row_h[i] - th)//2)
-                    if header_rows and i == 0:
-                        draw.text((tx, ty), cell or " ", fill=(0,0,0), font=font,
-                                stroke_width=1, stroke_fill=(0,0,0))
+                    tw, th = meas_pil(cell)
+                    tx = x_for_cell(tw, x_cursor, col_w[j])
+                    ty = y_cursor + max(0, (row_h[i] - th) // 2)
+                    if has_header and i == 0:
+                        draw.text((tx, ty), cell or " ", fill=(0, 0, 0), font=font_pil,
+                                stroke_width=1, stroke_fill=(0, 0, 0))
                     else:
-                        draw.text((tx, ty), cell or " ", fill=(0,0,0), font=font)
+                        draw.text((tx, ty), cell or " ", fill=(0, 0, 0), font=font_pil)
                     x_cursor += col_w[j]
                 y_cursor += row_h[i]
+
             panel_bgr = cv2.cvtColor(np.array(panel_img), cv2.COLOR_RGB2BGR)
+
         else:
-            font_cv = cv2.FONT_HERSHEY_SIMPLEX
-            scale_cv = ctx
             panel_bgr = np.full((grid_h, grid_w, 3), 255, dtype=np.uint8)
             header_rows = 1 if has_header and len(rows) >= 1 else 0
             if header_rows == 1:
                 hdr_h = row_h[0]
-                cv2.rectangle(panel_bgr, (0,0), (grid_w-1, hdr_h-1), (240,240,240), thickness=-1)
+                cv2.rectangle(panel_bgr, (0, 0), (grid_w - 1, hdr_h - 1), (240, 240, 240), thickness=-1)
+
             if show_grid:
                 y = 0
-                cv2.line(panel_bgr, (0,y), (grid_w-1,y), (0,0,0), 1)
+                cv2.line(panel_bgr, (0, y), (grid_w - 1, y), (0, 0, 0), 1)
                 for h in row_h:
                     y += h
-                    cv2.line(panel_bgr, (0,y), (grid_w-1,y), (0,0,0), 1)
+                    cv2.line(panel_bgr, (0, y), (grid_w - 1, y), (0, 0, 0), 1)
                 x = 0
-                cv2.line(panel_bgr, (x,0), (x,grid_h-1), (0,0,0), 1)
+                cv2.line(panel_bgr, (x, 0), (x, grid_h - 1), (0, 0, 0), 1)
                 for w in col_w:
                     x += w
-                    cv2.line(panel_bgr, (x,0), (x,grid_h-1), (0,0,0), 1)
-            def _x_for_cell_cv(tw, l, wid):
-                if align == "left":  return l + padx_cur
-                if align == "right": return l + max(0, wid - tw - padx_cur)
-                return l + max(0, (wid - tw)//2)
+                    cv2.line(panel_bgr, (x, 0), (x, grid_h - 1), (0, 0, 0), 1)
+
+            def x_for_cell_cv(tw, l, wid):
+                if align == "left": return l + pad_x_final
+                if align == "right": return l + max(0, wid - tw - pad_x_final)
+                return l + max(0, (wid - tw) // 2)
+
             y_cursor = 0
             for i, r in enumerate(rows):
                 x_cursor = 0
                 for j, cell in enumerate(r):
                     t = cell if cell else " "
                     (tw, th), base = cv2.getTextSize(t, font_cv, scale_cv, 2)
-                    tx = _x_for_cell_cv(tw, x_cursor, col_w[j])
-                    ty = y_cursor + max(0, (row_h[i] + th)//2)
+                    tx = x_for_cell_cv(tw, x_cursor, col_w[j])
+                    ty = y_cursor + max(0, (row_h[i] + th) // 2)
                     try:
                         cv2.putText(panel_bgr, t, (tx, ty), font_cv, scale_cv, line_color, 2, cv2.LINE_AA)
                     except Exception:
@@ -3227,23 +3116,24 @@ class App(tk.Tk):
                     x_cursor += col_w[j]
                 y_cursor += row_h[i]
 
-        # —— 取消下限：整体扩高，绝不裁切 —— 
+        # —— 顶部对齐 + 高度扩展（绝不裁切）——
         Hp, Wp = panel_bgr.shape[:2]
         Hp_total = panel_top_h + Hp
         H_out = max(H_img, Hp_total)
+
         top_pad_img = np.full((panel_top_h, Wp, 3), 255, dtype=np.uint8) if panel_top_h > 0 else None
         column_full = panel_bgr if top_pad_img is None else np.vstack([top_pad_img, panel_bgr])
         if column_full.shape[0] < H_out:
             pad = np.full((H_out - column_full.shape[0], Wp, 3), 255, dtype=np.uint8)
             column_full = np.vstack([column_full, pad])
+
         if H_img < H_out:
             pad = np.full((H_out - H_img, W_img, 3), 255, dtype=np.uint8)
             img_bgr = np.vstack([img_bgr, pad])
-        gap = np.full((H_out, max(1, gap_px), 3), 255, dtype=np.uint8)
-        out = np.concatenate([img_bgr, gap, column_full], axis=1)
-        return out
 
-        
+        gap = np.full((H_out, gap_px, 3), 255, dtype=np.uint8)
+        out = np.concatenate([img_bgr, gap, column_full], axis=1)
+        return out        
     
     def _snapshot_arrows_from_canvas(self) -> list[dict]:
         """
@@ -4834,6 +4724,8 @@ class App(tk.Tk):
 
         return np.vstack([panel, img_bgr])
 
+
+
     def _expand_tabs_for_cv2(self, text: str, tab_size: int = 4) -> str:
             """
             由于 cv2.putText 不支持 \t，这里把 Tab 展开为若干空格，使列对齐更可控。
@@ -4864,7 +4756,7 @@ class App(tk.Tk):
         note_text: str,
         allow_expand_width: bool = False,   # 兼容旧签名：当前实现始终优先换行，不横向扩宽
         align: str = "left",                # "left" | "center" | "right"
-        cap_px: int = None,                 # 字高像素；None 则用设计参数 bottom_cap_px
+        cap_px: int = 24,                 # 字高像素；None 则用设计参数 bottom_cap_px
         color: tuple = (0, 0, 0),           # 文本颜色（BGR）
         left_pad: int = 30,                 # 底注左留白
         right_pad: int = 30,                # 底注右留白
@@ -4893,7 +4785,7 @@ class App(tk.Tk):
         # 文字度量与绘制引擎
         font_path = self._find_font_ttf()
         design = self._get_design_params()
-        cap_px = int(cap_px) if isinstance(cap_px, (int, float)) and cap_px else int(design.get("bottom_cap_px", 28))
+        cap_px = int(cap_px*(H_img/1000)) if isinstance(cap_px, (int, float)) and cap_px else int(design.get("bottom_cap_px", 28)*(H_img/1000))
 
         use_pil = font_path is not None
         if use_pil:
